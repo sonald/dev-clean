@@ -1,0 +1,45 @@
+[package]
+name = "dev-cleaner"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name"]
+description = "A smart developer tool for cleaning temporary build directories"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "cargo"] }
+
+# TUI
+ratatui = "0.26"
+crossterm = "0.27"
+
+# File traversal (Ripgrep style)
+ignore = "0.4"
+walkdir = "2.4"
+
+# Parallel processing
+rayon = "1.8"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Progress bar
+indicatif = "0.17"
+
+# Colors
+colored = "2.1"
+
+# Error handling
+anyhow = "1.0"
+
+# System info
+num_cpus = "1.16"
+dirs = "5.0"
+
+[dev-dependencies]
+tempfile = "3.9"

@@ -1,0 +1,36 @@
+# Dev Cleaner Configuration Example
+# Copy this file to ~/.config/dev-cleaner/config.toml (Linux/macOS)
+# or %APPDATA%\dev-cleaner\config.toml (Windows)
+
+# Directories to always exclude from scanning
+exclude_dirs = [
+    ".git",
+    ".svn",
+    ".hg",
+]
+
+# Default maximum scan depth (None = unlimited)
+# default_depth = 10
+
+# Default minimum size in MB (None = no filter)
+# min_size_mb = 100
+
+# Default maximum age in days (None = no filter)
+# max_age_days = 30
+
+# Custom cleanable patterns
+# Add your own project types and cleanable directories
+[[custom_patterns]]
+name = "Unity"
+directory = "Library"
+marker_files = ["Assets", "ProjectSettings"]
+
+[[custom_patterns]]
+name = "Unreal Engine"
+directory = "Intermediate"
+marker_files = [".uproject"]
+
+# [[custom_patterns]]
+# name = "Your Custom Project"
+# directory = "custom-build-dir"
+# marker_files = ["marker-file.txt", "another-marker.json"]
