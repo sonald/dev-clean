@@ -131,6 +131,8 @@ impl Scanner {
     ///
     /// # Example
     /// ```no_run
+    /// use dev_cleaner::Scanner;
+    ///
     /// let scanner = Scanner::new("~/projects");
     /// let (total, rx) = scanner.scan_with_streaming().unwrap();
     ///
@@ -286,6 +288,30 @@ impl Scanner {
             }
         }
 
+        // Heuristic detection for CMake build directories
+        // If the directory contains CMakeCache.txt but not CMakeLists.txt,
+        // it's likely an out-of-source build directory that can be safely deleted
+        if ProjectDetector::is_cmake_build_dir(dir) {
+            // Look for parent directory containing CMakeLists.txt (project root)
+            let mut search_path = dir;
+            while let Some(parent) = search_path.parent() {
+                if parent.join("CMakeLists.txt").exists() {
+                    // Found the project root
+                    return if fast_mode {
+                        self.build_project_info_fast(parent, ProjectType::Cpp, dir)
+                    } else {
+                        self.build_project_info(parent, ProjectType::Cpp, dir)
+                    };
+                }
+                search_path = parent;
+
+                // Don't go too far up
+                if !search_path.starts_with(&self.root) {
+                    break;
+                }
+            }
+        }
+
         None
     }
 
@@ -412,5 +438,95 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_type, ProjectType::NodeJs);
+    }
+
+    #[test]
+    fn test_scanner_cmake_out_of_source() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a CMake project
+        let project_dir = root.join("cmake-project");
+        fs::create_dir(&project_dir).unwrap();
+        fs::write(project_dir.join("CMakeLists.txt"), "project(test)").unwrap();
+
+        // Create out-of-source build directory with custom name
+        let build_dir = project_dir.join("mybuild");
+        fs::create_dir(&build_dir).unwrap();
+        fs::write(build_dir.join("CMakeCache.txt"), "# CMake cache").unwrap();
+        fs::write(build_dir.join("test.o"), "binary").unwrap();
+
+        let scanner = Scanner::new(root);
+        let results = scanner.scan().unwrap();
+
+        // Should detect the custom-named build directory
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_type, ProjectType::Cpp);
+        assert!(results[0].cleanable_dir.ends_with("mybuild"));
+    }
+
+    #[test]
+    fn test_scanner_cmake_in_source() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a CMake project with in-source build (NOT recommended)
+        let project_dir = root.join("cmake-project");
+        fs::create_dir(&project_dir).unwrap();
+        fs::write(project_dir.join("CMakeLists.txt"), "project(test)").unwrap();
+        fs::write(project_dir.join("CMakeCache.txt"), "# CMake cache").unwrap();
+
+        // Create src directory to simulate real source code
+        let src_dir = project_dir.join("src");
+        fs::create_dir(&src_dir).unwrap();
+        fs::write(src_dir.join("main.cpp"), "int main() {}").unwrap();
+
+        let scanner = Scanner::new(root);
+        let results = scanner.scan().unwrap();
+
+        // Should NOT detect the project directory itself as cleanable
+        // because it contains both source (CMakeLists.txt) and build (CMakeCache.txt)
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_scanner_cmake_multiple_builds() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a CMake project
+        let project_dir = root.join("cmake-project");
+        fs::create_dir(&project_dir).unwrap();
+        fs::write(project_dir.join("CMakeLists.txt"), "project(test)").unwrap();
+
+        // Create multiple build directories with different names
+        let build_debug = project_dir.join("build-debug");
+        fs::create_dir(&build_debug).unwrap();
+        fs::write(build_debug.join("CMakeCache.txt"), "# Debug").unwrap();
+
+        let build_release = project_dir.join("_build");
+        fs::create_dir(&build_release).unwrap();
+        fs::write(build_release.join("CMakeCache.txt"), "# Release").unwrap();
+
+        // Also create a standard "build" directory
+        let build_standard = project_dir.join("build");
+        fs::create_dir(&build_standard).unwrap();
+        fs::write(build_standard.join("CMakeCache.txt"), "# Standard").unwrap();
+
+        let scanner = Scanner::new(root);
+        let results = scanner.scan().unwrap();
+
+        // Should detect all three build directories
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.project_type == ProjectType::Cpp));
+
+        // Verify all build directories are found
+        let found_dirs: Vec<String> = results
+            .iter()
+            .map(|r| r.cleanable_dir.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(found_dirs.contains(&"build-debug".to_string()));
+        assert!(found_dirs.contains(&"_build".to_string()));
+        assert!(found_dirs.contains(&"build".to_string()));
     }
 }

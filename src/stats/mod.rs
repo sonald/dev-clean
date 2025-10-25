@@ -1,4 +1,4 @@
-use crate::ProjectInfo;
+use crate::{ProjectInfo, ProjectType};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use prettytable::{Table, Row, Cell, format};
