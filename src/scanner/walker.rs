@@ -154,9 +154,10 @@ impl Scanner {
         while let Some(parent) = current.parent() {
             if let Some(project_type) = ProjectDetector::detect(parent) {
                 // Check if current directory is a cleanable dir for this project type
-                let cleanable_dirs = ProjectDetector::cleanable_dirs(project_type);
+                // This includes both default patterns AND patterns from .gitignore
+                let cleanable_dirs = ProjectDetector::cleanable_dirs_with_gitignore(project_type, parent);
 
-                if cleanable_dirs.contains(&dir_name.as_ref()) {
+                if cleanable_dirs.iter().any(|d| d == dir_name.as_ref()) {
                     return self.build_project_info(parent, project_type, dir);
                 }
             }

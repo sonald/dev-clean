@@ -54,7 +54,7 @@ The codebase is organized into 5 main modules:
 
 1. **scanner** (`src/scanner/`)
    - `walker.rs`: Core scanning engine using `ignore` crate (Ripgrep-style)
-   - `detector.rs`: Project type detection and cleanable directory mapping
+   - `detector.rs`: Project type detection, cleanable directory mapping, and .gitignore integration
    - `mod.rs`: Public API with `ProjectInfo` struct
 
 2. **cleaner** (`src/cleaner/`)
@@ -103,15 +103,75 @@ Detection happens in `scanner/detector.rs`:
 3. Match directory name against cleanable patterns for detected project type
 4. Check lock files for "in-use" detection (prevents cleaning active projects)
 
+#### .gitignore Integration
+
+**Key Insight**: For Git projects, .gitignore files contain exactly the directories that should be cleaned, because gitignored directories are typically build artifacts that can be regenerated.
+
+**Implementation**: `ProjectDetector::parse_gitignore()` and `ProjectDetector::cleanable_dirs_with_gitignore()` in `src/scanner/detector.rs`
+
+**Parsing Logic**:
+1. Read `.gitignore` file from project root
+2. Extract directory patterns while filtering out:
+   - Empty lines and comments (starting with `#`)
+   - Negation patterns (starting with `!`)
+   - File patterns (containing `.` extension, unless starting with `.` for hidden dirs)
+   - Complex wildcard patterns (wildcards in the middle)
+   - Protected directories (`.git`, `.svn`, `.hg`, `src`, `lib`, `include`)
+   - Known file patterns (`.env`, `.DS_Store`, `.gitignore`, etc.)
+3. Clean up patterns by removing leading/trailing slashes
+4. Return list of directory names
+
+**Integration Flow**:
+```rust
+// In walker.rs check_directory():
+let cleanable_dirs = ProjectDetector::cleanable_dirs_with_gitignore(project_type, parent);
+```
+
+This combines:
+- Default cleanable patterns for the detected project type (e.g., `node_modules` for Node.js)
+- Custom patterns from `.gitignore` (e.g., `.custom-cache`, `tmp-data`)
+- Deduplication to avoid reporting the same directory twice
+
+**Example**:
+```gitignore
+# .gitignore in a Node.js project
+node_modules/      # Already in default patterns
+dist/              # Already in default patterns
+.custom-cache/     # Custom pattern - will be added
+tmp-data           # Custom pattern - will be added
+*.log              # File pattern - will be skipped
+.env               # Known file - will be skipped
+```
+
+Result: Scanner will look for `node_modules`, `.next`, `dist`, `.cache`, `.turbo`, `.parcel-cache` (default patterns) PLUS `.custom-cache` and `tmp-data` (from .gitignore).
+
+**Testing**: See tests in `src/scanner/detector.rs`:
+- `test_parse_gitignore`: Tests .gitignore parsing logic
+- `test_cleanable_dirs_with_gitignore`: Tests integration with default patterns
+- `test_parse_gitignore_no_file`: Tests behavior when .gitignore doesn't exist
+
 ### Important Behavioral Notes
 
 #### .gitignore Handling
 
-**Default behavior**: Does NOT respect `.gitignore` files
-- Rationale: Most cleanable directories (node_modules, target, .venv) are gitignored
-- User can enable with `--gitignore` flag if needed
+**Two-Part Strategy**:
 
-**Implementation**: `Scanner::respect_gitignore()` defaults to `false`
+1. **Scanning Behavior** (controlled by `--gitignore` flag):
+   - **Default**: Does NOT respect `.gitignore` when traversing directories
+   - **Rationale**: Most cleanable directories (node_modules, target, .venv) are gitignored, so we need to scan them
+   - **Implementation**: `Scanner::respect_gitignore()` defaults to `false`
+   - User can enable with `--gitignore` flag if they want to skip gitignored directories
+
+2. **Pattern Discovery** (automatic):
+   - **Always active**: Reads `.gitignore` files to discover additional cleanable patterns
+   - **Rationale**: Gitignored directories are often custom build artifacts that should be cleanable
+   - **Implementation**: `ProjectDetector::parse_gitignore()` extracts directory patterns
+   - **Smart filtering**: Skips files, protected directories, and complex patterns
+   - **Integration**: Combined with default patterns via `cleanable_dirs_with_gitignore()`
+
+**Important**: These are independent features:
+- `--gitignore` flag controls WHETHER to traverse gitignored directories
+- `.gitignore` parsing discovers WHAT additional directories to clean
 
 #### VCS Directory Skipping
 
@@ -178,6 +238,11 @@ let project_dir = temp.path().join("test-project");
 - Verify correct project type detection
 - Test deduplication with nested directories
 - Validate filter application (size, age)
+- Test .gitignore parsing:
+  - Create .gitignore with various patterns (directories, files, comments)
+  - Verify only directory patterns are extracted
+  - Verify protected directories and files are filtered out
+  - Test integration with default cleanable patterns
 
 ### Cleaner Tests
 
@@ -196,3 +261,5 @@ let project_dir = temp.path().join("test-project");
 4. **Deduplication Order**: Must happen AFTER parallel processing completes but BEFORE filtering, to ensure accurate size calculations
 
 5. **clap Boolean Flags**: Don't use `default_value` with bool types - they are presence flags by default
+
+6. **.gitignore Parsing**: The parser is conservative - it skips patterns containing `.` (unless they start with `.` for hidden dirs) to avoid false positives from file patterns. If a directory name contains a dot (e.g., `build.tmp`), you may need to add it to the config file instead

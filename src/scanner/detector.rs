@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::fs;
 use serde::{Serialize, Deserialize};
 
 /// Supported project types
@@ -211,5 +212,188 @@ impl ProjectDetector {
             }
         }
         false
+    }
+
+    /// Parse .gitignore file and extract potential cleanable directory patterns
+    pub fn parse_gitignore(project_dir: &Path) -> Vec<String> {
+        let gitignore_path = project_dir.join(".gitignore");
+
+        if !gitignore_path.exists() {
+            return Vec::new();
+        }
+
+        let content = match fs::read_to_string(&gitignore_path) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut cleanable_patterns = Vec::new();
+
+        for line in content.lines() {
+            let line = line.trim();
+
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Skip negation patterns (starting with !)
+            if line.starts_with('!') {
+                continue;
+            }
+
+            // Skip file patterns (contains extension or is clearly a file)
+            if line.contains('.') && !line.ends_with('/') && !line.starts_with('.') {
+                // This might be a file pattern like *.log, skip it
+                continue;
+            }
+
+            // Clean up the pattern
+            let mut pattern = line.to_string();
+
+            // Remove leading slash
+            if pattern.starts_with('/') {
+                pattern = pattern[1..].to_string();
+            }
+
+            // Remove trailing slash
+            if pattern.ends_with('/') {
+                pattern = pattern[..pattern.len()-1].to_string();
+            }
+
+            // Skip patterns with wildcards in the middle (too complex)
+            if pattern.contains('*') && !pattern.starts_with('*') && !pattern.ends_with('*') {
+                continue;
+            }
+
+            // Skip obviously protected directories
+            if matches!(pattern.as_str(), ".git" | ".svn" | ".hg" | "." | ".." | "src" | "lib" | "include") {
+                continue;
+            }
+
+            // Skip common file patterns (even if they start with .)
+            if matches!(pattern.as_str(), ".env" | ".DS_Store" | ".gitignore" | ".gitattributes" | ".editorconfig" | ".npmrc" | ".yarnrc") {
+                continue;
+            }
+
+            // Only include patterns that look like directories
+            // Typically: no extension, or starts with . (hidden dirs)
+            if !pattern.is_empty() && (pattern.starts_with('.') || !pattern.contains('.')) {
+                cleanable_patterns.push(pattern);
+            }
+        }
+
+        cleanable_patterns
+    }
+
+    /// Get cleanable directories including both default patterns and .gitignore patterns
+    pub fn cleanable_dirs_with_gitignore(project_type: ProjectType, project_dir: &Path) -> Vec<String> {
+        let mut cleanable = Self::cleanable_dirs(project_type)
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<String>>();
+
+        // Add patterns from .gitignore
+        let gitignore_patterns = Self::parse_gitignore(project_dir);
+
+        for pattern in gitignore_patterns {
+            // Only add if not already in the list
+            if !cleanable.contains(&pattern) {
+                cleanable.push(pattern);
+            }
+        }
+
+        cleanable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_parse_gitignore() {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path();
+
+        // Create a .gitignore file
+        let gitignore_content = r#"
+# Node dependencies
+node_modules/
+dist/
+
+# Cache directories
+.cache/
+.temp
+
+# Files (should be skipped)
+*.log
+.env
+
+# Protected dirs (should be skipped)
+.git/
+src/
+
+# Complex patterns (should be skipped)
+**/temp/*
+"#;
+        fs::write(project_dir.join(".gitignore"), gitignore_content).unwrap();
+
+        let patterns = ProjectDetector::parse_gitignore(project_dir);
+
+        // Should include directory patterns
+        assert!(patterns.contains(&"node_modules".to_string()));
+        assert!(patterns.contains(&"dist".to_string()));
+        assert!(patterns.contains(&".cache".to_string()));
+        assert!(patterns.contains(&".temp".to_string()));
+
+        // Should NOT include file patterns
+        assert!(!patterns.iter().any(|p| p.contains(".log")));
+        assert!(!patterns.iter().any(|p| p.contains(".env")));
+
+        // Should NOT include protected directories
+        assert!(!patterns.contains(&".git".to_string()));
+        assert!(!patterns.contains(&"src".to_string()));
+    }
+
+    #[test]
+    fn test_cleanable_dirs_with_gitignore() {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path();
+
+        // Create a Node.js project
+        fs::write(project_dir.join("package.json"), "{}").unwrap();
+
+        // Create a .gitignore with custom patterns
+        let gitignore_content = r#"
+node_modules/
+dist/
+.custom-cache/
+"#;
+        fs::write(project_dir.join(".gitignore"), gitignore_content).unwrap();
+
+        let cleanable = ProjectDetector::cleanable_dirs_with_gitignore(
+            ProjectType::NodeJs,
+            project_dir
+        );
+
+        // Should include default Node.js patterns
+        assert!(cleanable.iter().any(|d| d == "node_modules"));
+        assert!(cleanable.iter().any(|d| d == ".next"));
+
+        // Should also include .gitignore patterns
+        assert!(cleanable.iter().any(|d| d == "dist"));
+        assert!(cleanable.iter().any(|d| d == ".custom-cache"));
+    }
+
+    #[test]
+    fn test_parse_gitignore_no_file() {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path();
+
+        let patterns = ProjectDetector::parse_gitignore(project_dir);
+        assert!(patterns.is_empty());
     }
 }

@@ -6,6 +6,7 @@ A fast, intelligent developer tool for scanning and cleaning temporary build dir
 
 - **Multi-Language Support**: Automatically detects and cleans 18+ project types
 - **Smart Scanning**: Uses Ripgrep-style traversal with `.gitignore` respect
+- **Intelligent .gitignore Integration**: Automatically reads `.gitignore` files to discover custom cleanable directories (because what's gitignored is usually cleanable!)
 - **Intelligent Deduplication**: Automatically detects only top-level cleanable directories (e.g., reports `.venv` instead of hundreds of nested `__pycache__` directories)
 - **Two Modes**: CLI for quick operations, TUI for interactive selection
 - **Safe by Default**: Dry-run mode, confirmation prompts, and in-use detection
