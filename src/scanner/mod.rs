@@ -1,8 +1,10 @@
 mod walker;
 mod detector;
+mod size_calculator;
 
 pub use walker::Scanner;
 pub use detector::{ProjectType, ProjectDetector};
+pub use size_calculator::SizeCalculator;
 
 use std::path::PathBuf;
 use chrono::{DateTime, Utc};
@@ -23,6 +25,10 @@ pub struct ProjectInfo {
     /// Size of the cleanable directory in bytes
     pub size: u64,
 
+    /// Whether the size has been calculated
+    #[serde(default = "default_true")]
+    pub size_calculated: bool,
+
     /// Last modified time of the cleanable directory
     pub last_modified: DateTime<Utc>,
 
@@ -30,10 +36,35 @@ pub struct ProjectInfo {
     pub in_use: bool,
 }
 
+fn default_true() -> bool { true }
+
 impl ProjectInfo {
+    /// Create a new ProjectInfo with pending size calculation
+    pub fn new_pending(
+        root: PathBuf,
+        project_type: ProjectType,
+        cleanable_dir: PathBuf,
+        last_modified: DateTime<Utc>,
+        in_use: bool,
+    ) -> Self {
+        Self {
+            root,
+            project_type,
+            cleanable_dir,
+            size: 0,
+            size_calculated: false,
+            last_modified,
+            in_use,
+        }
+    }
+
     /// Returns a human-readable size string
     pub fn size_human(&self) -> String {
-        format_size(self.size)
+        if !self.size_calculated {
+            "Calculating...".to_string()
+        } else {
+            format_size(self.size)
+        }
     }
 
     /// Returns how many days since last modification

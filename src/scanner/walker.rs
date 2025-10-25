@@ -1,11 +1,13 @@
-use super::{ProjectInfo, ProjectType, ProjectDetector};
+use super::{ProjectInfo, ProjectType, ProjectDetector, SizeCalculator};
 use anyhow::Result;
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+use std::thread;
 use chrono::{DateTime, Utc};
+use crossbeam::channel::{self, Receiver};
 
 /// Main scanner for finding cleanable project directories
 pub struct Scanner {
@@ -117,6 +119,107 @@ impl Scanner {
         Ok(final_results)
     }
 
+    /// Scan with streaming size calculation for real-time progress
+    ///
+    /// This method performs a fast scan first (without calculating sizes), then
+    /// streams size calculation results through a channel as they complete.
+    ///
+    /// # Returns
+    /// A tuple of (total_count, receiver) where:
+    /// - total_count: Total number of projects found (for progress calculation)
+    /// - receiver: Channel to receive completed ProjectInfo with calculated sizes
+    ///
+    /// # Example
+    /// ```no_run
+    /// let scanner = Scanner::new("~/projects");
+    /// let (total, rx) = scanner.scan_with_streaming().unwrap();
+    ///
+    /// println!("Found {} projects, calculating sizes...", total);
+    /// for project in rx.iter() {
+    ///     println!("{}: {}", project.cleanable_dir.display(), project.size_human());
+    /// }
+    /// ```
+    pub fn scan_with_streaming(&self) -> Result<(usize, Receiver<ProjectInfo>)> {
+        // Step 1: Fast scan without size calculation
+        let results = Arc::new(Mutex::new(Vec::new()));
+
+        // Build walker with Ripgrep-style configuration
+        let mut walker = WalkBuilder::new(&self.root);
+        walker
+            .hidden(false)
+            .ignore(self.respect_gitignore)
+            .git_ignore(self.respect_gitignore)
+            .git_exclude(self.respect_gitignore)
+            .filter_entry(|entry| {
+                let file_name = entry.file_name().to_string_lossy();
+                !matches!(file_name.as_ref(), ".git" | ".svn" | ".hg")
+            });
+
+        if let Some(depth) = self.max_depth {
+            walker.max_depth(Some(depth));
+        }
+
+        walker.threads(num_cpus::get());
+
+        // Collect candidate directories
+        let candidates: Vec<PathBuf> = walker
+            .build()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_dir()))
+            .map(|entry| entry.into_path())
+            .collect();
+
+        // Process candidates in parallel (fast mode - no size calculation)
+        candidates.par_iter().for_each(|dir| {
+            if let Some(project_info) = self.check_directory_fast(dir) {
+                // Note: Size filtering will be applied after size calculation
+                results.lock().unwrap().push(project_info);
+            }
+        });
+
+        let mut pending_projects = Arc::try_unwrap(results)
+            .unwrap()
+            .into_inner()
+            .unwrap();
+
+        // Deduplicate
+        pending_projects = self.deduplicate_nested_dirs(pending_projects);
+
+        let total_count = pending_projects.len();
+
+        // Step 2: Calculate sizes in parallel and stream results
+        let (tx, rx) = channel::unbounded();
+        let min_size = self.min_size;
+        let max_age_days = self.max_age_days;
+
+        // Spawn background thread for size calculation
+        thread::spawn(move || {
+            let calculator = SizeCalculator::new();
+            calculator.calculate_batch_streaming(pending_projects, tx);
+        });
+
+        // Create a new receiver that filters results
+        let (filtered_tx, filtered_rx) = channel::unbounded();
+        let min_size_clone = min_size;
+        let max_age_clone = max_age_days;
+
+        thread::spawn(move || {
+            for project in rx.iter() {
+                // Apply filters
+                let passes_size = min_size_clone.map_or(true, |ms| project.size >= ms);
+                let passes_age = max_age_clone.map_or(true, |ma| {
+                    project.days_since_modified() >= ma
+                });
+
+                if passes_size && passes_age {
+                    let _ = filtered_tx.send(project);
+                }
+            }
+        });
+
+        Ok((total_count, filtered_rx))
+    }
+
     /// Remove nested cleanable directories, keeping only the topmost ones
     fn deduplicate_nested_dirs(&self, results: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
         let mut deduplicated = Vec::new();
@@ -144,6 +247,16 @@ impl Scanner {
 
     /// Check if a directory is a cleanable project directory
     fn check_directory(&self, dir: &Path) -> Option<ProjectInfo> {
+        self.check_directory_impl(dir, false)
+    }
+
+    /// Check if a directory is a cleanable project directory (fast mode - no size calc)
+    fn check_directory_fast(&self, dir: &Path) -> Option<ProjectInfo> {
+        self.check_directory_impl(dir, true)
+    }
+
+    /// Implementation of directory checking with configurable fast mode
+    fn check_directory_impl(&self, dir: &Path, fast_mode: bool) -> Option<ProjectInfo> {
         // Try to detect project type by looking at parent directories
         let mut current = dir;
 
@@ -158,7 +271,11 @@ impl Scanner {
                 let cleanable_dirs = ProjectDetector::cleanable_dirs_with_gitignore(project_type, parent);
 
                 if cleanable_dirs.iter().any(|d| d == dir_name.as_ref()) {
-                    return self.build_project_info(parent, project_type, dir);
+                    return if fast_mode {
+                        self.build_project_info_fast(parent, project_type, dir)
+                    } else {
+                        self.build_project_info(parent, project_type, dir)
+                    };
                 }
             }
             current = parent;
@@ -172,7 +289,31 @@ impl Scanner {
         None
     }
 
-    /// Build ProjectInfo for a cleanable directory
+    /// Build ProjectInfo for a cleanable directory (fast scan - no size calculation)
+    fn build_project_info_fast(
+        &self,
+        project_root: &Path,
+        project_type: ProjectType,
+        cleanable_dir: &Path,
+    ) -> Option<ProjectInfo> {
+        // Get last modified time
+        let metadata = cleanable_dir.metadata().ok()?;
+        let modified = metadata.modified().ok()?;
+        let last_modified = system_time_to_datetime(modified);
+
+        // Check if project is in use
+        let in_use = ProjectDetector::is_in_use(project_root, project_type);
+
+        Some(ProjectInfo::new_pending(
+            project_root.to_path_buf(),
+            project_type,
+            cleanable_dir.to_path_buf(),
+            last_modified,
+            in_use,
+        ))
+    }
+
+    /// Build ProjectInfo for a cleanable directory (with size calculation)
     fn build_project_info(
         &self,
         project_root: &Path,
@@ -195,6 +336,7 @@ impl Scanner {
             project_type,
             cleanable_dir: cleanable_dir.to_path_buf(),
             size,
+            size_calculated: true,
             last_modified,
             in_use,
         })

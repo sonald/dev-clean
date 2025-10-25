@@ -89,6 +89,29 @@ pub enum Commands {
         path: PathBuf,
     },
 
+    /// Show statistics about cleanable directories
+    Stats {
+        /// Directory to scan
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Maximum scan depth
+        #[arg(short, long)]
+        depth: Option<usize>,
+
+        /// Number of top largest directories to show
+        #[arg(long, default_value = "10")]
+        top: usize,
+
+        /// Export as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Respect .gitignore files (skips gitignored directories)
+        #[arg(long)]
+        gitignore: bool,
+    },
+
     /// Generate default config file
     InitConfig {
         /// Output path for config file
@@ -114,6 +137,9 @@ impl Cli {
             Commands::Tui { path } => {
                 crate::tui::run_tui(path)?;
             }
+            Commands::Stats { path, depth, top, json, gitignore } => {
+                run_stats(path, depth, top, json, gitignore)?;
+            }
             Commands::InitConfig { path } => {
                 init_config(path)?;
             }
@@ -130,6 +156,8 @@ fn run_scan(
     older_than: Option<i64>,
     gitignore: bool,
 ) -> Result<()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
 
     let mut scanner = Scanner::new(&path);
@@ -148,20 +176,71 @@ fn run_scan(
 
     scanner = scanner.respect_gitignore(gitignore);
 
-    let projects = scanner.scan()?;
+    // Use streaming scan for real-time progress
+    let (total_count, rx) = scanner.scan_with_streaming()?;
 
-    if projects.is_empty() {
+    if total_count == 0 {
         println!("{}", "No cleanable directories found.".yellow());
         return Ok(());
     }
 
-    println!("\n{} cleanable directories found:\n", projects.len().to_string().green().bold());
+    println!("Found {} potential projects, calculating sizes...\n", total_count);
 
-    let total_size: u64 = projects.iter().map(|p| p.size).sum();
+    // Create progress bar
+    let pb = ProgressBar::new(total_count as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("#>-")
+    );
 
-    display_projects(&projects);
+    let mut projects = Vec::new();
+    let mut total_size = 0u64;
 
-    println!("\n{} {}", "Total size:".bold(), format_size(total_size).green().bold());
+    // Receive and display results as they complete
+    for project in rx.iter() {
+        total_size += project.size;
+
+        // Update progress bar message
+        let dir_display = project.cleanable_dir.display().to_string();
+        let short_path = if dir_display.len() > 50 {
+            format!("...{}", &dir_display[dir_display.len()-47..])
+        } else {
+            dir_display.clone()
+        };
+        pb.set_message(format!("{}: {}", short_path, project.size_human()));
+
+        // Print result immediately above progress bar (streaming output)
+        pb.println(format!("  {} {} {} ({})",
+            "✓".green(),
+            project.project_type.name().bright_cyan(),
+            dir_display.bright_white(),
+            project.size_human().yellow()
+        ));
+
+        pb.inc(1);
+        projects.push(project);
+    }
+
+    pb.finish_and_clear();
+
+    if projects.is_empty() {
+        println!("\n{}", "No directories match the filter criteria.".yellow());
+        return Ok(());
+    }
+
+    // Sort by size for summary
+    projects.sort_by(|a, b| b.size.cmp(&a.size));
+
+    println!("\n{} {} cleanable directories found",
+        "✓".green().bold(),
+        projects.len().to_string().green().bold()
+    );
+    println!("{} {}\n",
+        "Total size:".bold(),
+        format_size(total_size).green().bold()
+    );
 
     Ok(())
 }
@@ -308,6 +387,50 @@ fn select_projects_interactive(projects: &[ProjectInfo]) -> Result<Vec<ProjectIn
     }
 
     Ok(selected)
+}
+
+fn run_stats(
+    path: PathBuf,
+    depth: Option<usize>,
+    top_n: usize,
+    json_output: bool,
+    gitignore: bool,
+) -> Result<()> {
+    use crate::Statistics;
+
+    println!("{}", "Scanning for cleanable directories...".cyan().bold());
+
+    let mut scanner = Scanner::new(&path);
+
+    if let Some(d) = depth {
+        scanner = scanner.max_depth(d);
+    }
+
+    scanner = scanner.respect_gitignore(gitignore);
+
+    // Use regular scan for statistics (we need all results)
+    let projects = scanner.scan()?;
+
+    if projects.is_empty() {
+        println!("{}", "No cleanable directories found.".yellow());
+        return Ok(());
+    }
+
+    // Generate statistics
+    let stats = Statistics::from_projects(projects);
+
+    if json_output {
+        // Output JSON
+        match stats.to_json() {
+            Ok(json) => println!("{}", json),
+            Err(e) => eprintln!("Error generating JSON: {}", e),
+        }
+    } else {
+        // Display terminal output
+        stats.display_terminal(top_n);
+    }
+
+    Ok(())
 }
 
 fn init_config(path: Option<PathBuf>) -> Result<()> {

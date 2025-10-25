@@ -20,9 +20,11 @@ walkdir = "2.4"
 
 # Parallel processing
 rayon = "1.8"
+crossbeam = "0.8"
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 
 # Time handling
@@ -33,6 +35,7 @@ indicatif = "0.17"
 
 # Colors
 colored = "2.1"
+prettytable-rs = "0.10"
 
 # Error handling
 anyhow = "1.0"
