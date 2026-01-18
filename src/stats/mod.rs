@@ -1,8 +1,9 @@
-use crate::{ProjectInfo, ProjectType};
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use prettytable::{Table, Row, Cell, format};
+use crate::utils::format_size;
+use crate::ProjectInfo;
 use colored::Colorize;
+use prettytable::{format, Cell, Row, Table};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Statistics about cleanable directories
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +126,11 @@ impl Statistics {
             }
         }
 
-        let by_age_group = AgeGroupStats { recent, medium, old };
+        let by_age_group = AgeGroupStats {
+            recent,
+            medium,
+            old,
+        };
 
         Self {
             total_size,
@@ -161,8 +166,14 @@ impl Statistics {
 
     fn display_overview(&self) {
         println!("\n{}", "📁 Overview".bright_green().bold());
-        println!("  Total projects: {}", self.total_projects.to_string().bright_white());
-        println!("  Cleanable space: {}", format_size(self.total_size).bright_yellow());
+        println!(
+            "  Total projects: {}",
+            self.total_projects.to_string().bright_white()
+        );
+        println!(
+            "  Cleanable space: {}",
+            format_size(self.total_size).bright_yellow()
+        );
     }
 
     fn display_by_type(&self) {
@@ -194,7 +205,12 @@ impl Statistics {
     }
 
     fn display_top_largest(&self, top_n: usize) {
-        println!("\n{}", format!("🏆 Top {} Largest Directories", top_n).bright_green().bold());
+        println!(
+            "\n{}",
+            format!("🏆 Top {} Largest Directories", top_n)
+                .bright_green()
+                .bold()
+        );
 
         let mut table = Table::new();
         table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
@@ -209,7 +225,7 @@ impl Statistics {
         for (i, project) in self.top_largest.iter().take(top_n).enumerate() {
             // Shorten path if too long
             let path = if project.path.len() > 60 {
-                format!("...{}", &project.path[project.path.len()-57..])
+                format!("...{}", &project.path[project.path.len() - 57..])
             } else {
                 project.path.clone()
             };
@@ -233,17 +249,20 @@ impl Statistics {
         let (medium_count, medium_size) = self.by_age_group.medium;
         let (old_count, old_size) = self.by_age_group.old;
 
-        println!("  {} Recent (<30 days):   {} projects, {}",
+        println!(
+            "  {} Recent (<30 days):   {} projects, {}",
             "📗".green(),
             recent_count,
             format_size(recent_size).bright_white()
         );
-        println!("  {} Medium (30-90 days): {} projects, {}",
+        println!(
+            "  {} Medium (30-90 days): {} projects, {}",
             "📙".yellow(),
             medium_count,
             format_size(medium_size).bright_white()
         );
-        println!("  {} Old (>90 days):      {} projects, {}",
+        println!(
+            "  {} Old (>90 days):      {} projects, {}",
             "📕".red(),
             old_count,
             format_size(old_size).bright_white()
@@ -255,7 +274,8 @@ impl Statistics {
 
         let (old_count, old_size) = self.by_age_group.old;
         if old_count > 0 {
-            println!("  • {} old projects (>90 days) can likely be safely cleaned, freeing up {}",
+            println!(
+                "  • {} old projects (>90 days) can likely be safely cleaned, freeing up {}",
                 old_count,
                 format_size(old_size).bright_yellow()
             );
@@ -264,14 +284,16 @@ impl Statistics {
         if self.top_largest.len() >= 5 {
             let top5_size: u64 = self.top_largest.iter().take(5).map(|p| p.size).sum();
             let percentage = (top5_size as f64 / self.total_size as f64 * 100.0) as u32;
-            println!("  • Top 5 largest directories account for {}% of total space",
+            println!(
+                "  • Top 5 largest directories account for {}% of total space",
                 percentage.to_string().bright_yellow()
             );
         }
 
         let (recent_count, _) = self.by_age_group.recent;
         if recent_count > 0 {
-            println!("  • {} recent projects (<30 days) are likely still in use, consider keeping them",
+            println!(
+                "  • {} recent projects (<30 days) are likely still in use, consider keeping them",
                 recent_count
             );
         }
@@ -283,27 +305,10 @@ impl Statistics {
     }
 }
 
-/// Format bytes into human-readable size
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit_idx = 0;
-
-    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_idx += 1;
-    }
-
-    if unit_idx == 0 {
-        format!("{} {}", size as u64, UNITS[unit_idx])
-    } else {
-        format!("{:.2} {}", size, UNITS[unit_idx])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProjectType;
     use chrono::Utc;
     use std::path::PathBuf;
 

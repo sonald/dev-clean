@@ -17,6 +17,7 @@ crossterm = "0.27"
 # File traversal (Ripgrep style)
 ignore = "0.4"
 walkdir = "2.4"
+globset = "0.4"
 
 # Parallel processing
 rayon = "1.8"

@@ -50,6 +50,9 @@ dev-cleaner tui ~/projects
 # Preview what would be deleted (dry-run)
 dev-cleaner clean --dry-run
 
+# Move directories to Dev Cleaner trash (undoable)
+dev-cleaner clean --trash
+
 # Interactive selection
 dev-cleaner clean
 
@@ -58,6 +61,22 @@ dev-cleaner clean --older-than 90 --auto
 
 # Clean large projects only
 dev-cleaner clean --min-size 500 --auto
+```
+
+### 4. Plan / Apply (for scripts)
+
+```bash
+# Generate a plan as JSON
+dev-cleaner plan ~/projects --older-than 60 --min-size 500 -o plan.json
+
+# Apply the plan later
+dev-cleaner apply plan.json
+
+# Apply but move to Dev Cleaner trash (undoable)
+dev-cleaner apply plan.json --trash
+
+# Undo the most recent trash batch
+dev-cleaner undo
 ```
 
 ## Common Scenarios

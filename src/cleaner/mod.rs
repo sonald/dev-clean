@@ -1,6 +1,8 @@
 use crate::scanner::ProjectInfo;
+use crate::trash::TrashManager;
+use crate::utils::format_size;
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::Path;
 
@@ -15,6 +17,9 @@ pub struct CleanOptions {
 
     /// Skip confirmation prompts
     pub force: bool,
+
+    /// Move directories to Dev Cleaner's trash (undoable) instead of deleting
+    pub trash: bool,
 }
 
 impl Default for CleanOptions {
@@ -23,6 +28,7 @@ impl Default for CleanOptions {
             dry_run: false,
             verbose: false,
             force: false,
+            trash: false,
         }
     }
 }
@@ -36,11 +42,20 @@ pub struct CleanResult {
     /// Total bytes freed
     pub bytes_freed: u64,
 
+    /// Number of directories skipped (e.g., in-use protection)
+    pub skipped_count: usize,
+
+    /// Total bytes skipped
+    pub bytes_skipped: u64,
+
     /// Number of failed operations
     pub failed_count: usize,
 
     /// Error messages
     pub errors: Vec<String>,
+
+    /// Trash batch id (when `trash=true`)
+    pub trash_batch_id: Option<String>,
 }
 
 impl CleanResult {
@@ -86,14 +101,23 @@ impl Cleaner {
         self
     }
 
+    /// Set trash mode
+    pub fn trash(mut self, trash: bool) -> Self {
+        self.options.trash = trash;
+        self
+    }
+
     /// Clean multiple projects with progress bar
     pub fn clean_multiple(&self, projects: &[ProjectInfo]) -> Result<CleanResult> {
         if projects.is_empty() {
             return Ok(CleanResult {
                 cleaned_count: 0,
                 bytes_freed: 0,
+                skipped_count: 0,
+                bytes_skipped: 0,
                 failed_count: 0,
                 errors: Vec::new(),
+                trash_batch_id: None,
             });
         }
 
@@ -111,23 +135,41 @@ impl Cleaner {
 
         let mut cleaned_count = 0;
         let mut bytes_freed = 0u64;
+        let mut skipped_count = 0;
+        let mut bytes_skipped = 0u64;
         let mut failed_count = 0;
         let mut errors = Vec::new();
+
+        let trash_manager = if self.options.trash && !self.options.dry_run {
+            Some(TrashManager::new_default()?)
+        } else {
+            None
+        };
+        let trash_batch_id = trash_manager.as_ref().map(|m| m.batch_id.clone());
 
         for project in projects {
             let path_str = project.cleanable_dir.display().to_string();
             main_pb.set_message(format!("Cleaning: {}", path_str));
 
-            match self.clean_single(project) {
+            if project.in_use && !self.options.force {
+                skipped_count += 1;
+                bytes_skipped += project.size;
+
+                if self.options.verbose {
+                    println!("↷ Skipped {} (in use)", path_str);
+                }
+
+                main_pb.inc(1);
+                continue;
+            }
+
+            match self.clean_single_impl(project, trash_manager.as_ref()) {
                 Ok(size) => {
                     cleaned_count += 1;
                     bytes_freed += size;
 
                     if self.options.verbose {
-                        println!("✓ Cleaned {} (freed {})",
-                            path_str,
-                            format_size(size)
-                        );
+                        println!("✓ Cleaned {} (freed {})", path_str, format_size(size));
                     }
                 }
                 Err(e) => {
@@ -145,8 +187,9 @@ impl Cleaner {
         }
 
         main_pb.finish_with_message(format!(
-            "Completed: {} cleaned, {} failed, {} freed",
+            "Completed: {} cleaned, {} skipped, {} failed, {} freed",
             cleaned_count,
+            skipped_count,
             failed_count,
             format_size(bytes_freed)
         ));
@@ -154,13 +197,29 @@ impl Cleaner {
         Ok(CleanResult {
             cleaned_count,
             bytes_freed,
+            skipped_count,
+            bytes_skipped,
             failed_count,
             errors,
+            trash_batch_id,
         })
     }
 
     /// Clean a single project directory
     pub fn clean_single(&self, project: &ProjectInfo) -> Result<u64> {
+        let trash_manager = if self.options.trash && !self.options.dry_run {
+            Some(TrashManager::new_default()?)
+        } else {
+            None
+        };
+        self.clean_single_impl(project, trash_manager.as_ref())
+    }
+
+    fn clean_single_impl(
+        &self,
+        project: &ProjectInfo,
+        trash_manager: Option<&TrashManager>,
+    ) -> Result<u64> {
         let path = &project.cleanable_dir;
 
         if !path.exists() {
@@ -170,16 +229,30 @@ impl Cleaner {
         let size = project.size;
 
         if self.options.dry_run {
-            println!("[DRY RUN] Would remove: {} ({})",
-                path.display(),
-                format_size(size)
-            );
+            if self.options.trash {
+                println!(
+                    "[DRY RUN] Would move to trash: {} ({})",
+                    path.display(),
+                    format_size(size)
+                );
+            } else {
+                println!(
+                    "[DRY RUN] Would remove: {} ({})",
+                    path.display(),
+                    format_size(size)
+                );
+            }
             return Ok(size);
         }
 
-        // Perform actual deletion
-        remove_dir_all(path)
-            .with_context(|| format!("Failed to remove directory: {}", path.display()))?;
+        if self.options.trash {
+            let manager = trash_manager.context("Trash manager not initialized")?;
+            manager.trash_dir(path, size)?;
+        } else {
+            // Perform actual deletion
+            remove_dir_all(path)
+                .with_context(|| format!("Failed to remove directory: {}", path.display()))?;
+        }
 
         Ok(size)
     }
@@ -199,34 +272,9 @@ fn remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Format bytes into human-readable size
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit_idx = 0;
-
-    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_idx += 1;
-    }
-
-    if unit_idx == 0 {
-        format!("{} {}", size as u64, UNITS[unit_idx])
-    } else {
-        format!("{:.2} {}", size, UNITS[unit_idx])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_format_size() {
-        assert_eq!(format_size(500), "500 B");
-        assert_eq!(format_size(1024), "1.00 KB");
-        assert_eq!(format_size(1048576), "1.00 MB");
-    }
 
     #[test]
     fn test_dry_run() {

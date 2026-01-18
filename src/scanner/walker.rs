@@ -1,13 +1,26 @@
-use super::{ProjectInfo, ProjectType, ProjectDetector, SizeCalculator};
+use super::{ProjectDetector, ProjectInfo, ProjectType, SizeCalculator};
 use anyhow::Result;
-use ignore::WalkBuilder;
-use rayon::prelude::*;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
-use std::thread;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{self, Receiver};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use ignore::{WalkBuilder, WalkState};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::SystemTime;
+
+#[derive(Debug)]
+struct CleanableMatchers {
+    basename: GlobSet,
+    relative_path: GlobSet,
+}
+
+impl CleanableMatchers {
+    fn matches(&self, basename: &str, relative_path: &str) -> bool {
+        self.basename.is_match(basename) || self.relative_path.is_match(relative_path)
+    }
+}
 
 /// Main scanner for finding cleanable project directories
 pub struct Scanner {
@@ -25,6 +38,9 @@ pub struct Scanner {
 
     /// Maximum age in days (None = no filter)
     max_age_days: Option<i64>,
+
+    /// Cache of compiled cleanable directory matchers per project root/type
+    matcher_cache: Mutex<HashMap<(PathBuf, ProjectType), Arc<CleanableMatchers>>>,
 }
 
 impl Scanner {
@@ -32,10 +48,11 @@ impl Scanner {
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            respect_gitignore: false,  // Default to false - we want to scan gitignored build dirs
+            respect_gitignore: false, // Default to false - we want to scan gitignored build dirs
             max_depth: None,
             min_size: None,
             max_age_days: None,
+            matcher_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -70,8 +87,8 @@ impl Scanner {
         // Build walker with Ripgrep-style configuration
         let mut walker = WalkBuilder::new(&self.root);
         walker
-            .hidden(false)                    // Don't skip hidden files/dirs
-            .ignore(self.respect_gitignore)   // Respect .gitignore if enabled
+            .hidden(false) // Don't skip hidden files/dirs
+            .ignore(self.respect_gitignore) // Respect .gitignore if enabled
             .git_ignore(self.respect_gitignore)
             .git_exclude(self.respect_gitignore)
             .filter_entry(|entry| {
@@ -87,27 +104,33 @@ impl Scanner {
         // Use parallel walker for better performance
         walker.threads(num_cpus::get());
 
-        // Collect candidate directories
-        let candidates: Vec<PathBuf> = walker
-            .build()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_dir()))
-            .map(|entry| entry.into_path())
-            .collect();
+        let scanner = self;
+        walker.build_parallel().run(|| {
+            let results = Arc::clone(&results);
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
 
-        // Process candidates in parallel
-        candidates.par_iter().for_each(|dir| {
-            if let Some(project_info) = self.check_directory(dir) {
-                if self.passes_filters(&project_info) {
-                    results.lock().unwrap().push(project_info);
+                if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    return WalkState::Continue;
                 }
-            }
+
+                let dir = entry.path();
+                if let Some(project_info) = scanner.check_directory(dir) {
+                    if scanner.passes_filters(&project_info) {
+                        results.lock().unwrap().push(project_info);
+                    }
+                    // If we found a cleanable directory, avoid walking into it.
+                    return WalkState::Skip;
+                }
+
+                WalkState::Continue
+            })
         });
 
-        let mut final_results = Arc::try_unwrap(results)
-            .unwrap()
-            .into_inner()
-            .unwrap();
+        let mut final_results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
 
         // Remove nested cleanable directories to avoid duplicates
         // For example, if we have both .venv and .venv/lib/.../pycache, keep only .venv
@@ -163,26 +186,38 @@ impl Scanner {
 
         walker.threads(num_cpus::get());
 
-        // Collect candidate directories
-        let candidates: Vec<PathBuf> = walker
-            .build()
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_dir()))
-            .map(|entry| entry.into_path())
-            .collect();
+        let scanner = self;
+        walker.build_parallel().run(|| {
+            let results = Arc::clone(&results);
+            Box::new(move |entry| {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => return WalkState::Continue,
+                };
 
-        // Process candidates in parallel (fast mode - no size calculation)
-        candidates.par_iter().for_each(|dir| {
-            if let Some(project_info) = self.check_directory_fast(dir) {
-                // Note: Size filtering will be applied after size calculation
-                results.lock().unwrap().push(project_info);
-            }
+                if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                    return WalkState::Continue;
+                }
+
+                let dir = entry.path();
+                if let Some(project_info) = scanner.check_directory_fast(dir) {
+                    // Apply age filter early (size filtering will be applied after size calculation).
+                    let passes_age = scanner
+                        .max_age_days
+                        .map_or(true, |ma| project_info.days_since_modified() >= ma);
+                    if passes_age {
+                        results.lock().unwrap().push(project_info);
+                    }
+
+                    // Avoid walking into cleanable directories.
+                    return WalkState::Skip;
+                }
+
+                WalkState::Continue
+            })
         });
 
-        let mut pending_projects = Arc::try_unwrap(results)
-            .unwrap()
-            .into_inner()
-            .unwrap();
+        let mut pending_projects = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
 
         // Deduplicate
         pending_projects = self.deduplicate_nested_dirs(pending_projects);
@@ -191,8 +226,6 @@ impl Scanner {
 
         // Step 2: Calculate sizes in parallel and stream results
         let (tx, rx) = channel::unbounded();
-        let min_size = self.min_size;
-        let max_age_days = self.max_age_days;
 
         // Spawn background thread for size calculation
         thread::spawn(move || {
@@ -200,26 +233,7 @@ impl Scanner {
             calculator.calculate_batch_streaming(pending_projects, tx);
         });
 
-        // Create a new receiver that filters results
-        let (filtered_tx, filtered_rx) = channel::unbounded();
-        let min_size_clone = min_size;
-        let max_age_clone = max_age_days;
-
-        thread::spawn(move || {
-            for project in rx.iter() {
-                // Apply filters
-                let passes_size = min_size_clone.map_or(true, |ms| project.size >= ms);
-                let passes_age = max_age_clone.map_or(true, |ma| {
-                    project.days_since_modified() >= ma
-                });
-
-                if passes_size && passes_age {
-                    let _ = filtered_tx.send(project);
-                }
-            }
-        });
-
-        Ok((total_count, filtered_rx))
+        Ok((total_count, rx))
     }
 
     /// Remove nested cleanable directories, keeping only the topmost ones
@@ -270,9 +284,10 @@ impl Scanner {
             if let Some(project_type) = ProjectDetector::detect(parent) {
                 // Check if current directory is a cleanable dir for this project type
                 // This includes both default patterns AND patterns from .gitignore
-                let cleanable_dirs = ProjectDetector::cleanable_dirs_with_gitignore(project_type, parent);
+                let matchers = self.matchers_for(project_type, parent);
+                let relative_path = normalize_relative_path(dir.strip_prefix(parent).ok()?);
 
-                if cleanable_dirs.iter().any(|d| d == dir_name.as_ref()) {
+                if matchers.matches(dir_name.as_ref(), &relative_path) {
                     return if fast_mode {
                         self.build_project_info_fast(parent, project_type, dir)
                     } else {
@@ -313,6 +328,25 @@ impl Scanner {
         }
 
         None
+    }
+
+    fn matchers_for(
+        &self,
+        project_type: ProjectType,
+        project_root: &Path,
+    ) -> Arc<CleanableMatchers> {
+        let key = (project_root.to_path_buf(), project_type);
+
+        // Fast path: cache hit
+        if let Some(cached) = self.matcher_cache.lock().unwrap().get(&key) {
+            return Arc::clone(cached);
+        }
+
+        // Build outside lock to avoid blocking other threads while reading .gitignore
+        let built = Arc::new(build_matchers(project_type, project_root));
+
+        let mut cache = self.matcher_cache.lock().unwrap();
+        Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&built)))
     }
 
     /// Build ProjectInfo for a cleanable directory (fast scan - no size calculation)
@@ -388,6 +422,45 @@ impl Scanner {
     }
 }
 
+fn build_matchers(project_type: ProjectType, project_root: &Path) -> CleanableMatchers {
+    let patterns = ProjectDetector::cleanable_dirs_with_gitignore(project_type, project_root);
+
+    let mut basename_builder = GlobSetBuilder::new();
+    let mut relpath_builder = GlobSetBuilder::new();
+
+    for pattern in patterns {
+        let pattern = pattern.replace('\\', "/");
+        let is_relpath = pattern.contains('/');
+
+        let glob = match GlobBuilder::new(&pattern).literal_separator(true).build() {
+            Ok(g) => g,
+            Err(_) => continue,
+        };
+
+        if is_relpath {
+            relpath_builder.add(glob);
+        } else {
+            basename_builder.add(glob);
+        }
+    }
+
+    let basename = basename_builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap());
+    let relative_path = relpath_builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap());
+
+    CleanableMatchers {
+        basename,
+        relative_path,
+    }
+}
+
+fn normalize_relative_path(relative: &Path) -> String {
+    relative.to_string_lossy().replace('\\', "/")
+}
+
 /// Calculate total size of a directory recursively
 fn calculate_dir_size(dir: &Path) -> Result<u64> {
     let mut total = 0u64;
@@ -407,10 +480,10 @@ fn calculate_dir_size(dir: &Path) -> Result<u64> {
 
 /// Convert SystemTime to DateTime<Utc>
 fn system_time_to_datetime(time: SystemTime) -> DateTime<Utc> {
-    let duration = time.duration_since(SystemTime::UNIX_EPOCH)
+    let duration = time
+        .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    DateTime::from_timestamp(duration.as_secs() as i64, 0)
-        .unwrap_or_else(|| Utc::now())
+    DateTime::from_timestamp(duration.as_secs() as i64, 0).unwrap_or_else(|| Utc::now())
 }
 
 #[cfg(test)]
@@ -438,6 +511,62 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_type, ProjectType::NodeJs);
+    }
+
+    #[test]
+    fn test_scanner_python_egg_info() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a fake Python project
+        let project_dir = root.join("py-project");
+        fs::create_dir(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("pyproject.toml"),
+            "[project]\nname = \"x\"\n",
+        )
+        .unwrap();
+
+        // Create egg-info directory
+        let egg_info = project_dir.join("mypkg.egg-info");
+        fs::create_dir(&egg_info).unwrap();
+        fs::write(egg_info.join("PKG-INFO"), "Name: mypkg\n").unwrap();
+
+        let scanner = Scanner::new(root);
+        let results = scanner.scan().unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_type, ProjectType::Python);
+        assert!(results[0].cleanable_dir.ends_with("mypkg.egg-info"));
+    }
+
+    #[test]
+    fn test_scanner_ruby_vendor_bundle() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        // Create a fake Ruby project
+        let project_dir = root.join("rb-project");
+        fs::create_dir(&project_dir).unwrap();
+        fs::write(
+            project_dir.join("Gemfile"),
+            "source \"https://rubygems.org\"",
+        )
+        .unwrap();
+
+        // Create vendor/bundle directory
+        let vendor_dir = project_dir.join("vendor");
+        fs::create_dir(&vendor_dir).unwrap();
+        let vendor_bundle = vendor_dir.join("bundle");
+        fs::create_dir(&vendor_bundle).unwrap();
+        fs::write(vendor_bundle.join("x"), "y").unwrap();
+
+        let scanner = Scanner::new(root);
+        let results = scanner.scan().unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_type, ProjectType::Ruby);
+        assert!(results[0].cleanable_dir.ends_with("vendor/bundle"));
     }
 
     #[test]
@@ -523,7 +652,13 @@ mod tests {
         // Verify all build directories are found
         let found_dirs: Vec<String> = results
             .iter()
-            .map(|r| r.cleanable_dir.file_name().unwrap().to_string_lossy().to_string())
+            .map(|r| {
+                r.cleanable_dir
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
             .collect();
         assert!(found_dirs.contains(&"build-debug".to_string()));
         assert!(found_dirs.contains(&"_build".to_string()));

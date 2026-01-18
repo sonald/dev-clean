@@ -1,4 +1,5 @@
-use crate::{Scanner, Cleaner, ProjectInfo};
+use crate::utils::format_size;
+use crate::{Cleaner, ProjectInfo, Scanner};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -96,7 +97,8 @@ impl App {
     }
 
     fn update_selected_size(&mut self) {
-        self.selected_size = self.projects
+        self.selected_size = self
+            .projects
             .iter()
             .enumerate()
             .filter(|(i, _)| self.selected[*i])
@@ -180,6 +182,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App) 
 
                         println!("\nCleaning completed!");
                         println!("  Cleaned: {}", result.cleaned_count);
+                        println!(
+                            "  Skipped: {} ({})",
+                            result.skipped_count,
+                            format_size(result.bytes_skipped)
+                        );
                         println!("  Failed: {}", result.failed_count);
                         println!("  Space freed: {}", result.size_freed_human());
 
@@ -221,7 +228,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let text = vec![
         Line::from(Span::styled(
             "Dev Cleaner - Interactive Mode",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::raw(format!(
             "Found {} cleanable directories | Total size: {}",
@@ -230,8 +239,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ))),
     ];
 
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Info"));
+    let paragraph =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Info"));
 
     f.render_widget(paragraph, area);
 }
@@ -257,7 +266,9 @@ fn draw_project_list(f: &mut Frame, area: Rect, app: &mut App) {
             );
 
             let style = if app.selected[i] {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -294,7 +305,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(" | a: "),
             Span::styled("Select All", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" | d: "),
-            Span::styled("Deselect All", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Deselect All",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::raw("Enter: "),
@@ -306,8 +320,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ]),
     ];
 
-    let paragraph = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    let paragraph =
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL).title("Controls"));
 
     f.render_widget(paragraph, area);
 }
@@ -316,7 +330,9 @@ fn draw_help(f: &mut Frame) {
     let help_text = vec![
         Line::from(Span::styled(
             "Help - Keyboard Shortcuts",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from("Navigation:"),
@@ -336,25 +352,8 @@ fn draw_help(f: &mut Frame) {
         Line::from("Press any key to close this help..."),
     ];
 
-    let paragraph = Paragraph::new(help_text)
-        .block(Block::default().borders(Borders::ALL).title("Help"));
+    let paragraph =
+        Paragraph::new(help_text).block(Block::default().borders(Borders::ALL).title("Help"));
 
     f.render_widget(paragraph, f.size());
-}
-
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit_idx = 0;
-
-    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_idx += 1;
-    }
-
-    if unit_idx == 0 {
-        format!("{} {}", size as u64, UNITS[unit_idx])
-    } else {
-        format!("{:.2} {}", size, UNITS[unit_idx])
-    }
 }

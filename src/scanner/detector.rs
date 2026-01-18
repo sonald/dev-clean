@@ -1,6 +1,7 @@
-use std::path::Path;
+use globset::GlobBuilder;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use serde::{Serialize, Deserialize};
+use std::path::Path;
 
 /// Supported project types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -81,7 +82,8 @@ impl ProjectDetector {
         if dir.join("requirements.txt").exists()
             || dir.join("setup.py").exists()
             || dir.join("pyproject.toml").exists()
-            || dir.join("Pipfile").exists() {
+            || dir.join("Pipfile").exists()
+        {
             return Some(ProjectType::Python);
         }
 
@@ -113,7 +115,7 @@ impl ProjectDetector {
             return Some(ProjectType::Elixir);
         }
 
-        if dir.join("*.csproj").exists() || dir.join("*.sln").exists() {
+        if dir_contains_extension(dir, &["csproj", "sln"]) {
             return Some(ProjectType::DotNet);
         }
 
@@ -177,12 +179,9 @@ impl ProjectDetector {
             ProjectType::Java | ProjectType::Maven => vec!["target", "out"],
             ProjectType::Kotlin | ProjectType::Gradle => vec!["build", ".gradle", "out"],
             ProjectType::Go => vec!["vendor", "bin"],
-            ProjectType::C | ProjectType::Cpp => vec![
-                "build",
-                "cmake-build-debug",
-                "cmake-build-release",
-                "out",
-            ],
+            ProjectType::C | ProjectType::Cpp => {
+                vec!["build", "cmake-build-debug", "cmake-build-release", "out"]
+            }
             ProjectType::Ruby => vec!["vendor/bundle", ".bundle"],
             ProjectType::Swift => vec![".build", "DerivedData", ".swiftpm"],
             ProjectType::Php => vec!["vendor"],
@@ -200,27 +199,19 @@ impl ProjectDetector {
                 let lock_files = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"];
                 Self::check_recent_lock_files(project_dir, &lock_files)
             }
-            ProjectType::Rust => {
-                Self::check_recent_lock_files(project_dir, &["Cargo.lock"])
-            }
+            ProjectType::Rust => Self::check_recent_lock_files(project_dir, &["Cargo.lock"]),
             ProjectType::Python => {
                 Self::check_recent_lock_files(project_dir, &["Pipfile.lock", "poetry.lock"])
             }
-            ProjectType::Go => {
-                Self::check_recent_lock_files(project_dir, &["go.sum"])
-            }
-            ProjectType::Ruby => {
-                Self::check_recent_lock_files(project_dir, &["Gemfile.lock"])
-            }
-            ProjectType::Php => {
-                Self::check_recent_lock_files(project_dir, &["composer.lock"])
-            }
+            ProjectType::Go => Self::check_recent_lock_files(project_dir, &["go.sum"]),
+            ProjectType::Ruby => Self::check_recent_lock_files(project_dir, &["Gemfile.lock"]),
+            ProjectType::Php => Self::check_recent_lock_files(project_dir, &["composer.lock"]),
             _ => false,
         }
     }
 
     fn check_recent_lock_files(dir: &Path, lock_files: &[&str]) -> bool {
-        use std::time::{SystemTime, Duration};
+        use std::time::{Duration, SystemTime};
 
         for lock_file in lock_files {
             if let Ok(metadata) = dir.join(lock_file).metadata() {
@@ -281,7 +272,7 @@ impl ProjectDetector {
 
             // Remove trailing slash
             if pattern.ends_with('/') {
-                pattern = pattern[..pattern.len()-1].to_string();
+                pattern = pattern[..pattern.len() - 1].to_string();
             }
 
             // Skip patterns with wildcards in the middle (too complex)
@@ -290,12 +281,24 @@ impl ProjectDetector {
             }
 
             // Skip obviously protected directories
-            if matches!(pattern.as_str(), ".git" | ".svn" | ".hg" | "." | ".." | "src" | "lib" | "include") {
+            if matches!(
+                pattern.as_str(),
+                ".git" | ".svn" | ".hg" | "." | ".." | "src" | "lib" | "include"
+            ) {
                 continue;
             }
 
             // Skip common file patterns (even if they start with .)
-            if matches!(pattern.as_str(), ".env" | ".DS_Store" | ".gitignore" | ".gitattributes" | ".editorconfig" | ".npmrc" | ".yarnrc") {
+            if matches!(
+                pattern.as_str(),
+                ".env"
+                    | ".DS_Store"
+                    | ".gitignore"
+                    | ".gitattributes"
+                    | ".editorconfig"
+                    | ".npmrc"
+                    | ".yarnrc"
+            ) {
                 continue;
             }
 
@@ -310,7 +313,10 @@ impl ProjectDetector {
     }
 
     /// Get cleanable directories including both default patterns and .gitignore patterns
-    pub fn cleanable_dirs_with_gitignore(project_type: ProjectType, project_dir: &Path) -> Vec<String> {
+    pub fn cleanable_dirs_with_gitignore(
+        project_type: ProjectType,
+        project_dir: &Path,
+    ) -> Vec<String> {
         let mut cleanable = Self::cleanable_dirs(project_type)
             .iter()
             .map(|s| s.to_string())
@@ -328,6 +334,88 @@ impl ProjectDetector {
 
         cleanable
     }
+
+    /// Explain why a directory is considered cleanable.
+    ///
+    /// This is primarily intended for CLI output (`scan --explain`).
+    pub fn explain_cleanable_dir(
+        project_type: ProjectType,
+        project_root: &Path,
+        cleanable_dir: &Path,
+    ) -> String {
+        let basename = cleanable_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+
+        let relative_path = cleanable_dir
+            .strip_prefix(project_root)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| cleanable_dir.display().to_string());
+
+        // Prefer built-in patterns.
+        for pattern in Self::cleanable_dirs(project_type) {
+            if pattern_matches(pattern, basename, &relative_path) {
+                return format!("matched builtin pattern `{}`", pattern);
+            }
+        }
+
+        // Then .gitignore-derived patterns.
+        for pattern in Self::parse_gitignore(project_root) {
+            if pattern_matches(&pattern, basename, &relative_path) {
+                return format!("matched .gitignore pattern `{}`", pattern);
+            }
+        }
+
+        // Finally, heuristics.
+        if Self::is_cmake_build_dir(cleanable_dir) {
+            return "matched CMake out-of-source build heuristic (CMakeCache.txt present, no CMakeLists.txt)".to_string();
+        }
+
+        "matched cleanable rules".to_string()
+    }
+}
+
+fn pattern_matches(pattern: &str, basename: &str, relative_path: &str) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    let text = if pattern.contains('/') {
+        relative_path
+    } else {
+        basename
+    };
+
+    let glob = match GlobBuilder::new(&pattern).literal_separator(true).build() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    glob.compile_matcher().is_match(text)
+}
+
+fn dir_contains_extension(dir: &Path, extensions: &[&str]) -> bool {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if extensions
+            .iter()
+            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -335,6 +423,15 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_detect_dotnet_project() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+
+        fs::write(dir.join("app.csproj"), "<Project></Project>").unwrap();
+        assert_eq!(ProjectDetector::detect(dir), Some(ProjectType::DotNet));
+    }
 
     #[test]
     fn test_parse_gitignore() {
@@ -397,10 +494,8 @@ dist/
 "#;
         fs::write(project_dir.join(".gitignore"), gitignore_content).unwrap();
 
-        let cleanable = ProjectDetector::cleanable_dirs_with_gitignore(
-            ProjectType::NodeJs,
-            project_dir
-        );
+        let cleanable =
+            ProjectDetector::cleanable_dirs_with_gitignore(ProjectType::NodeJs, project_dir);
 
         // Should include default Node.js patterns
         assert!(cleanable.iter().any(|d| d == "node_modules"));

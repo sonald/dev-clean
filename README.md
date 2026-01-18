@@ -91,6 +91,8 @@ Options:
   --min-size <MIN_SIZE>         Minimum size in MB
   --older-than <OLDER_THAN>     Older than N days
   --gitignore                   Respect .gitignore files (default: false)
+  --json                        Output scan results as JSON
+  --explain                     Print the matching rule for each result
 ```
 
 #### Clean
@@ -105,10 +107,29 @@ Options:
   --min-size <MIN_SIZE>         Minimum size in MB
   --older-than <OLDER_THAN>     Older than N days
   --dry-run                     Preview without deleting
+  --trash                       Move directories to Dev Cleaner's trash (undoable)
   --auto                        Skip interactive selection
   -f, --force                   Skip all confirmations
   -v, --verbose                 Verbose output
   --gitignore                   Respect .gitignore files (default: false)
+```
+
+#### Plan / Apply / Undo
+
+Generate a machine-readable cleanup plan and apply it later:
+
+```bash
+# Create a plan file
+dev-cleaner plan ~/projects --older-than 60 --min-size 500 -o plan.json
+
+# Apply the plan (with confirmation)
+dev-cleaner apply plan.json
+
+# Apply the plan but move to Dev Cleaner trash (undoable)
+dev-cleaner apply plan.json --trash
+
+# Undo a trash batch (printed after clean/apply with --trash)
+dev-cleaner undo --batch <BATCH_ID>
 ```
 
 #### Stats

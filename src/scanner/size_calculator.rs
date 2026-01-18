@@ -1,9 +1,9 @@
 use crate::ProjectInfo;
 use anyhow::Result;
+use crossbeam::channel::{self, Sender};
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
-use crossbeam::channel::{self, Sender};
 use std::thread;
 use std::time::Duration;
 
@@ -16,9 +16,7 @@ pub struct SizeCalculator {
 impl SizeCalculator {
     /// Create a new size calculator with default timeout (60 seconds)
     pub fn new() -> Self {
-        Self {
-            timeout_secs: 60,
-        }
+        Self { timeout_secs: 60 }
     }
 
     /// Create a new size calculator with custom timeout
@@ -108,7 +106,10 @@ fn calculate_dir_size_with_timeout(dir: &Path, timeout: Duration) -> Result<u64>
     // Wait for result with timeout
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir_for_error)),
+        Err(_) => Err(anyhow::anyhow!(
+            "Timeout calculating size for {:?}",
+            dir_for_error
+        )),
     }
 }
 
@@ -132,7 +133,7 @@ fn calculate_dir_size(dir: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProjectType, ProjectInfo};
+    use crate::{ProjectInfo, ProjectType};
     use chrono::Utc;
     use std::fs;
     use tempfile::TempDir;

@@ -1,14 +1,14 @@
-mod walker;
 mod detector;
 mod size_calculator;
+mod walker;
 
-pub use walker::Scanner;
-pub use detector::{ProjectType, ProjectDetector};
+pub use detector::{ProjectDetector, ProjectType};
 pub use size_calculator::SizeCalculator;
+pub use walker::Scanner;
 
-use std::path::PathBuf;
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Information about a cleanable project directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +36,9 @@ pub struct ProjectInfo {
     pub in_use: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl ProjectInfo {
     /// Create a new ProjectInfo with pending size calculation
@@ -63,7 +65,7 @@ impl ProjectInfo {
         if !self.size_calculated {
             "Calculating...".to_string()
         } else {
-            format_size(self.size)
+            crate::utils::format_size(self.size)
         }
     }
 
@@ -71,37 +73,5 @@ impl ProjectInfo {
     pub fn days_since_modified(&self) -> i64 {
         let now = Utc::now();
         (now - self.last_modified).num_days()
-    }
-}
-
-/// Format bytes into human-readable size
-fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit_idx = 0;
-
-    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_idx += 1;
-    }
-
-    if unit_idx == 0 {
-        format!("{} {}", size as u64, UNITS[unit_idx])
-    } else {
-        format!("{:.2} {}", size, UNITS[unit_idx])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_size() {
-        assert_eq!(format_size(500), "500 B");
-        assert_eq!(format_size(1024), "1.00 KB");
-        assert_eq!(format_size(1536), "1.50 KB");
-        assert_eq!(format_size(1048576), "1.00 MB");
-        assert_eq!(format_size(1073741824), "1.00 GB");
     }
 }

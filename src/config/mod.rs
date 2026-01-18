@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -73,16 +73,15 @@ impl Config {
         let content = fs::read_to_string(path.as_ref())
             .with_context(|| format!("Failed to read config file: {}", path.as_ref().display()))?;
 
-        let config: Config = toml::from_str(&content)
-            .with_context(|| "Failed to parse config file")?;
+        let config: Config =
+            toml::from_str(&content).with_context(|| "Failed to parse config file")?;
 
         Ok(config)
     }
 
     /// Save config to file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .with_context(|| "Failed to serialize config")?;
+        let content = toml::to_string_pretty(self).with_context(|| "Failed to serialize config")?;
 
         fs::write(path.as_ref(), content)
             .with_context(|| format!("Failed to write config file: {}", path.as_ref().display()))?;
@@ -104,8 +103,9 @@ impl Config {
         let config_path = Self::default_path();
 
         if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
 
         Ok(config_path)
