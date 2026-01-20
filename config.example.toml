@@ -24,11 +24,13 @@ exclude_dirs = [
 name = "Unity"
 directory = "Library"
 marker_files = ["Assets", "ProjectSettings"]
+# marker_mode = "all_of" # optional (default: "any_of")
 
 [[custom_patterns]]
 name = "Unreal Engine"
 directory = "Intermediate"
 marker_files = [".uproject"]
+# marker_mode = "any_of" # optional (default: "any_of")
 
 # [[custom_patterns]]
 # name = "Your Custom Project"

@@ -27,6 +27,9 @@ dev-cleaner scan ~/projects
 
 # Scan with filters
 dev-cleaner scan --min-size 100 --older-than 30
+
+# Include higher-risk targets (e.g. deps like node_modules)
+dev-cleaner scan ~/projects --max-risk high
 ```
 
 ### 2. Interactive TUI Mode (Recommended)
@@ -61,6 +64,9 @@ dev-cleaner clean --older-than 90 --auto
 
 # Clean large projects only
 dev-cleaner clean --min-size 500 --auto
+
+# Include higher-risk targets (e.g. deps like node_modules/.venv)
+dev-cleaner clean --max-risk high --auto
 ```
 
 ### 4. Plan / Apply (for scripts)
@@ -79,16 +85,37 @@ dev-cleaner apply plan.json --trash
 dev-cleaner undo
 ```
 
+### 5. Recommend (goal-based, no deletion)
+
+```bash
+# Recommend a plan to free 10GB, and write plan.json
+dev-cleaner recommend ~/projects --cleanup 10GB --output-plan plan.json
+
+# Or: ensure at least 50GB free
+dev-cleaner recommend ~/projects --free-at-least 50GB --output-plan plan.json
+
+# Apply the plan (optionally with trash)
+dev-cleaner apply plan.json --trash
+```
+
+### 6. Trash management
+
+```bash
+dev-cleaner trash list
+dev-cleaner trash show --batch <BATCH_ID>
+dev-cleaner trash gc --keep-days 30 --keep-gb 20
+```
+
 ## Common Scenarios
 
 ### Clean old Node.js projects
 
 ```bash
 # Find all node_modules older than 60 days
-dev-cleaner scan ~/projects --older-than 60
+dev-cleaner scan ~/projects --older-than 60 --max-risk high
 
 # Clean them (with confirmation)
-dev-cleaner clean ~/projects --older-than 60
+dev-cleaner clean ~/projects --older-than 60 --max-risk high
 ```
 
 ### Free up space on your dev machine

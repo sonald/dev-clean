@@ -8,12 +8,14 @@ A fast, intelligent developer tool for scanning and cleaning temporary build dir
 - **Smart Scanning**: Uses Ripgrep-style traversal with `.gitignore` respect
 - **Streaming Progress**: Real-time progress bars with live size calculation streaming
 - **Statistics Dashboard**: Comprehensive stats with charts, breakdowns by type, age, and size
-- **Intelligent .gitignore Integration**: Automatically reads `.gitignore` files to discover custom cleanable directories (because what's gitignored is usually cleanable!)
+- **.gitignore Discovery (Conservative)**: Reads project `.gitignore` to discover extra candidates, but treats them as high-risk by default unless explicitly included
 - **Intelligent Deduplication**: Automatically detects only top-level cleanable directories (e.g., reports `.venv` instead of hundreds of nested `__pycache__` directories)
 - **Two Modes**: CLI for quick operations, TUI for interactive selection
-- **Safe by Default**: Dry-run mode, confirmation prompts, and in-use detection
+- **Safe by Default**: Dry-run mode, confirmation prompts, in-use detection, and risk filtering (default: `--max-risk medium`)
 - **Fast & Parallel**: Leverages Rust's performance and parallel processing with streaming
 - **Configurable**: Custom rules, filters, and exclusions
+- **Trash & GC**: Undoable trash batches + `trash list/show/purge/gc`
+- **Goal-based Recommend**: `recommend --cleanup 10GB` / `recommend --free-at-least 50GB` with optional `--output-plan`
 
 ## Supported Project Types
 
@@ -75,6 +77,18 @@ dev-cleaner clean
 # Auto-clean with filters (dry-run first!)
 dev-cleaner clean --older-than 60 --min-size 500 --dry-run
 dev-cleaner clean --older-than 60 --min-size 500 --auto
+
+# Include higher-risk targets (e.g. deps like node_modules)
+dev-cleaner scan --max-risk high
+dev-cleaner clean --max-risk high --auto
+
+# Recommend a cleanup plan (does not delete), then apply it
+dev-cleaner recommend ~/projects --cleanup 10GB --output-plan plan.json
+dev-cleaner apply plan.json --trash
+
+# Manage trash batches
+dev-cleaner trash list
+dev-cleaner trash gc --keep-days 30 --keep-gb 20
 ```
 
 ### CLI Commands
@@ -93,6 +107,8 @@ Options:
   --gitignore                   Respect .gitignore files (default: false)
   --json                        Output scan results as JSON
   --explain                     Print the matching rule for each result
+  --category <CATEGORY>         Filter by category (cache/build/deps/all)
+  --max-risk <MAX_RISK>         Filter by max risk level (low/medium/high/all) (alias: --risk)
 ```
 
 #### Clean
@@ -112,6 +128,8 @@ Options:
   -f, --force                   Skip all confirmations
   -v, --verbose                 Verbose output
   --gitignore                   Respect .gitignore files (default: false)
+  --category <CATEGORY>         Filter by category (cache/build/deps/all)
+  --max-risk <MAX_RISK>         Filter by max risk level (low/medium/high/all) (alias: --risk)
 ```
 
 #### Plan / Apply / Undo
@@ -132,6 +150,26 @@ dev-cleaner apply plan.json --trash
 dev-cleaner undo --batch <BATCH_ID>
 ```
 
+#### Recommend
+
+Output a recommended list (does not delete), optionally writing a plan file:
+
+```bash
+dev-cleaner recommend [PATH] --cleanup 10GB --output-plan plan.json
+dev-cleaner recommend [PATH] --free-at-least 50GB --output-plan plan.json
+```
+
+#### Trash
+
+Manage trash batches:
+
+```bash
+dev-cleaner trash list
+dev-cleaner trash show --batch <BATCH_ID>
+dev-cleaner trash purge --batch <BATCH_ID>
+dev-cleaner trash gc --keep-days 30 --keep-gb 20
+```
+
 #### Stats
 
 Show comprehensive statistics about cleanable directories:
@@ -144,6 +182,8 @@ Options:
   --top <TOP>              Number of top largest directories to show (default: 10)
   --json                   Export statistics as JSON
   --gitignore              Respect .gitignore files (default: false)
+  --category <CATEGORY>    Filter by category (cache/build/deps/all)
+  --max-risk <MAX_RISK>    Filter by max risk level (low/medium/high/all) (alias: --risk)
 ```
 
 The stats command provides:
@@ -242,6 +282,8 @@ max_age_days = 30
 name = "Custom Build"
 directory = "my-build-dir"
 marker_files = ["my-project.config"]
+# marker_mode = "any_of" # default
+# marker_mode = "all_of"
 ```
 
 ## Examples
