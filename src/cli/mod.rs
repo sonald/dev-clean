@@ -4,9 +4,10 @@ use crate::trash::{
     default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
     restore_batch, trash_entries_for_batch,
 };
-use crate::utils::format_size;
+use crate::recommend::recommend_projects;
+use crate::utils::{format_size, parse_size};
 use crate::{Cleaner, CleanupPlan, Config, ProjectInfo, Scanner};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::fs;
@@ -233,6 +234,61 @@ pub enum Commands {
         max_risk: RiskArg,
     },
 
+    /// Recommend a cleanup plan to meet a space goal (does not execute)
+    Recommend {
+        /// Directory to scan
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Maximum scan depth
+        #[arg(short, long)]
+        depth: Option<usize>,
+
+        /// Minimum size in MB
+        #[arg(long)]
+        min_size: Option<u64>,
+
+        /// Older than N days
+        #[arg(long)]
+        older_than: Option<i64>,
+
+        /// Respect .gitignore files (skips gitignored directories)
+        #[arg(long)]
+        gitignore: bool,
+
+        /// Target bytes to free (e.g. 10GB)
+        #[arg(long)]
+        cleanup: Option<String>,
+
+        /// Ensure disk free space is at least this value (e.g. 50GB)
+        #[arg(long)]
+        free_at_least: Option<String>,
+
+        /// Include in-use projects (default: false)
+        #[arg(long)]
+        include_in_use: bool,
+
+        /// Output recommended plan to a JSON file
+        #[arg(long)]
+        output_plan: Option<PathBuf>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Print the matching rule for each result
+        #[arg(long)]
+        explain: bool,
+
+        /// Filter by category (cache/build/deps/all)
+        #[arg(long, value_enum, default_value = "all")]
+        category: CategoryFilterArg,
+
+        /// Filter by max risk level (low/medium/high/all)
+        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
+        max_risk: RiskArg,
+    },
+
     /// Apply a cleanup plan JSON file
     Apply {
         /// Path to plan JSON file
@@ -438,6 +494,38 @@ impl Cli {
                     older_than.or(config.max_age_days),
                     gitignore,
                     output,
+                    category,
+                    max_risk,
+                    &config,
+                )?;
+            }
+            Commands::Recommend {
+                path,
+                depth,
+                min_size,
+                older_than,
+                gitignore,
+                cleanup,
+                free_at_least,
+                include_in_use,
+                output_plan,
+                json,
+                explain,
+                category,
+                max_risk,
+            } => {
+                run_recommend(
+                    path,
+                    depth.or(config.default_depth),
+                    min_size.or(config.min_size_mb),
+                    older_than.or(config.max_age_days),
+                    gitignore,
+                    cleanup,
+                    free_at_least,
+                    include_in_use,
+                    output_plan,
+                    json,
+                    explain,
                     category,
                     max_risk,
                     &config,
@@ -947,6 +1035,149 @@ fn run_plan(
     Ok(())
 }
 
+fn run_recommend(
+    path: PathBuf,
+    depth: Option<usize>,
+    min_size_mb: Option<u64>,
+    older_than: Option<i64>,
+    gitignore: bool,
+    cleanup: Option<String>,
+    free_at_least: Option<String>,
+    include_in_use: bool,
+    output_plan: Option<PathBuf>,
+    json_output: bool,
+    explain: bool,
+    category: CategoryFilterArg,
+    max_risk: RiskArg,
+    config: &Config,
+) -> Result<()> {
+    use serde::Serialize;
+
+    let scan_root = fs::canonicalize(&path).unwrap_or(path);
+
+    let cleanup_bytes = cleanup.as_deref().map(parse_size).transpose()?;
+    let free_at_least_bytes = free_at_least.as_deref().map(parse_size).transpose()?;
+
+    let target_bytes = match (cleanup_bytes, free_at_least_bytes) {
+        (Some(_), Some(_)) => anyhow::bail!("Use either --cleanup or --free-at-least (not both)"),
+        (None, None) => anyhow::bail!("Missing goal: use --cleanup or --free-at-least"),
+        (Some(bytes), None) => bytes,
+        (None, Some(want_free)) => {
+            let free_now = fs2::available_space(&scan_root).with_context(|| {
+                format!(
+                    "Failed to read available disk space for {}",
+                    scan_root.display()
+                )
+            })?;
+            want_free.saturating_sub(free_now)
+        }
+    };
+
+    let mut scanner = Scanner::new(&scan_root)
+        .exclude_dirs(&config.exclude_dirs)
+        .custom_patterns(&config.custom_patterns)
+        .max_risk(max_risk.to_max_risk());
+
+    if let Some(category) = category.to_filter() {
+        scanner = scanner.category(category);
+    }
+
+    if let Some(d) = depth {
+        scanner = scanner.max_depth(d);
+    }
+
+    if let Some(size_mb) = min_size_mb {
+        scanner = scanner.min_size(size_mb * 1024 * 1024);
+    }
+
+    if let Some(days) = older_than {
+        scanner = scanner.max_age_days(days);
+    }
+
+    scanner = scanner.respect_gitignore(gitignore);
+
+    let projects = scanner.scan()?;
+    let result = recommend_projects(projects, target_bytes, include_in_use);
+
+    #[derive(Serialize)]
+    struct RecommendOutput {
+        scan_root: String,
+        target_bytes: u64,
+        selected_bytes: u64,
+        selected_count: usize,
+        projects: Vec<ProjectInfo>,
+    }
+
+    let out = RecommendOutput {
+        scan_root: scan_root.display().to_string(),
+        target_bytes: result.target_bytes,
+        selected_bytes: result.selected_bytes,
+        selected_count: result.selected.len(),
+        projects: result.selected.clone(),
+    };
+
+    if let Some(plan_path) = &output_plan {
+        let mut params = crate::plan::PlanParams::default();
+        params.cleanup_bytes = cleanup_bytes;
+        params.free_at_least_bytes = free_at_least_bytes;
+        params.max_risk = Some(max_risk.to_max_risk());
+        params.category = category.to_filter();
+
+        let plan = CleanupPlan::new_with_params(scan_root.clone(), result.selected.clone(), params);
+        plan.save_json(plan_path)?;
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("{}", "Recommended cleanup:".cyan().bold());
+    println!("  Scan root: {}", scan_root.display());
+    println!(
+        "  Target: {}",
+        if free_at_least_bytes.is_some() {
+            format!("free at least {} (need {})", format_size(free_at_least_bytes.unwrap()), format_size(target_bytes))
+        } else {
+            format!("cleanup {}", format_size(target_bytes))
+        }
+        .green()
+    );
+    println!(
+        "  Selected: {} ({})",
+        out.selected_count.to_string().green(),
+        format_size(out.selected_bytes).green().bold()
+    );
+
+    if out.projects.is_empty() {
+        println!("{}", "No directories selected.".yellow());
+        return Ok(());
+    }
+
+    println!();
+    display_projects(&out.projects);
+
+    if explain {
+        println!();
+        for project in &out.projects {
+            let reason = ProjectDetector::explain_cleanable_dir(
+                project.project_type,
+                &project.root,
+                &project.cleanable_dir,
+                &config.custom_patterns,
+            );
+            println!("  {} {}", "↳".bright_black(), reason.bright_black());
+        }
+    }
+
+    if let Some(plan_path) = output_plan {
+        println!();
+        println!("{} {}", "Plan file created:".green().bold(), plan_path.display());
+    }
+
+    Ok(())
+}
+
 fn run_apply(
     plan_path: PathBuf,
     dry_run: bool,
@@ -956,7 +1187,7 @@ fn run_apply(
 ) -> Result<()> {
     let plan = CleanupPlan::load_json(&plan_path)?;
 
-    if plan.schema_version != 1 {
+    if plan.schema_version != 1 && plan.schema_version != 2 {
         anyhow::bail!("Unsupported plan schema_version: {}", plan.schema_version);
     }
 

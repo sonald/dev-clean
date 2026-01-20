@@ -2,6 +2,7 @@ pub mod cleaner;
 pub mod cli;
 pub mod config;
 pub mod plan;
+pub mod recommend;
 pub mod scanner;
 pub mod stats;
 pub mod trash;

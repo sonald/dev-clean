@@ -44,6 +44,7 @@ anyhow = "1.0"
 # System info
 num_cpus = "1.16"
 dirs = "5.0"
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3.9"

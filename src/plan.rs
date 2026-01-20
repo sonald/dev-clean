@@ -5,22 +5,46 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlanParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_at_least_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_risk: Option<crate::scanner::RiskLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<crate::scanner::Category>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupPlan {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_version: Option<String>,
     pub created_at: DateTime<Utc>,
     pub scan_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<PlanParams>,
     pub projects: Vec<ProjectInfo>,
 }
 
 impl CleanupPlan {
     pub fn new(scan_root: PathBuf, projects: Vec<ProjectInfo>) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
+            tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             created_at: Utc::now(),
             scan_root,
+            params: None,
             projects,
         }
+    }
+
+    pub fn new_with_params(scan_root: PathBuf, projects: Vec<ProjectInfo>, params: PlanParams) -> Self {
+        let mut plan = Self::new(scan_root, projects);
+        plan.params = Some(params);
+        plan
     }
 
     pub fn to_json_pretty(&self) -> Result<String> {
@@ -56,29 +80,26 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let plan_path = temp.path().join("plan.json");
 
-        let plan = CleanupPlan {
-            schema_version: 1,
-            created_at: Utc::now(),
-            scan_root: PathBuf::from("/scan"),
-            projects: vec![ProjectInfo {
-                root: PathBuf::from("/scan/p1"),
-                project_type: ProjectType::NodeJs,
-                project_name: None,
-                category: Category::Deps,
-                risk_level: RiskLevel::High,
-                confidence: Confidence::High,
-                matched_rule: None,
-                cleanable_dir: PathBuf::from("/scan/p1/node_modules"),
-                size: 123,
-                size_calculated: true,
-                last_modified: Utc::now(),
-                in_use: false,
-            }],
-        };
+        let projects = vec![ProjectInfo {
+            root: PathBuf::from("/scan/p1"),
+            project_type: ProjectType::NodeJs,
+            project_name: None,
+            category: Category::Deps,
+            risk_level: RiskLevel::High,
+            confidence: Confidence::High,
+            matched_rule: None,
+            cleanable_dir: PathBuf::from("/scan/p1/node_modules"),
+            size: 123,
+            size_calculated: true,
+            last_modified: Utc::now(),
+            in_use: false,
+        }];
+
+        let plan = CleanupPlan::new(PathBuf::from("/scan"), projects);
 
         plan.save_json(&plan_path).unwrap();
         let loaded = CleanupPlan::load_json(&plan_path).unwrap();
-        assert_eq!(loaded.schema_version, 1);
+        assert_eq!(loaded.schema_version, 2);
         assert_eq!(loaded.projects.len(), 1);
     }
 }
