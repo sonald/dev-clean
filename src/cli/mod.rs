@@ -1,6 +1,9 @@
 use crate::cleaner::CleanOptions;
 use crate::scanner::ProjectDetector;
-use crate::trash::{default_trash_root, latest_batch_id, restore_batch};
+use crate::trash::{
+    default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
+    restore_batch, trash_entries_for_batch,
+};
 use crate::utils::format_size;
 use crate::{Cleaner, CleanupPlan, Config, ProjectInfo, Scanner};
 use anyhow::Result;
@@ -201,6 +204,63 @@ pub enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// Manage Dev Cleaner trash (list/show/purge/gc)
+    Trash {
+        #[command(subcommand)]
+        command: TrashCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TrashCommands {
+    /// List trash batches
+    List {
+        /// Show only top N batches (by most recent)
+        #[arg(long, default_value = "20")]
+        top: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show entries for a trash batch
+    Show {
+        /// Batch id to show
+        #[arg(long)]
+        batch: String,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Permanently delete a trash batch
+    Purge {
+        /// Batch id to permanently delete
+        #[arg(long)]
+        batch: String,
+
+        /// Skip confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Garbage-collect old/oversize trash batches
+    Gc {
+        /// Keep batches newer than N days
+        #[arg(long)]
+        keep_days: Option<i64>,
+
+        /// Keep total trash size under N GiB
+        #[arg(long)]
+        keep_gb: Option<u64>,
+
+        /// Dry run (show what would be deleted)
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 impl Cli {
@@ -304,6 +364,9 @@ impl Cli {
                 verbose,
             } => {
                 run_undo(batch, dry_run, force, verbose)?;
+            }
+            Commands::Trash { command } => {
+                run_trash(command)?;
             }
         }
 
@@ -851,6 +914,187 @@ fn run_undo(batch: Option<String>, dry_run: bool, force: bool, verbose: bool) ->
         println!("\n{}", "Errors:".red().bold());
         for error in &result.errors {
             println!("  {}", error.red());
+        }
+    }
+
+    Ok(())
+}
+
+fn run_trash(command: TrashCommands) -> Result<()> {
+    let trash_root = default_trash_root();
+
+    match command {
+        TrashCommands::List { top, json } => {
+            let batches = list_trash_batches(&trash_root)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&batches)?);
+                return Ok(());
+            }
+
+            if batches.is_empty() {
+                println!("{}", "No trash batches found.".yellow());
+                return Ok(());
+            }
+
+            println!("{}", "Trash batches:".cyan().bold());
+            println!("  Trash root: {}", trash_root.display());
+            println!(
+                "  Showing: {} / {}",
+                std::cmp::min(top, batches.len()),
+                batches.len()
+            );
+
+            for batch in batches.iter().take(top) {
+                println!(
+                    "  {}  {}  {}  {}",
+                    batch.batch_id.cyan().bold(),
+                    format!("{} items", batch.entries_count).bright_black(),
+                    format_size(batch.total_size).green(),
+                    batch.created_at
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                        .bright_black()
+                );
+            }
+        }
+        TrashCommands::Show { batch, json } => {
+            let entries = trash_entries_for_batch(&trash_root, &batch)?;
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+                return Ok(());
+            }
+
+            if entries.is_empty() {
+                println!("{}", "No entries found for this batch.".yellow());
+                return Ok(());
+            }
+
+            let total_size: u64 = entries.iter().map(|e| e.size).sum();
+            println!("{}", "Trash batch:".cyan().bold());
+            println!("  Trash root: {}", trash_root.display());
+            println!("  Batch: {}", batch.cyan().bold());
+            println!("  Entries: {}", entries.len().to_string().green());
+            println!("  Total size: {}", format_size(total_size).green().bold());
+            println!();
+
+            for entry in entries {
+                println!(
+                    "  {} {} ({})",
+                    "•".bright_black(),
+                    entry.original_path.display(),
+                    format_size(entry.size).yellow()
+                );
+                println!("    {} {}", "↳".bright_black(), entry.trashed_path.display());
+            }
+        }
+        TrashCommands::Purge { batch, force } => {
+            let entries = trash_entries_for_batch(&trash_root, &batch)?;
+            let total_size: u64 = entries.iter().map(|e| e.size).sum();
+
+            if !force
+                && !confirm(&format!(
+                    "Permanently delete trash batch `{}` ({} entries, {})?",
+                    batch,
+                    entries.len(),
+                    format_size(total_size)
+                ))?
+            {
+                println!("{}", "Cancelled.".yellow());
+                return Ok(());
+            }
+
+            let result = purge_trash_batch(&trash_root, &batch, false)?;
+
+            if result.failed_batches > 0 {
+                println!("{}", "Purge completed with errors.".yellow().bold());
+            } else {
+                println!("{}", "Purge completed.".green().bold());
+            }
+            println!("  Batch: {}", batch.cyan().bold());
+            println!(
+                "  Removed entries: {} ({})",
+                result.removed_entries.to_string().green(),
+                format_size(result.removed_bytes).green()
+            );
+            if !result.errors.is_empty() {
+                println!("\n{}", "Errors:".red().bold());
+                for error in &result.errors {
+                    println!("  {}", error.red());
+                }
+            }
+        }
+        TrashCommands::Gc {
+            keep_days,
+            keep_gb,
+            dry_run,
+        } => {
+            let (keep_days, keep_bytes) = match (keep_days, keep_gb) {
+                (None, None) => (Some(30), Some(20_u64.saturating_mul(1024 * 1024 * 1024))),
+                (days, gb) => (days, gb.map(|g| g.saturating_mul(1024 * 1024 * 1024))),
+            };
+
+            let result = gc_trash(&trash_root, keep_days, keep_bytes, true)?;
+
+            if result.removed_batches == 0 {
+                println!("{}", "Nothing to delete.".yellow());
+                return Ok(());
+            }
+
+            println!("{}", "Trash GC:".cyan().bold());
+            println!("  Trash root: {}", trash_root.display());
+            println!("  Would delete batches: {}", result.removed_batches.to_string().green());
+            println!(
+                "  Would free: {}",
+                format_size(result.removed_bytes).green().bold()
+            );
+
+            if result.blocked_by_keep_days {
+                println!(
+                    "  {} {}",
+                    "Note:".yellow().bold(),
+                    "keep-days prevents meeting keep-gb; only older batches are eligible."
+                        .yellow()
+                );
+            }
+
+            if dry_run {
+                println!("{}", "Dry run only; no changes made.".bright_black());
+                return Ok(());
+            }
+
+            if !confirm(&format!(
+                "Permanently delete {} trash batches (free {})?",
+                result.removed_batches,
+                format_size(result.removed_bytes)
+            ))? {
+                println!("{}", "Cancelled.".yellow());
+                return Ok(());
+            }
+
+            let applied = gc_trash(&trash_root, keep_days, keep_bytes, false)?;
+            if applied.failed_batches > 0 {
+                println!("{}", "Trash GC completed with errors.".yellow().bold());
+            } else {
+                println!("{}", "Trash GC completed.".green().bold());
+            }
+            println!(
+                "  Deleted: {} batches ({} freed)",
+                applied.removed_batches.to_string().green(),
+                format_size(applied.removed_bytes).green()
+            );
+            println!(
+                "  Remaining trash: {}",
+                format_size(applied.remaining_bytes).yellow()
+            );
+
+            if !applied.errors.is_empty() {
+                println!("\n{}", "Errors:".red().bold());
+                for error in &applied.errors {
+                    println!("  {}", error.red());
+                }
+            }
         }
     }
 
