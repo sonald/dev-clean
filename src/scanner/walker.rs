@@ -1,4 +1,7 @@
-use super::{ProjectDetector, ProjectInfo, ProjectType, SizeCalculator};
+use super::{
+    Category, Confidence, ProjectDetector, ProjectInfo, ProjectType, RiskLevel, RuleRef,
+    RuleSource, SizeCalculator,
+};
 use crate::config::{CustomPattern, MarkerMode};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -15,11 +18,37 @@ use std::time::SystemTime;
 struct CleanableMatchers {
     basename: GlobSet,
     relative_path: GlobSet,
+    builtin_patterns: Vec<String>,
+    gitignore_patterns: Vec<String>,
 }
 
 impl CleanableMatchers {
     fn matches(&self, basename: &str, relative_path: &str) -> bool {
         self.basename.is_match(basename) || self.relative_path.is_match(relative_path)
+    }
+
+    fn matched_rule(&self, basename: &str, relative_path: &str) -> Option<RuleRef> {
+        for pattern in &self.builtin_patterns {
+            if pattern_matches(pattern, basename, relative_path) {
+                return Some(RuleRef {
+                    source: RuleSource::Builtin,
+                    pattern: pattern.clone(),
+                    name: None,
+                });
+            }
+        }
+
+        for pattern in &self.gitignore_patterns {
+            if pattern_matches(pattern, basename, relative_path) {
+                return Some(RuleRef {
+                    source: RuleSource::Gitignore,
+                    pattern: pattern.clone(),
+                    name: None,
+                });
+            }
+        }
+
+        None
     }
 }
 
@@ -48,6 +77,12 @@ pub struct Scanner {
 
     /// Custom patterns from user config
     custom_patterns: Vec<CustomPattern>,
+
+    /// Filter results by category (None = all)
+    category_filter: Option<Category>,
+
+    /// Filter results by max risk level (None = all)
+    max_risk: Option<RiskLevel>,
 }
 
 impl Scanner {
@@ -62,6 +97,8 @@ impl Scanner {
             matcher_cache: Mutex::new(HashMap::new()),
             exclude_dirs: HashSet::new(),
             custom_patterns: Vec::new(),
+            category_filter: None,
+            max_risk: None,
         }
     }
 
@@ -74,6 +111,16 @@ impl Scanner {
     /// Set custom patterns from config
     pub fn custom_patterns(mut self, patterns: &[CustomPattern]) -> Self {
         self.custom_patterns = patterns.to_vec();
+        self
+    }
+
+    pub fn category(mut self, category: Category) -> Self {
+        self.category_filter = Some(category);
+        self
+    }
+
+    pub fn max_risk(mut self, max_risk: RiskLevel) -> Self {
+        self.max_risk = Some(max_risk);
         self
     }
 
@@ -226,11 +273,8 @@ impl Scanner {
 
                 let dir = entry.path();
                 if let Some(project_info) = scanner.check_directory_fast(dir) {
-                    // Apply age filter early (size filtering will be applied after size calculation).
-                    let passes_age = scanner
-                        .max_age_days
-                        .map_or(true, |ma| project_info.days_since_modified() >= ma);
-                    if passes_age {
+                    // Apply non-size filters early (size filtering will be applied after size calculation).
+                    if scanner.passes_filters(&project_info) {
                         results.lock().unwrap().push(project_info);
                     }
 
@@ -325,6 +369,12 @@ impl Scanner {
                 };
 
                 if let Some(mut info) = info {
+                    let rule = RuleRef {
+                        source: RuleSource::Custom,
+                        pattern: custom.directory.clone(),
+                        name: Some(custom.name.clone()),
+                    };
+                    apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
                     info.project_name = Some(custom.name.clone());
                     return Some(info);
                 }
@@ -336,11 +386,23 @@ impl Scanner {
                 let matchers = self.matchers_for(project_type, parent);
 
                 if matchers.matches(dir_name.as_ref(), &relative_path) {
-                    return if fast_mode {
+                    let info = if fast_mode {
                         self.build_project_info_fast(parent, project_type, dir)
                     } else {
                         self.build_project_info(parent, project_type, dir)
                     };
+
+                    if let Some(mut info) = info {
+                        if let Some(rule) = matchers.matched_rule(dir_name.as_ref(), &relative_path)
+                        {
+                            apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
+                        } else {
+                            // Shouldn't happen, but keep the default fields intact if we can't pinpoint a rule.
+                            info.category = classify_category(dir_name.as_ref(), &relative_path);
+                            info.risk_level = default_risk_level(info.category);
+                        }
+                        return Some(info);
+                    }
                 }
             }
             current = parent;
@@ -360,11 +422,24 @@ impl Scanner {
             while let Some(parent) = search_path.parent() {
                 if parent.join("CMakeLists.txt").exists() {
                     // Found the project root
-                    return if fast_mode {
+                    let info = if fast_mode {
                         self.build_project_info_fast(parent, ProjectType::Cpp, dir)
                     } else {
                         self.build_project_info(parent, ProjectType::Cpp, dir)
                     };
+
+                    if let Some(mut info) = info {
+                        info.category = Category::Build;
+                        info.risk_level = RiskLevel::Medium;
+                        info.confidence = Confidence::Medium;
+                        info.matched_rule = Some(RuleRef {
+                            source: RuleSource::Heuristic,
+                            pattern: "cmake-out-of-source-build".to_string(),
+                            name: None,
+                        });
+                        return Some(info);
+                    }
+                    return None;
                 }
                 search_path = parent;
 
@@ -443,6 +518,10 @@ impl Scanner {
             root: project_root.to_path_buf(),
             project_type,
             project_name: None,
+            category: Category::Unknown,
+            risk_level: RiskLevel::Medium,
+            confidence: Confidence::Unknown,
+            matched_rule: None,
             cleanable_dir: cleanable_dir.to_path_buf(),
             size,
             size_calculated: true,
@@ -455,7 +534,21 @@ impl Scanner {
     fn passes_filters(&self, info: &ProjectInfo) -> bool {
         // Size filter
         if let Some(min_size) = self.min_size {
-            if info.size < min_size {
+            if info.size_calculated && info.size < min_size {
+                return false;
+            }
+        }
+
+        // Category filter
+        if let Some(category) = self.category_filter {
+            if info.category != category {
+                return false;
+            }
+        }
+
+        // Risk filter
+        if let Some(max_risk) = self.max_risk {
+            if info.risk_level > max_risk {
                 return false;
             }
         }
@@ -472,7 +565,18 @@ impl Scanner {
 }
 
 fn build_matchers(project_type: ProjectType, project_root: &Path) -> CleanableMatchers {
-    let patterns = ProjectDetector::cleanable_dirs_with_gitignore(project_type, project_root);
+    let builtin_patterns = ProjectDetector::cleanable_dirs(project_type)
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let gitignore_patterns = ProjectDetector::parse_gitignore(project_root);
+
+    let mut patterns = builtin_patterns.clone();
+    for pattern in &gitignore_patterns {
+        if !patterns.contains(pattern) {
+            patterns.push(pattern.clone());
+        }
+    }
 
     let mut basename_builder = GlobSetBuilder::new();
     let mut relpath_builder = GlobSetBuilder::new();
@@ -503,6 +607,8 @@ fn build_matchers(project_type: ProjectType, project_root: &Path) -> CleanableMa
     CleanableMatchers {
         basename,
         relative_path,
+        builtin_patterns,
+        gitignore_patterns,
     }
 }
 
@@ -541,6 +647,92 @@ fn pattern_matches(pattern: &str, basename: &str, relative_path: &str) -> bool {
     };
 
     glob.compile_matcher().is_match(text)
+}
+
+fn apply_matched_rule(info: &mut ProjectInfo, rule: RuleRef, basename: &str, relative_path: &str) {
+    let category = classify_category(basename, relative_path);
+    let risk_level = risk_for_rule(rule.source, category);
+    let confidence = confidence_for_rule(rule.source);
+
+    info.category = category;
+    info.risk_level = risk_level;
+    info.confidence = confidence;
+    info.matched_rule = Some(rule);
+}
+
+fn classify_category(basename: &str, relative_path: &str) -> Category {
+    let basename = basename.to_ascii_lowercase();
+    let relative_path = relative_path.to_ascii_lowercase();
+
+    // deps
+    if basename == "node_modules"
+        || basename == ".venv"
+        || basename == "venv"
+        || basename == "vendor"
+        || basename == "deps"
+        || basename == ".bundle"
+        || relative_path == "vendor/bundle"
+        || relative_path.starts_with("vendor/bundle/")
+    {
+        return Category::Deps;
+    }
+
+    // cache
+    if basename == "__pycache__"
+        || basename == ".pytest_cache"
+        || basename == ".mypy_cache"
+        || basename == ".tox"
+        || basename == ".eggs"
+        || basename == ".cache"
+        || basename == ".turbo"
+        || basename == ".parcel-cache"
+    {
+        return Category::Cache;
+    }
+
+    // build
+    if basename == "target"
+        || basename == "build"
+        || basename == "dist"
+        || basename == "out"
+        || basename == "_build"
+        || basename == "deriveddata"
+        || basename == ".build"
+        || basename == ".next"
+        || basename == ".nuxt"
+        || basename == "bin"
+        || basename == "obj"
+        || basename.starts_with("cmake-build")
+        || basename.ends_with(".egg-info")
+    {
+        return Category::Build;
+    }
+
+    Category::Unknown
+}
+
+fn default_risk_level(category: Category) -> RiskLevel {
+    match category {
+        Category::Cache => RiskLevel::Low,
+        Category::Build => RiskLevel::Medium,
+        Category::Deps => RiskLevel::High,
+        Category::Unknown => RiskLevel::Medium,
+    }
+}
+
+fn risk_for_rule(source: RuleSource, category: Category) -> RiskLevel {
+    match source {
+        RuleSource::Gitignore => RiskLevel::High,
+        _ => default_risk_level(category),
+    }
+}
+
+fn confidence_for_rule(source: RuleSource) -> Confidence {
+    match source {
+        RuleSource::Custom | RuleSource::Builtin => Confidence::High,
+        RuleSource::Heuristic => Confidence::Medium,
+        RuleSource::Gitignore => Confidence::Low,
+    }
 }
 
 /// Calculate total size of a directory recursively

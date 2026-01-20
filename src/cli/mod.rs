@@ -1,5 +1,5 @@
 use crate::cleaner::CleanOptions;
-use crate::scanner::ProjectDetector;
+use crate::scanner::{Category, ProjectDetector, RiskLevel};
 use crate::trash::{
     default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
     restore_batch, trash_entries_for_batch,
@@ -7,7 +7,7 @@ use crate::trash::{
 use crate::utils::format_size;
 use crate::{Cleaner, CleanupPlan, Config, ProjectInfo, Scanner};
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::fs;
 use std::io::{self, Write};
@@ -23,6 +23,43 @@ pub struct Cli {
     /// Config file path
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CategoryFilterArg {
+    Cache,
+    Build,
+    Deps,
+    All,
+}
+
+impl CategoryFilterArg {
+    fn to_filter(self) -> Option<Category> {
+        match self {
+            Self::Cache => Some(Category::Cache),
+            Self::Build => Some(Category::Build),
+            Self::Deps => Some(Category::Deps),
+            Self::All => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum RiskArg {
+    Low,
+    Medium,
+    High,
+    All,
+}
+
+impl RiskArg {
+    fn to_max_risk(self) -> RiskLevel {
+        match self {
+            Self::Low => RiskLevel::Low,
+            Self::Medium => RiskLevel::Medium,
+            Self::High | Self::All => RiskLevel::High,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -56,6 +93,14 @@ pub enum Commands {
         /// Print the matching rule for each result
         #[arg(long)]
         explain: bool,
+
+        /// Filter by category (cache/build/deps/all)
+        #[arg(long, value_enum, default_value = "all")]
+        category: CategoryFilterArg,
+
+        /// Filter by max risk level (low/medium/high/all)
+        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
+        max_risk: RiskArg,
     },
 
     /// Clean project directories
@@ -99,6 +144,14 @@ pub enum Commands {
         /// Respect .gitignore files (skips gitignored directories)
         #[arg(long)]
         gitignore: bool,
+
+        /// Filter by category (cache/build/deps/all)
+        #[arg(long, value_enum, default_value = "all")]
+        category: CategoryFilterArg,
+
+        /// Filter by max risk level (low/medium/high/all)
+        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
+        max_risk: RiskArg,
     },
 
     /// Launch interactive TUI mode
@@ -129,6 +182,14 @@ pub enum Commands {
         /// Respect .gitignore files (skips gitignored directories)
         #[arg(long)]
         gitignore: bool,
+
+        /// Filter by category (cache/build/deps/all)
+        #[arg(long, value_enum, default_value = "all")]
+        category: CategoryFilterArg,
+
+        /// Filter by max risk level (low/medium/high/all)
+        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
+        max_risk: RiskArg,
     },
 
     /// Generate default config file
@@ -162,6 +223,14 @@ pub enum Commands {
         /// Output file path (prints to stdout if omitted)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Filter by category (cache/build/deps/all)
+        #[arg(long, value_enum, default_value = "all")]
+        category: CategoryFilterArg,
+
+        /// Filter by max risk level (low/medium/high/all)
+        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
+        max_risk: RiskArg,
     },
 
     /// Apply a cleanup plan JSON file
@@ -280,6 +349,8 @@ impl Cli {
                 gitignore,
                 json,
                 explain,
+                category,
+                max_risk,
             } => {
                 run_scan(
                     path,
@@ -289,6 +360,8 @@ impl Cli {
                     gitignore,
                     json,
                     explain,
+                    category,
+                    max_risk,
                     &config,
                 )?;
             }
@@ -303,6 +376,8 @@ impl Cli {
                 force,
                 verbose,
                 gitignore,
+                category,
+                max_risk,
             } => {
                 run_clean(
                     path,
@@ -315,6 +390,8 @@ impl Cli {
                     force,
                     verbose,
                     gitignore,
+                    category,
+                    max_risk,
                     &config,
                 )?;
             }
@@ -327,8 +404,19 @@ impl Cli {
                 top,
                 json,
                 gitignore,
+                category,
+                max_risk,
             } => {
-                run_stats(path, depth.or(config.default_depth), top, json, gitignore, &config)?;
+                run_stats(
+                    path,
+                    depth.or(config.default_depth),
+                    top,
+                    json,
+                    gitignore,
+                    category,
+                    max_risk,
+                    &config,
+                )?;
             }
             Commands::InitConfig { path } => {
                 init_config(path)?;
@@ -340,6 +428,8 @@ impl Cli {
                 older_than,
                 gitignore,
                 output,
+                category,
+                max_risk,
             } => {
                 run_plan(
                     path,
@@ -348,6 +438,8 @@ impl Cli {
                     older_than.or(config.max_age_days),
                     gitignore,
                     output,
+                    category,
+                    max_risk,
                     &config,
                 )?;
             }
@@ -385,6 +477,8 @@ fn run_scan(
     gitignore: bool,
     json_output: bool,
     explain: bool,
+    category: CategoryFilterArg,
+    max_risk: RiskArg,
     config: &Config,
 ) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
@@ -392,7 +486,12 @@ fn run_scan(
     if json_output {
         let mut scanner = Scanner::new(&path)
             .exclude_dirs(&config.exclude_dirs)
-            .custom_patterns(&config.custom_patterns);
+            .custom_patterns(&config.custom_patterns)
+            .max_risk(max_risk.to_max_risk());
+
+        if let Some(category) = category.to_filter() {
+            scanner = scanner.category(category);
+        }
 
         if let Some(d) = depth {
             scanner = scanner.max_depth(d);
@@ -417,7 +516,12 @@ fn run_scan(
 
     let mut scanner = Scanner::new(&path)
         .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns);
+        .custom_patterns(&config.custom_patterns)
+        .max_risk(max_risk.to_max_risk());
+
+    if let Some(category) = category.to_filter() {
+        scanner = scanner.category(category);
+    }
     let min_size_bytes = min_size_mb.map(|size_mb| size_mb * 1024 * 1024);
 
     if let Some(d) = depth {
@@ -483,9 +587,14 @@ fn run_scan(
 
         // Print result immediately above progress bar (streaming output)
         pb.println(format!(
-            "  {} {} {} ({})",
+            "  {} {} {} {} ({})",
             "✓".green(),
             project.project_type_display_name().bright_cyan(),
+            format!(
+                "[{}/{}/{}]",
+                project.category, project.risk_level, project.confidence
+            )
+            .bright_black(),
             dir_display.bright_white(),
             project.size_human().yellow()
         ));
@@ -542,13 +651,20 @@ fn run_clean(
     force: bool,
     verbose: bool,
     gitignore: bool,
+    category: CategoryFilterArg,
+    max_risk: RiskArg,
     config: &Config,
 ) -> Result<()> {
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
 
     let mut scanner = Scanner::new(&path)
         .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns);
+        .custom_patterns(&config.custom_patterns)
+        .max_risk(max_risk.to_max_risk());
+
+    if let Some(category) = category.to_filter() {
+        scanner = scanner.category(category);
+    }
 
     if let Some(d) = depth {
         scanner = scanner.max_depth(d);
@@ -658,9 +774,14 @@ fn display_projects(projects: &[ProjectInfo]) {
         };
 
         println!(
-            "{}. [{}] {} - {}{} ({})",
+            "{}. [{}] {} {} - {}{} ({})",
             (idx + 1).to_string().dimmed(),
             colored_type,
+            format!(
+                "[{}/{}/{}]",
+                project.category, project.risk_level, project.confidence
+            )
+            .bright_black(),
             project.cleanable_dir.display().to_string().bold(),
             project.size_human().green(),
             in_use,
@@ -709,6 +830,8 @@ fn run_stats(
     top_n: usize,
     json_output: bool,
     gitignore: bool,
+    category: CategoryFilterArg,
+    max_risk: RiskArg,
     config: &Config,
 ) -> Result<()> {
     use crate::Statistics;
@@ -717,7 +840,12 @@ fn run_stats(
 
     let mut scanner = Scanner::new(&path)
         .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns);
+        .custom_patterns(&config.custom_patterns)
+        .max_risk(max_risk.to_max_risk());
+
+    if let Some(category) = category.to_filter() {
+        scanner = scanner.category(category);
+    }
 
     if let Some(d) = depth {
         scanner = scanner.max_depth(d);
@@ -774,12 +902,19 @@ fn run_plan(
     older_than: Option<i64>,
     gitignore: bool,
     output: Option<PathBuf>,
+    category: CategoryFilterArg,
+    max_risk: RiskArg,
     config: &Config,
 ) -> Result<()> {
     let scan_root = fs::canonicalize(&path).unwrap_or(path);
     let mut scanner = Scanner::new(&scan_root)
         .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns);
+        .custom_patterns(&config.custom_patterns)
+        .max_risk(max_risk.to_max_risk());
+
+    if let Some(category) = category.to_filter() {
+        scanner = scanner.category(category);
+    }
 
     if let Some(d) = depth {
         scanner = scanner.max_depth(d);

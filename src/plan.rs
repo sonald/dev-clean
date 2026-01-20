@@ -46,6 +46,7 @@ impl CleanupPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::{Category, Confidence, RiskLevel};
     use crate::ProjectType;
     use chrono::Utc;
     use tempfile::TempDir;
@@ -63,6 +64,10 @@ mod tests {
                 root: PathBuf::from("/scan/p1"),
                 project_type: ProjectType::NodeJs,
                 project_name: None,
+                category: Category::Deps,
+                risk_level: RiskLevel::High,
+                confidence: Confidence::High,
+                matched_rule: None,
                 cleanable_dir: PathBuf::from("/scan/p1/node_modules"),
                 size: 123,
                 size_calculated: true,

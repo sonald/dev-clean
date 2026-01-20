@@ -9,6 +9,118 @@ pub use walker::Scanner;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::{fmt, fmt::Display};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Category {
+    Cache,
+    Build,
+    Deps,
+    Unknown,
+}
+
+impl Default for Category {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl Category {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cache => "cache",
+            Self::Build => "build",
+            Self::Deps => "deps",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl Display for Category {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
+impl Default for RiskLevel {
+    fn default() -> Self {
+        Self::Medium
+    }
+}
+
+impl RiskLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl Display for RiskLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+    Unknown,
+}
+
+impl Default for Confidence {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl Confidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl Display for Confidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleSource {
+    Custom,
+    Builtin,
+    Gitignore,
+    Heuristic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleRef {
+    pub source: RuleSource,
+    pub pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
 
 /// Information about a cleanable project directory
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +134,22 @@ pub struct ProjectInfo {
     /// Optional custom project type name (from config `custom_patterns`)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+
+    /// Category of this cleanable target (cache/build/deps)
+    #[serde(default)]
+    pub category: Category,
+
+    /// Default risk level (low/medium/high)
+    #[serde(default)]
+    pub risk_level: RiskLevel,
+
+    /// Confidence of the matching rule (high/medium/low)
+    #[serde(default)]
+    pub confidence: Confidence,
+
+    /// Matching rule reference (source + pattern) for explain/audit
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_rule: Option<RuleRef>,
 
     /// Cleanable directory path (e.g., node_modules, target)
     pub cleanable_dir: PathBuf,
@@ -57,6 +185,10 @@ impl ProjectInfo {
             root,
             project_type,
             project_name: None,
+            category: Category::default(),
+            risk_level: RiskLevel::default(),
+            confidence: Confidence::default(),
+            matched_rule: None,
             cleanable_dir,
             size: 0,
             size_calculated: false,

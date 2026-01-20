@@ -308,6 +308,7 @@ impl Statistics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::{Category, Confidence, RiskLevel};
     use crate::ProjectType;
     use chrono::Utc;
     use std::path::PathBuf;
@@ -319,6 +320,10 @@ mod tests {
                 root: PathBuf::from("/test1"),
                 project_type: ProjectType::NodeJs,
                 project_name: None,
+                category: Category::Deps,
+                risk_level: RiskLevel::High,
+                confidence: Confidence::High,
+                matched_rule: None,
                 cleanable_dir: PathBuf::from("/test1/node_modules"),
                 size: 1000000,
                 size_calculated: true,
@@ -329,6 +334,10 @@ mod tests {
                 root: PathBuf::from("/test2"),
                 project_type: ProjectType::Rust,
                 project_name: None,
+                category: Category::Build,
+                risk_level: RiskLevel::Medium,
+                confidence: Confidence::High,
+                matched_rule: None,
                 cleanable_dir: PathBuf::from("/test2/target"),
                 size: 2000000,
                 size_calculated: true,
