@@ -19,6 +19,10 @@ pub struct ProjectInfo {
     /// Type of the project (Node, Rust, Python, etc.)
     pub project_type: ProjectType,
 
+    /// Optional custom project type name (from config `custom_patterns`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+
     /// Cleanable directory path (e.g., node_modules, target)
     pub cleanable_dir: PathBuf,
 
@@ -52,12 +56,19 @@ impl ProjectInfo {
         Self {
             root,
             project_type,
+            project_name: None,
             cleanable_dir,
             size: 0,
             size_calculated: false,
             last_modified,
             in_use,
         }
+    }
+
+    pub fn project_type_display_name(&self) -> String {
+        self.project_name
+            .clone()
+            .unwrap_or_else(|| self.project_type.name().to_string())
     }
 
     /// Returns a human-readable size string

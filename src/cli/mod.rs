@@ -289,6 +289,7 @@ impl Cli {
                     gitignore,
                     json,
                     explain,
+                    &config,
                 )?;
             }
             Commands::Clean {
@@ -314,10 +315,11 @@ impl Cli {
                     force,
                     verbose,
                     gitignore,
+                    &config,
                 )?;
             }
             Commands::Tui { path } => {
-                crate::tui::run_tui(path)?;
+                crate::tui::run_tui_with_config(path, &config)?;
             }
             Commands::Stats {
                 path,
@@ -326,7 +328,7 @@ impl Cli {
                 json,
                 gitignore,
             } => {
-                run_stats(path, depth.or(config.default_depth), top, json, gitignore)?;
+                run_stats(path, depth.or(config.default_depth), top, json, gitignore, &config)?;
             }
             Commands::InitConfig { path } => {
                 init_config(path)?;
@@ -346,6 +348,7 @@ impl Cli {
                     older_than.or(config.max_age_days),
                     gitignore,
                     output,
+                    &config,
                 )?;
             }
             Commands::Apply {
@@ -382,11 +385,14 @@ fn run_scan(
     gitignore: bool,
     json_output: bool,
     explain: bool,
+    config: &Config,
 ) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
 
     if json_output {
-        let mut scanner = Scanner::new(&path);
+        let mut scanner = Scanner::new(&path)
+            .exclude_dirs(&config.exclude_dirs)
+            .custom_patterns(&config.custom_patterns);
 
         if let Some(d) = depth {
             scanner = scanner.max_depth(d);
@@ -409,7 +415,9 @@ fn run_scan(
 
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
 
-    let mut scanner = Scanner::new(&path);
+    let mut scanner = Scanner::new(&path)
+        .exclude_dirs(&config.exclude_dirs)
+        .custom_patterns(&config.custom_patterns);
     let min_size_bytes = min_size_mb.map(|size_mb| size_mb * 1024 * 1024);
 
     if let Some(d) = depth {
@@ -477,7 +485,7 @@ fn run_scan(
         pb.println(format!(
             "  {} {} {} ({})",
             "✓".green(),
-            project.project_type.name().bright_cyan(),
+            project.project_type_display_name().bright_cyan(),
             dir_display.bright_white(),
             project.size_human().yellow()
         ));
@@ -487,6 +495,7 @@ fn run_scan(
                 project.project_type,
                 &project.root,
                 &project.cleanable_dir,
+                &config.custom_patterns,
             );
             pb.println(format!(
                 "    {} {}",
@@ -533,10 +542,13 @@ fn run_clean(
     force: bool,
     verbose: bool,
     gitignore: bool,
+    config: &Config,
 ) -> Result<()> {
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
 
-    let mut scanner = Scanner::new(&path);
+    let mut scanner = Scanner::new(&path)
+        .exclude_dirs(&config.exclude_dirs)
+        .custom_patterns(&config.custom_patterns);
 
     if let Some(d) = depth {
         scanner = scanner.max_depth(d);
@@ -628,7 +640,7 @@ fn run_clean(
 
 fn display_projects(projects: &[ProjectInfo]) {
     for (idx, project) in projects.iter().enumerate() {
-        let project_type = project.project_type.name();
+        let project_type = project.project_type_display_name();
         let colored_type = match project.project_type.color() {
             "green" => project_type.green(),
             "red" => project_type.red(),
@@ -697,12 +709,15 @@ fn run_stats(
     top_n: usize,
     json_output: bool,
     gitignore: bool,
+    config: &Config,
 ) -> Result<()> {
     use crate::Statistics;
 
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
 
-    let mut scanner = Scanner::new(&path);
+    let mut scanner = Scanner::new(&path)
+        .exclude_dirs(&config.exclude_dirs)
+        .custom_patterns(&config.custom_patterns);
 
     if let Some(d) = depth {
         scanner = scanner.max_depth(d);
@@ -759,9 +774,12 @@ fn run_plan(
     older_than: Option<i64>,
     gitignore: bool,
     output: Option<PathBuf>,
+    config: &Config,
 ) -> Result<()> {
     let scan_root = fs::canonicalize(&path).unwrap_or(path);
-    let mut scanner = Scanner::new(&scan_root);
+    let mut scanner = Scanner::new(&scan_root)
+        .exclude_dirs(&config.exclude_dirs)
+        .custom_patterns(&config.custom_patterns);
 
     if let Some(d) = depth {
         scanner = scanner.max_depth(d);

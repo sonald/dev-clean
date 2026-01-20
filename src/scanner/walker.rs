@@ -1,10 +1,11 @@
 use super::{ProjectDetector, ProjectInfo, ProjectType, SizeCalculator};
+use crate::config::{CustomPattern, MarkerMode};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{self, Receiver};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -41,6 +42,12 @@ pub struct Scanner {
 
     /// Cache of compiled cleanable directory matchers per project root/type
     matcher_cache: Mutex<HashMap<(PathBuf, ProjectType), Arc<CleanableMatchers>>>,
+
+    /// Directories to always exclude from scanning (by basename)
+    exclude_dirs: HashSet<String>,
+
+    /// Custom patterns from user config
+    custom_patterns: Vec<CustomPattern>,
 }
 
 impl Scanner {
@@ -53,7 +60,21 @@ impl Scanner {
             min_size: None,
             max_age_days: None,
             matcher_cache: Mutex::new(HashMap::new()),
+            exclude_dirs: HashSet::new(),
+            custom_patterns: Vec::new(),
         }
+    }
+
+    /// Set directories to exclude from scanning (by basename)
+    pub fn exclude_dirs(mut self, dirs: &[String]) -> Self {
+        self.exclude_dirs = dirs.iter().cloned().collect();
+        self
+    }
+
+    /// Set custom patterns from config
+    pub fn custom_patterns(mut self, patterns: &[CustomPattern]) -> Self {
+        self.custom_patterns = patterns.to_vec();
+        self
     }
 
     /// Set whether to respect .gitignore files (default: false)
@@ -86,15 +107,17 @@ impl Scanner {
 
         // Build walker with Ripgrep-style configuration
         let mut walker = WalkBuilder::new(&self.root);
+        let exclude_dirs = self.exclude_dirs.clone();
         walker
             .hidden(false) // Don't skip hidden files/dirs
             .ignore(self.respect_gitignore) // Respect .gitignore if enabled
             .git_ignore(self.respect_gitignore)
             .git_exclude(self.respect_gitignore)
-            .filter_entry(|entry| {
+            .filter_entry(move |entry| {
                 // Skip common VCS directories that should never be scanned
                 let file_name = entry.file_name().to_string_lossy();
                 !matches!(file_name.as_ref(), ".git" | ".svn" | ".hg")
+                    && !exclude_dirs.contains(file_name.as_ref())
             });
 
         if let Some(depth) = self.max_depth {
@@ -170,14 +193,16 @@ impl Scanner {
 
         // Build walker with Ripgrep-style configuration
         let mut walker = WalkBuilder::new(&self.root);
+        let exclude_dirs = self.exclude_dirs.clone();
         walker
             .hidden(false)
             .ignore(self.respect_gitignore)
             .git_ignore(self.respect_gitignore)
             .git_exclude(self.respect_gitignore)
-            .filter_entry(|entry| {
+            .filter_entry(move |entry| {
                 let file_name = entry.file_name().to_string_lossy();
                 !matches!(file_name.as_ref(), ".git" | ".svn" | ".hg")
+                    && !exclude_dirs.contains(file_name.as_ref())
             });
 
         if let Some(depth) = self.max_depth {
@@ -281,11 +306,34 @@ impl Scanner {
 
         // Look for project root by checking parent directories
         while let Some(parent) = current.parent() {
+            let relative_path = normalize_relative_path(dir.strip_prefix(parent).ok()?);
+
+            // Custom patterns (higher priority than builtin/.gitignore patterns)
+            for custom in &self.custom_patterns {
+                if !custom_root_matches(parent, custom) {
+                    continue;
+                }
+
+                if !pattern_matches(&custom.directory, dir_name.as_ref(), &relative_path) {
+                    continue;
+                }
+
+                let info = if fast_mode {
+                    self.build_project_info_fast(parent, ProjectType::Generic, dir)
+                } else {
+                    self.build_project_info(parent, ProjectType::Generic, dir)
+                };
+
+                if let Some(mut info) = info {
+                    info.project_name = Some(custom.name.clone());
+                    return Some(info);
+                }
+            }
+
             if let Some(project_type) = ProjectDetector::detect(parent) {
                 // Check if current directory is a cleanable dir for this project type
                 // This includes both default patterns AND patterns from .gitignore
                 let matchers = self.matchers_for(project_type, parent);
-                let relative_path = normalize_relative_path(dir.strip_prefix(parent).ok()?);
 
                 if matchers.matches(dir_name.as_ref(), &relative_path) {
                     return if fast_mode {
@@ -394,6 +442,7 @@ impl Scanner {
         Some(ProjectInfo {
             root: project_root.to_path_buf(),
             project_type,
+            project_name: None,
             cleanable_dir: cleanable_dir.to_path_buf(),
             size,
             size_calculated: true,
@@ -459,6 +508,39 @@ fn build_matchers(project_type: ProjectType, project_root: &Path) -> CleanableMa
 
 fn normalize_relative_path(relative: &Path) -> String {
     relative.to_string_lossy().replace('\\', "/")
+}
+
+fn custom_root_matches(project_root: &Path, custom: &CustomPattern) -> bool {
+    if custom.marker_files.is_empty() {
+        return false;
+    }
+
+    match custom.marker_mode {
+        MarkerMode::AnyOf => custom
+            .marker_files
+            .iter()
+            .any(|marker| project_root.join(marker).exists()),
+        MarkerMode::AllOf => custom
+            .marker_files
+            .iter()
+            .all(|marker| project_root.join(marker).exists()),
+    }
+}
+
+fn pattern_matches(pattern: &str, basename: &str, relative_path: &str) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    let text = if pattern.contains('/') {
+        relative_path
+    } else {
+        basename
+    };
+
+    let glob = match GlobBuilder::new(&pattern).literal_separator(true).build() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    glob.compile_matcher().is_match(text)
 }
 
 /// Calculate total size of a directory recursively
@@ -663,5 +745,57 @@ mod tests {
         assert!(found_dirs.contains(&"build-debug".to_string()));
         assert!(found_dirs.contains(&"_build".to_string()));
         assert!(found_dirs.contains(&"build".to_string()));
+    }
+
+    #[test]
+    fn test_scanner_exclude_dirs_prunes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let excluded = root.join("excluded");
+        fs::create_dir_all(&excluded).unwrap();
+
+        let project_dir = excluded.join("test-project");
+        fs::create_dir(&project_dir).unwrap();
+        fs::write(project_dir.join("package.json"), "{}").unwrap();
+
+        let node_modules = project_dir.join("node_modules");
+        fs::create_dir(&node_modules).unwrap();
+        fs::write(node_modules.join("test.txt"), "test").unwrap();
+
+        let exclude_dirs = vec!["excluded".to_string()];
+        let scanner = Scanner::new(root).exclude_dirs(&exclude_dirs);
+        let results = scanner.scan().unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_scanner_custom_patterns() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let project_dir = root.join("unity-project");
+        fs::create_dir(&project_dir).unwrap();
+        fs::create_dir(project_dir.join("Assets")).unwrap();
+        fs::create_dir(project_dir.join("ProjectSettings")).unwrap();
+
+        let library_dir = project_dir.join("Library");
+        fs::create_dir(&library_dir).unwrap();
+        fs::write(library_dir.join("x"), "y").unwrap();
+
+        let patterns = vec![CustomPattern {
+            name: "Unity".to_string(),
+            directory: "Library".to_string(),
+            marker_files: vec!["Assets".to_string(), "ProjectSettings".to_string()],
+            marker_mode: MarkerMode::AllOf,
+        }];
+
+        let scanner = Scanner::new(root).custom_patterns(&patterns);
+        let results = scanner.scan().unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].project_type, ProjectType::Generic);
+        assert_eq!(results[0].project_name.as_deref(), Some("Unity"));
+        assert!(results[0].cleanable_dir.ends_with("Library"));
     }
 }

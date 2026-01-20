@@ -75,7 +75,7 @@ impl Statistics {
         // Group by type
         let mut by_type: HashMap<String, TypeStats> = HashMap::new();
         for project in &projects {
-            let type_name = project.project_type.name().to_string();
+            let type_name = project.project_type_display_name();
             let entry = by_type.entry(type_name.clone()).or_insert(TypeStats {
                 total_size: 0,
                 count: 0,
@@ -102,7 +102,7 @@ impl Statistics {
             .map(|p| ProjectStats {
                 path: p.cleanable_dir.display().to_string(),
                 size: p.size,
-                project_type: p.project_type.name().to_string(),
+                project_type: p.project_type_display_name(),
                 age_days: p.days_since_modified(),
             })
             .collect();
@@ -318,6 +318,7 @@ mod tests {
             ProjectInfo {
                 root: PathBuf::from("/test1"),
                 project_type: ProjectType::NodeJs,
+                project_name: None,
                 cleanable_dir: PathBuf::from("/test1/node_modules"),
                 size: 1000000,
                 size_calculated: true,
@@ -327,6 +328,7 @@ mod tests {
             ProjectInfo {
                 root: PathBuf::from("/test2"),
                 project_type: ProjectType::Rust,
+                project_name: None,
                 cleanable_dir: PathBuf::from("/test2/target"),
                 size: 2000000,
                 size_calculated: true,

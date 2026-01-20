@@ -1,3 +1,4 @@
+use crate::config::{CustomPattern, MarkerMode};
 use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -342,6 +343,7 @@ impl ProjectDetector {
         project_type: ProjectType,
         project_root: &Path,
         cleanable_dir: &Path,
+        custom_patterns: &[CustomPattern],
     ) -> String {
         let basename = cleanable_dir
             .file_name()
@@ -354,7 +356,20 @@ impl ProjectDetector {
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|| cleanable_dir.display().to_string());
 
-        // Prefer built-in patterns.
+        // Prefer user config custom patterns.
+        for pattern in custom_patterns {
+            if !custom_root_matches(project_root, pattern) {
+                continue;
+            }
+            if pattern_matches(&pattern.directory, basename, &relative_path) {
+                return format!(
+                    "matched config custom pattern `{}` directory `{}`",
+                    pattern.name, pattern.directory
+                );
+            }
+        }
+
+        // Then built-in patterns.
         for pattern in Self::cleanable_dirs(project_type) {
             if pattern_matches(pattern, basename, &relative_path) {
                 return format!("matched builtin pattern `{}`", pattern);
@@ -391,6 +406,23 @@ fn pattern_matches(pattern: &str, basename: &str, relative_path: &str) -> bool {
     };
 
     glob.compile_matcher().is_match(text)
+}
+
+fn custom_root_matches(project_root: &Path, custom: &CustomPattern) -> bool {
+    if custom.marker_files.is_empty() {
+        return false;
+    }
+
+    match custom.marker_mode {
+        MarkerMode::AnyOf => custom
+            .marker_files
+            .iter()
+            .any(|marker| project_root.join(marker).exists()),
+        MarkerMode::AllOf => custom
+            .marker_files
+            .iter()
+            .all(|marker| project_root.join(marker).exists()),
+    }
 }
 
 fn dir_contains_extension(dir: &Path, extensions: &[&str]) -> bool {

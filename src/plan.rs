@@ -62,6 +62,7 @@ mod tests {
             projects: vec![ProjectInfo {
                 root: PathBuf::from("/scan/p1"),
                 project_type: ProjectType::NodeJs,
+                project_name: None,
                 cleanable_dir: PathBuf::from("/scan/p1/node_modules"),
                 size: 123,
                 size_calculated: true,

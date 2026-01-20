@@ -54,6 +54,23 @@ pub struct CustomPattern {
 
     /// Marker files to identify project type
     pub marker_files: Vec<String>,
+
+    /// How to interpret `marker_files`
+    #[serde(default)]
+    pub marker_mode: MarkerMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerMode {
+    AnyOf,
+    AllOf,
+}
+
+impl Default for MarkerMode {
+    fn default() -> Self {
+        Self::AnyOf
+    }
 }
 
 impl Config {

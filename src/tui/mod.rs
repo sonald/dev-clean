@@ -1,5 +1,5 @@
 use crate::utils::format_size;
-use crate::{Cleaner, ProjectInfo, Scanner};
+use crate::{Cleaner, Config, ProjectInfo, Scanner};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -122,7 +122,28 @@ impl App {
 
 pub fn run_tui(path: PathBuf) -> Result<()> {
     // Scan for projects
-    let scanner = Scanner::new(&path);
+    let config = Config::load_or_default(Config::default_path())?;
+    run_tui_with_config(path, &config)
+}
+
+pub fn run_tui_with_config(path: PathBuf, config: &Config) -> Result<()> {
+    // Scan for projects
+    let mut scanner = Scanner::new(&path)
+        .exclude_dirs(&config.exclude_dirs)
+        .custom_patterns(&config.custom_patterns);
+
+    if let Some(depth) = config.default_depth {
+        scanner = scanner.max_depth(depth);
+    }
+
+    if let Some(min_size_mb) = config.min_size_mb {
+        scanner = scanner.min_size(min_size_mb * 1024 * 1024);
+    }
+
+    if let Some(max_age_days) = config.max_age_days {
+        scanner = scanner.max_age_days(max_age_days);
+    }
+
     let projects = scanner.scan()?;
 
     if projects.is_empty() {
