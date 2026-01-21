@@ -684,6 +684,7 @@ fn classify_category(basename: &str, relative_path: &str) -> Category {
         || basename == ".tox"
         || basename == ".eggs"
         || basename == ".cache"
+        || basename == ".dart_tool"
         || basename == ".turbo"
         || basename == ".parcel-cache"
     {
@@ -694,8 +695,10 @@ fn classify_category(basename: &str, relative_path: &str) -> Category {
     if basename == "target"
         || basename == "build"
         || basename == "dist"
+        || basename == "dist-newstyle"
         || basename == "out"
         || basename == "_build"
+        || basename == ".stack-work"
         || basename == "deriveddata"
         || basename == ".build"
         || basename == ".next"

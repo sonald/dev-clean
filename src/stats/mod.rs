@@ -152,6 +152,9 @@ impl Statistics {
         // By Type
         self.display_by_type();
 
+        // Charts
+        self.display_charts();
+
         // Top N Largest
         self.display_top_largest(top_n);
 
@@ -202,6 +205,52 @@ impl Statistics {
         }
 
         table.printstd();
+    }
+
+    fn display_charts(&self) {
+        println!("\n{}", "Charts".bright_green().bold());
+        self.display_chart_by_type(8);
+        self.display_chart_by_age();
+    }
+
+    fn display_chart_by_type(&self, top_n: usize) {
+        println!("  Size by project type");
+
+        let mut types: Vec<_> = self.by_type.iter().collect();
+        if types.is_empty() {
+            println!("  (no data)");
+            return;
+        }
+
+        types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
+        let max_size = types.first().map(|(_, stats)| stats.total_size).unwrap_or(0);
+
+        for (type_name, stats) in types.into_iter().take(top_n) {
+            let bar = render_bar(stats.total_size, max_size, 24);
+            let size_label = format_size(stats.total_size);
+            println!("  {:<18} {:>10} {}", type_name, size_label, bar);
+        }
+    }
+
+    fn display_chart_by_age(&self) {
+        println!("\n  Size by age group");
+
+        let groups = vec![
+            ("Recent (<30d)", self.by_age_group.recent),
+            ("Medium (30-90d)", self.by_age_group.medium),
+            ("Old (>90d)", self.by_age_group.old),
+        ];
+
+        let max_size = groups
+            .iter()
+            .map(|(_, (_, size))| *size)
+            .max()
+            .unwrap_or(0);
+
+        for (label, (_, size)) in groups {
+            let bar = render_bar(size, max_size, 24);
+            println!("  {:<18} {:>10} {}", label, format_size(size), bar);
+        }
     }
 
     fn display_top_largest(&self, top_n: usize) {
@@ -303,6 +352,21 @@ impl Statistics {
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
+}
+
+fn render_bar(value: u64, max: u64, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let filled = if max == 0 {
+        0
+    } else {
+        ((value.saturating_mul(width as u64)) / max) as usize
+    };
+    let filled = filled.min(width);
+
+    format!("{}{}", "#".repeat(filled), "-".repeat(width - filled))
 }
 
 #[cfg(test)]

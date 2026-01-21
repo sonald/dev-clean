@@ -26,6 +26,10 @@ A fast, intelligent developer tool for scanning and cleaning temporary build dir
 | **Python** | `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.tox`, `*.egg-info`, `.eggs`, `build`, `dist` |
 | **Java/Maven** | `target`, `out` |
 | **Kotlin/Gradle** | `build`, `.gradle`, `out` |
+| **Scala (sbt)** | `target`, `project/target` |
+| **Clojure** | `target` |
+| **Dart/Flutter** | `build`, `.dart_tool` |
+| **Haskell** | `.stack-work`, `dist`, `dist-newstyle` |
 | **Go** | `vendor`, `bin` |
 | **C/C++** | `build`, `cmake-build-*`, `out` |
 | **Ruby** | `vendor/bundle`, `.bundle` |

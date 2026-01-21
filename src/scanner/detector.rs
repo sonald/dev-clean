@@ -12,6 +12,10 @@ pub enum ProjectType {
     Python,
     Java,
     Kotlin,
+    Scala,
+    Clojure,
+    Dart,
+    Haskell,
     Go,
     C,
     Cpp,
@@ -33,6 +37,10 @@ impl ProjectType {
             Self::Rust => "red",
             Self::Python => "blue",
             Self::Java | Self::Kotlin | Self::Maven | Self::Gradle => "cyan",
+            Self::Scala => "red",
+            Self::Clojure => "cyan",
+            Self::Dart => "blue",
+            Self::Haskell => "yellow",
             Self::Go => "cyan",
             Self::Ruby => "red",
             Self::Swift => "yellow",
@@ -51,6 +59,10 @@ impl ProjectType {
             Self::Python => "Python",
             Self::Java => "Java",
             Self::Kotlin => "Kotlin",
+            Self::Scala => "Scala",
+            Self::Clojure => "Clojure",
+            Self::Dart => "Dart",
+            Self::Haskell => "Haskell",
             Self::Go => "Go",
             Self::C => "C",
             Self::Cpp => "C++",
@@ -94,6 +106,22 @@ impl ProjectDetector {
 
         if dir.join("build.gradle").exists() || dir.join("build.gradle.kts").exists() {
             return Some(ProjectType::Gradle);
+        }
+
+        if dir.join("build.sbt").exists() {
+            return Some(ProjectType::Scala);
+        }
+
+        if dir.join("project.clj").exists() || dir.join("deps.edn").exists() {
+            return Some(ProjectType::Clojure);
+        }
+
+        if dir.join("pubspec.yaml").exists() {
+            return Some(ProjectType::Dart);
+        }
+
+        if dir.join("stack.yaml").exists() || dir_contains_extension(dir, &["cabal"]) {
+            return Some(ProjectType::Haskell);
         }
 
         if dir.join("go.mod").exists() {
@@ -179,6 +207,10 @@ impl ProjectDetector {
             ],
             ProjectType::Java | ProjectType::Maven => vec!["target", "out"],
             ProjectType::Kotlin | ProjectType::Gradle => vec!["build", ".gradle", "out"],
+            ProjectType::Scala => vec!["target", "project/target"],
+            ProjectType::Clojure => vec!["target"],
+            ProjectType::Dart => vec!["build", ".dart_tool"],
+            ProjectType::Haskell => vec!["dist", "dist-newstyle", ".stack-work"],
             ProjectType::Go => vec!["vendor", "bin"],
             ProjectType::C | ProjectType::Cpp => {
                 vec!["build", "cmake-build-debug", "cmake-build-release", "out"]
@@ -204,6 +236,8 @@ impl ProjectDetector {
             ProjectType::Python => {
                 Self::check_recent_lock_files(project_dir, &["Pipfile.lock", "poetry.lock"])
             }
+            ProjectType::Dart => Self::check_recent_lock_files(project_dir, &["pubspec.lock"]),
+            ProjectType::Haskell => Self::check_recent_lock_files(project_dir, &["stack.yaml.lock"]),
             ProjectType::Go => Self::check_recent_lock_files(project_dir, &["go.sum"]),
             ProjectType::Ruby => Self::check_recent_lock_files(project_dir, &["Gemfile.lock"]),
             ProjectType::Php => Self::check_recent_lock_files(project_dir, &["composer.lock"]),
@@ -463,6 +497,42 @@ mod tests {
 
         fs::write(dir.join("app.csproj"), "<Project></Project>").unwrap();
         assert_eq!(ProjectDetector::detect(dir), Some(ProjectType::DotNet));
+    }
+
+    #[test]
+    fn test_detect_scala_project() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+
+        fs::write(dir.join("build.sbt"), "name := \"demo\"").unwrap();
+        assert_eq!(ProjectDetector::detect(dir), Some(ProjectType::Scala));
+    }
+
+    #[test]
+    fn test_detect_clojure_project() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+
+        fs::write(dir.join("deps.edn"), "{:deps {}}").unwrap();
+        assert_eq!(ProjectDetector::detect(dir), Some(ProjectType::Clojure));
+    }
+
+    #[test]
+    fn test_detect_dart_project() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+
+        fs::write(dir.join("pubspec.yaml"), "name: demo").unwrap();
+        assert_eq!(ProjectDetector::detect(dir), Some(ProjectType::Dart));
+    }
+
+    #[test]
+    fn test_detect_haskell_project() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path();
+
+        fs::write(dir.join("demo.cabal"), "name: demo").unwrap();
+        assert_eq!(ProjectDetector::detect(dir), Some(ProjectType::Haskell));
     }
 
     #[test]
