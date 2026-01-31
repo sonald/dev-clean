@@ -1,10 +1,10 @@
 use crate::cleaner::CleanOptions;
+use crate::recommend::recommend_projects;
 use crate::scanner::{Category, ProjectDetector, RiskLevel};
 use crate::trash::{
     default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
     restore_batch, trash_entries_for_batch,
 };
-use crate::recommend::recommend_projects;
 use crate::utils::{format_size, parse_size};
 use crate::{Cleaner, CleanupPlan, Config, ProjectInfo, Scanner};
 use anyhow::{Context, Result};
@@ -1137,7 +1137,11 @@ fn run_recommend(
     println!(
         "  Target: {}",
         if free_at_least_bytes.is_some() {
-            format!("free at least {} (need {})", format_size(free_at_least_bytes.unwrap()), format_size(target_bytes))
+            format!(
+                "free at least {} (need {})",
+                format_size(free_at_least_bytes.unwrap()),
+                format_size(target_bytes)
+            )
         } else {
             format!("cleanup {}", format_size(target_bytes))
         }
@@ -1172,7 +1176,11 @@ fn run_recommend(
 
     if let Some(plan_path) = output_plan {
         println!();
-        println!("{} {}", "Plan file created:".green().bold(), plan_path.display());
+        println!(
+            "{} {}",
+            "Plan file created:".green().bold(),
+            plan_path.display()
+        );
     }
 
     Ok(())
@@ -1335,7 +1343,8 @@ fn run_trash(command: TrashCommands) -> Result<()> {
                     batch.batch_id.cyan().bold(),
                     format!("{} items", batch.entries_count).bright_black(),
                     format_size(batch.total_size).green(),
-                    batch.created_at
+                    batch
+                        .created_at
                         .format("%Y-%m-%d %H:%M:%S")
                         .to_string()
                         .bright_black()
@@ -1370,7 +1379,11 @@ fn run_trash(command: TrashCommands) -> Result<()> {
                     entry.original_path.display(),
                     format_size(entry.size).yellow()
                 );
-                println!("    {} {}", "↳".bright_black(), entry.trashed_path.display());
+                println!(
+                    "    {} {}",
+                    "↳".bright_black(),
+                    entry.trashed_path.display()
+                );
             }
         }
         TrashCommands::Purge { batch, force } => {
@@ -1428,7 +1441,10 @@ fn run_trash(command: TrashCommands) -> Result<()> {
 
             println!("{}", "Trash GC:".cyan().bold());
             println!("  Trash root: {}", trash_root.display());
-            println!("  Would delete batches: {}", result.removed_batches.to_string().green());
+            println!(
+                "  Would delete batches: {}",
+                result.removed_batches.to_string().green()
+            );
             println!(
                 "  Would free: {}",
                 format_size(result.removed_bytes).green().bold()
@@ -1438,8 +1454,7 @@ fn run_trash(command: TrashCommands) -> Result<()> {
                 println!(
                     "  {} {}",
                     "Note:".yellow().bold(),
-                    "keep-days prevents meeting keep-gb; only older batches are eligible."
-                        .yellow()
+                    "keep-days prevents meeting keep-gb; only older batches are eligible.".yellow()
                 );
             }
 

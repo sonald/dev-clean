@@ -41,7 +41,11 @@ impl CleanupPlan {
         }
     }
 
-    pub fn new_with_params(scan_root: PathBuf, projects: Vec<ProjectInfo>, params: PlanParams) -> Self {
+    pub fn new_with_params(
+        scan_root: PathBuf,
+        projects: Vec<ProjectInfo>,
+        params: PlanParams,
+    ) -> Self {
         let mut plan = Self::new(scan_root, projects);
         plan.params = Some(params);
         plan

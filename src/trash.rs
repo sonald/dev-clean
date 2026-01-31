@@ -164,12 +164,14 @@ pub fn list_trash_batches(root: &Path) -> Result<Vec<TrashBatchSummary>> {
     let mut batches: HashMap<String, TrashBatchSummary> = HashMap::new();
 
     for entry in entries {
-        let summary = batches.entry(entry.batch_id.clone()).or_insert(TrashBatchSummary {
-            batch_id: entry.batch_id.clone(),
-            created_at: entry.created_at,
-            entries_count: 0,
-            total_size: 0,
-        });
+        let summary = batches
+            .entry(entry.batch_id.clone())
+            .or_insert(TrashBatchSummary {
+                batch_id: entry.batch_id.clone(),
+                created_at: entry.created_at,
+                entries_count: 0,
+                total_size: 0,
+            });
 
         summary.entries_count += 1;
         summary.total_size += entry.size;
@@ -335,7 +337,8 @@ pub fn purge_trash_batch(root: &Path, batch_id: &str, dry_run: bool) -> Result<P
     let log_path = root.join(TRASH_LOG_FILENAME);
     let entries = load_trash_log(&log_path)?;
 
-    let (kept, removed): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| e.batch_id != batch_id);
+    let (kept, removed): (Vec<_>, Vec<_>) =
+        entries.into_iter().partition(|e| e.batch_id != batch_id);
     let removed_entries = removed.len();
     let removed_bytes = removed.iter().map(|e| e.size).sum::<u64>();
 
@@ -362,7 +365,11 @@ pub fn purge_trash_batch(root: &Path, batch_id: &str, dry_run: bool) -> Result<P
             ));
         } else if let Err(err) = fs::remove_dir_all(&batch_dir) {
             failed_batches += 1;
-            errors.push(format!("Failed to remove batch dir {}: {}", batch_dir.display(), err));
+            errors.push(format!(
+                "Failed to remove batch dir {}: {}",
+                batch_dir.display(),
+                err
+            ));
         }
     }
 
@@ -440,7 +447,9 @@ pub fn gc_trash(
                 candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at)); // oldest first
 
                 while bytes_after > limit {
-                    let Some(next) = candidates.first().cloned() else { break };
+                    let Some(next) = candidates.first().cloned() else {
+                        break;
+                    };
                     candidates.remove(0);
                     bytes_after = bytes_after.saturating_sub(next.total_size);
                     selected_ids.insert(next.batch_id.clone());
@@ -552,12 +561,14 @@ fn summarize_batches(entries: Vec<TrashEntry>) -> Vec<TrashBatchSummary> {
 
     let mut batches: HashMap<String, TrashBatchSummary> = HashMap::new();
     for entry in entries {
-        let summary = batches.entry(entry.batch_id.clone()).or_insert(TrashBatchSummary {
-            batch_id: entry.batch_id.clone(),
-            created_at: entry.created_at,
-            entries_count: 0,
-            total_size: 0,
-        });
+        let summary = batches
+            .entry(entry.batch_id.clone())
+            .or_insert(TrashBatchSummary {
+                batch_id: entry.batch_id.clone(),
+                created_at: entry.created_at,
+                entries_count: 0,
+                total_size: 0,
+            });
 
         summary.entries_count += 1;
         summary.total_size += entry.size;
@@ -625,7 +636,10 @@ fn move_path_with_exdev_fallback(src: &Path, dst: &Path) -> Result<()> {
                 )
             })?;
             fs::remove_dir_all(src).with_context(|| {
-                format!("Failed to remove source directory after copy: {}", src.display())
+                format!(
+                    "Failed to remove source directory after copy: {}",
+                    src.display()
+                )
             })?;
             Ok(())
         }
@@ -643,24 +657,25 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
         anyhow::bail!("Destination already exists: {}", dst.display());
     }
-    fs::create_dir_all(dst)
-        .with_context(|| format!("Failed to create {}", dst.display()))?;
+    fs::create_dir_all(dst).with_context(|| format!("Failed to create {}", dst.display()))?;
 
     for entry in walkdir::WalkDir::new(src).follow_links(false).into_iter() {
-        let entry = entry.with_context(|| format!("Failed to read dir entry under {}", src.display()))?;
-        let rel = entry
-            .path()
-            .strip_prefix(src)
-            .with_context(|| format!("Failed to compute relative path for {}", entry.path().display()))?;
+        let entry =
+            entry.with_context(|| format!("Failed to read dir entry under {}", src.display()))?;
+        let rel = entry.path().strip_prefix(src).with_context(|| {
+            format!(
+                "Failed to compute relative path for {}",
+                entry.path().display()
+            )
+        })?;
         if rel.as_os_str().is_empty() {
             continue;
         }
         let dest_path = dst.join(rel);
 
         if entry.file_type().is_dir() {
-            fs::create_dir_all(&dest_path).with_context(|| {
-                format!("Failed to create directory {}", dest_path.display())
-            })?;
+            fs::create_dir_all(&dest_path)
+                .with_context(|| format!("Failed to create directory {}", dest_path.display()))?;
             continue;
         }
 
@@ -693,8 +708,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
     use std::os::unix::fs::symlink;
 
-    let target = fs::read_link(src)
-        .with_context(|| format!("Failed to readlink {}", src.display()))?;
+    let target =
+        fs::read_link(src).with_context(|| format!("Failed to readlink {}", src.display()))?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create {}", parent.display()))?;

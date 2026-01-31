@@ -145,4 +145,3 @@ mod tests {
         assert_eq!(result.selected[0].size, 80);
     }
 }
-

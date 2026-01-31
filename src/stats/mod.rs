@@ -223,7 +223,10 @@ impl Statistics {
         }
 
         types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
-        let max_size = types.first().map(|(_, stats)| stats.total_size).unwrap_or(0);
+        let max_size = types
+            .first()
+            .map(|(_, stats)| stats.total_size)
+            .unwrap_or(0);
 
         for (type_name, stats) in types.into_iter().take(top_n) {
             let bar = render_bar(stats.total_size, max_size, 24);
@@ -241,11 +244,7 @@ impl Statistics {
             ("Old (>90d)", self.by_age_group.old),
         ];
 
-        let max_size = groups
-            .iter()
-            .map(|(_, (_, size))| *size)
-            .max()
-            .unwrap_or(0);
+        let max_size = groups.iter().map(|(_, (_, size))| *size).max().unwrap_or(0);
 
         for (label, (_, size)) in groups {
             let bar = render_bar(size, max_size, 24);

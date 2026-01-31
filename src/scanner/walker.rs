@@ -7,7 +7,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{self, Receiver};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use ignore::{WalkBuilder, WalkState};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::{Match, WalkBuilder, WalkState};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,6 @@ struct CleanableMatchers {
     basename: GlobSet,
     relative_path: GlobSet,
     builtin_patterns: Vec<String>,
-    gitignore_patterns: Vec<String>,
 }
 
 impl CleanableMatchers {
@@ -38,17 +38,20 @@ impl CleanableMatchers {
             }
         }
 
-        for pattern in &self.gitignore_patterns {
-            if pattern_matches(pattern, basename, relative_path) {
-                return Some(RuleRef {
-                    source: RuleSource::Gitignore,
-                    pattern: pattern.clone(),
-                    name: None,
-                });
-            }
-        }
-
         None
+    }
+}
+
+#[derive(Debug)]
+struct CandidateMatchers {
+    basename: GlobSet,
+    relative_path: GlobSet,
+}
+
+impl CandidateMatchers {
+    fn matches(&self, basename: &str, relative_path_from_scan_root: &str) -> bool {
+        self.basename.is_match(basename)
+            || self.relative_path.is_match(relative_path_from_scan_root)
     }
 }
 
@@ -71,6 +74,9 @@ pub struct Scanner {
 
     /// Cache of compiled cleanable directory matchers per project root/type
     matcher_cache: Mutex<HashMap<(PathBuf, ProjectType), Arc<CleanableMatchers>>>,
+
+    /// Cache of compiled `.gitignore` matchers per project root
+    gitignore_cache: Mutex<HashMap<PathBuf, Arc<Gitignore>>>,
 
     /// Directories to always exclude from scanning (by basename)
     exclude_dirs: HashSet<String>,
@@ -95,6 +101,7 @@ impl Scanner {
             min_size: None,
             max_age_days: None,
             matcher_cache: Mutex::new(HashMap::new()),
+            gitignore_cache: Mutex::new(HashMap::new()),
             exclude_dirs: HashSet::new(),
             custom_patterns: Vec::new(),
             category_filter: None,
@@ -151,6 +158,7 @@ impl Scanner {
     /// Scan and return list of cleanable projects
     pub fn scan(&self) -> Result<Vec<ProjectInfo>> {
         let results = Arc::new(Mutex::new(Vec::new()));
+        let candidate_matchers = self.candidate_matchers();
 
         // Build walker with Ripgrep-style configuration
         let mut walker = WalkBuilder::new(&self.root);
@@ -177,6 +185,7 @@ impl Scanner {
         let scanner = self;
         walker.build_parallel().run(|| {
             let results = Arc::clone(&results);
+            let candidate_matchers = Arc::clone(&candidate_matchers);
             Box::new(move |entry| {
                 let entry = match entry {
                     Ok(e) => e,
@@ -188,6 +197,24 @@ impl Scanner {
                 }
 
                 let dir = entry.path();
+
+                if let Some(candidate_matchers) = candidate_matchers.as_ref() {
+                    let Some(dir_name) = dir.file_name().map(|s| s.to_string_lossy()) else {
+                        return WalkState::Continue;
+                    };
+                    let relative_path = dir
+                        .strip_prefix(&scanner.root)
+                        .ok()
+                        .map(normalize_relative_path)
+                        .unwrap_or_else(|| dir.display().to_string().replace('\\', "/"));
+
+                    if !candidate_matchers.matches(dir_name.as_ref(), &relative_path)
+                        && !ProjectDetector::is_cmake_build_dir(dir)
+                    {
+                        return WalkState::Continue;
+                    }
+                }
+
                 if let Some(project_info) = scanner.check_directory(dir) {
                     if scanner.passes_filters(&project_info) {
                         results.lock().unwrap().push(project_info);
@@ -237,6 +264,7 @@ impl Scanner {
     pub fn scan_with_streaming(&self) -> Result<(usize, Receiver<ProjectInfo>)> {
         // Step 1: Fast scan without size calculation
         let results = Arc::new(Mutex::new(Vec::new()));
+        let candidate_matchers = self.candidate_matchers();
 
         // Build walker with Ripgrep-style configuration
         let mut walker = WalkBuilder::new(&self.root);
@@ -261,6 +289,7 @@ impl Scanner {
         let scanner = self;
         walker.build_parallel().run(|| {
             let results = Arc::clone(&results);
+            let candidate_matchers = Arc::clone(&candidate_matchers);
             Box::new(move |entry| {
                 let entry = match entry {
                     Ok(e) => e,
@@ -272,6 +301,24 @@ impl Scanner {
                 }
 
                 let dir = entry.path();
+
+                if let Some(candidate_matchers) = candidate_matchers.as_ref() {
+                    let Some(dir_name) = dir.file_name().map(|s| s.to_string_lossy()) else {
+                        return WalkState::Continue;
+                    };
+                    let relative_path = dir
+                        .strip_prefix(&scanner.root)
+                        .ok()
+                        .map(normalize_relative_path)
+                        .unwrap_or_else(|| dir.display().to_string().replace('\\', "/"));
+
+                    if !candidate_matchers.matches(dir_name.as_ref(), &relative_path)
+                        && !ProjectDetector::is_cmake_build_dir(dir)
+                    {
+                        return WalkState::Continue;
+                    }
+                }
+
                 if let Some(project_info) = scanner.check_directory_fast(dir) {
                     // Apply non-size filters early (size filtering will be applied after size calculation).
                     if scanner.passes_filters(&project_info) {
@@ -303,6 +350,17 @@ impl Scanner {
         });
 
         Ok((total_count, rx))
+    }
+
+    fn candidate_matchers(&self) -> Arc<Option<CandidateMatchers>> {
+        // We can safely prefilter only when high-risk results (including .gitignore-derived)
+        // are filtered out, otherwise we could miss them.
+        let can_prefilter = matches!(self.max_risk, Some(RiskLevel::Low | RiskLevel::Medium));
+        if !can_prefilter {
+            return Arc::new(None);
+        }
+
+        Arc::new(Some(build_candidate_matchers(&self.custom_patterns)))
     }
 
     /// Remove nested cleanable directories, keeping only the topmost ones
@@ -382,10 +440,11 @@ impl Scanner {
 
             if let Some(project_type) = ProjectDetector::detect(parent) {
                 // Check if current directory is a cleanable dir for this project type
-                // This includes both default patterns AND patterns from .gitignore
+                // This includes both default patterns AND patterns from `.gitignore` discovery.
                 let matchers = self.matchers_for(project_type, parent);
+                let gitignore_rule = self.gitignore_rule_for(parent, dir, dir_name.as_ref());
 
-                if matchers.matches(dir_name.as_ref(), &relative_path) {
+                if matchers.matches(dir_name.as_ref(), &relative_path) || gitignore_rule.is_some() {
                     let info = if fast_mode {
                         self.build_project_info_fast(parent, project_type, dir)
                     } else {
@@ -395,6 +454,8 @@ impl Scanner {
                     if let Some(mut info) = info {
                         if let Some(rule) = matchers.matched_rule(dir_name.as_ref(), &relative_path)
                         {
+                            apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
+                        } else if let Some(rule) = gitignore_rule {
                             apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
                         } else {
                             // Shouldn't happen, but keep the default fields intact if we can't pinpoint a rule.
@@ -465,11 +526,58 @@ impl Scanner {
             return Arc::clone(cached);
         }
 
-        // Build outside lock to avoid blocking other threads while reading .gitignore
+        // Build outside lock to avoid blocking other threads while compiling patterns.
         let built = Arc::new(build_matchers(project_type, project_root));
 
         let mut cache = self.matcher_cache.lock().unwrap();
         Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&built)))
+    }
+
+    fn gitignore_for(&self, project_root: &Path) -> Arc<Gitignore> {
+        let key = project_root.to_path_buf();
+
+        if let Some(cached) = self.gitignore_cache.lock().unwrap().get(&key) {
+            return Arc::clone(cached);
+        }
+
+        // Build outside lock to avoid blocking other threads while reading `.gitignore`.
+        let built = Arc::new(build_gitignore(project_root));
+
+        let mut cache = self.gitignore_cache.lock().unwrap();
+        Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&built)))
+    }
+
+    fn gitignore_rule_for(
+        &self,
+        project_root: &Path,
+        dir: &Path,
+        basename: &str,
+    ) -> Option<RuleRef> {
+        // Avoid `.gitignore` I/O/matching if high-risk results are filtered out anyway.
+        if matches!(self.max_risk, Some(RiskLevel::Low | RiskLevel::Medium)) {
+            return None;
+        }
+
+        // Skip obviously protected directories (basename-level).
+        if matches!(basename, ".git" | ".svn" | ".hg" | "." | "..") {
+            return None;
+        }
+
+        let gi = self.gitignore_for(project_root);
+        let matched = gi.matched(dir, /* is_dir */ true);
+        let Match::Ignore(glob) = matched else {
+            return None;
+        };
+
+        let Some(pattern) = ProjectDetector::gitignore_discovery_pattern(glob.original()) else {
+            return None;
+        };
+
+        Some(RuleRef {
+            source: RuleSource::Gitignore,
+            pattern,
+            name: None,
+        })
     }
 
     /// Build ProjectInfo for a cleanable directory (fast scan - no size calculation)
@@ -564,19 +672,108 @@ impl Scanner {
     }
 }
 
-fn build_matchers(project_type: ProjectType, project_root: &Path) -> CleanableMatchers {
+fn build_gitignore(project_root: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(project_root);
+    let path = project_root.join(".gitignore");
+    if path.is_file() {
+        let _ = builder.add(path);
+    }
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+fn build_candidate_matchers(custom_patterns: &[CustomPattern]) -> CandidateMatchers {
+    let mut basename_builder = GlobSetBuilder::new();
+    let mut relpath_builder = GlobSetBuilder::new();
+
+    let mut add_pattern = |pattern: &str| {
+        let mut pattern = pattern.replace('\\', "/");
+
+        if pattern.starts_with('/') {
+            pattern = pattern[1..].to_string();
+        }
+        if pattern.ends_with('/') {
+            pattern = pattern[..pattern.len() - 1].to_string();
+        }
+
+        if pattern.is_empty() {
+            return;
+        }
+
+        if pattern.contains('/') {
+            let prefixed = if pattern.starts_with("**/") || pattern == "**" {
+                pattern
+            } else {
+                format!("**/{}", pattern)
+            };
+
+            let glob = match GlobBuilder::new(&prefixed).literal_separator(true).build() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            relpath_builder.add(glob);
+        } else {
+            let glob = match GlobBuilder::new(&pattern).literal_separator(true).build() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            basename_builder.add(glob);
+        }
+    };
+
+    // Built-in cleanable patterns across all supported project types.
+    const ALL_PROJECT_TYPES: [ProjectType; 20] = [
+        ProjectType::NodeJs,
+        ProjectType::Rust,
+        ProjectType::Python,
+        ProjectType::Java,
+        ProjectType::Kotlin,
+        ProjectType::Scala,
+        ProjectType::Clojure,
+        ProjectType::Dart,
+        ProjectType::Haskell,
+        ProjectType::Go,
+        ProjectType::C,
+        ProjectType::Cpp,
+        ProjectType::Ruby,
+        ProjectType::Swift,
+        ProjectType::Php,
+        ProjectType::Elixir,
+        ProjectType::DotNet,
+        ProjectType::Maven,
+        ProjectType::Gradle,
+        ProjectType::Generic,
+    ];
+
+    for project_type in ALL_PROJECT_TYPES {
+        for pattern in ProjectDetector::cleanable_dirs(project_type) {
+            add_pattern(pattern);
+        }
+    }
+
+    // User custom patterns.
+    for pattern in custom_patterns {
+        add_pattern(&pattern.directory);
+    }
+
+    let basename = basename_builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap());
+    let relative_path = relpath_builder
+        .build()
+        .unwrap_or_else(|_| GlobSetBuilder::new().build().unwrap());
+
+    CandidateMatchers {
+        basename,
+        relative_path,
+    }
+}
+
+fn build_matchers(project_type: ProjectType, _project_root: &Path) -> CleanableMatchers {
     let builtin_patterns = ProjectDetector::cleanable_dirs(project_type)
         .iter()
         .map(|s| s.to_string())
         .collect::<Vec<_>>();
-    let gitignore_patterns = ProjectDetector::parse_gitignore(project_root);
-
-    let mut patterns = builtin_patterns.clone();
-    for pattern in &gitignore_patterns {
-        if !patterns.contains(pattern) {
-            patterns.push(pattern.clone());
-        }
-    }
+    let patterns = builtin_patterns.clone();
 
     let mut basename_builder = GlobSetBuilder::new();
     let mut relpath_builder = GlobSetBuilder::new();
@@ -608,7 +805,6 @@ fn build_matchers(project_type: ProjectType, project_root: &Path) -> CleanableMa
         basename,
         relative_path,
         builtin_patterns,
-        gitignore_patterns,
     }
 }
 

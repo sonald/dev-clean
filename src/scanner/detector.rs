@@ -1,5 +1,7 @@
 use crate::config::{CustomPattern, MarkerMode};
 use globset::GlobBuilder;
+use ignore::gitignore::GitignoreBuilder;
+use ignore::Match;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -172,11 +174,13 @@ impl ProjectDetector {
     /// * `true` - Safe to delete (out-of-source build directory)
     /// * `false` - Not a build directory, or in-source build (unsafe to delete)
     pub fn is_cmake_build_dir(dir: &Path) -> bool {
-        let has_cache = dir.join("CMakeCache.txt").exists();
-        let has_source = dir.join("CMakeLists.txt").exists();
+        // Optimize for the common case: most directories don't have a CMake cache.
+        if !dir.join("CMakeCache.txt").exists() {
+            return false;
+        }
 
-        // Only pure build directories are safe to delete (has cache but no source)
-        has_cache && !has_source
+        // Safety: Only pure build directories are safe to delete (cache present, no source).
+        !dir.join("CMakeLists.txt").exists()
     }
 
     /// Get cleanable directories for a project type
@@ -237,7 +241,9 @@ impl ProjectDetector {
                 Self::check_recent_lock_files(project_dir, &["Pipfile.lock", "poetry.lock"])
             }
             ProjectType::Dart => Self::check_recent_lock_files(project_dir, &["pubspec.lock"]),
-            ProjectType::Haskell => Self::check_recent_lock_files(project_dir, &["stack.yaml.lock"]),
+            ProjectType::Haskell => {
+                Self::check_recent_lock_files(project_dir, &["stack.yaml.lock"])
+            }
             ProjectType::Go => Self::check_recent_lock_files(project_dir, &["go.sum"]),
             ProjectType::Ruby => Self::check_recent_lock_files(project_dir, &["Gemfile.lock"]),
             ProjectType::Php => Self::check_recent_lock_files(project_dir, &["composer.lock"]),
@@ -279,72 +285,80 @@ impl ProjectDetector {
         let mut cleanable_patterns = Vec::new();
 
         for line in content.lines() {
-            let line = line.trim();
-
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Skip negation patterns (starting with !)
-            if line.starts_with('!') {
-                continue;
-            }
-
-            // Skip file patterns (contains extension or is clearly a file)
-            if line.contains('.') && !line.ends_with('/') && !line.starts_with('.') {
-                // This might be a file pattern like *.log, skip it
-                continue;
-            }
-
-            // Clean up the pattern
-            let mut pattern = line.to_string();
-
-            // Remove leading slash
-            if pattern.starts_with('/') {
-                pattern = pattern[1..].to_string();
-            }
-
-            // Remove trailing slash
-            if pattern.ends_with('/') {
-                pattern = pattern[..pattern.len() - 1].to_string();
-            }
-
-            // Skip patterns with wildcards in the middle (too complex)
-            if pattern.contains('*') && !pattern.starts_with('*') && !pattern.ends_with('*') {
-                continue;
-            }
-
-            // Skip obviously protected directories
-            if matches!(
-                pattern.as_str(),
-                ".git" | ".svn" | ".hg" | "." | ".." | "src" | "lib" | "include"
-            ) {
-                continue;
-            }
-
-            // Skip common file patterns (even if they start with .)
-            if matches!(
-                pattern.as_str(),
-                ".env"
-                    | ".DS_Store"
-                    | ".gitignore"
-                    | ".gitattributes"
-                    | ".editorconfig"
-                    | ".npmrc"
-                    | ".yarnrc"
-            ) {
-                continue;
-            }
-
-            // Only include patterns that look like directories
-            // Typically: no extension, or starts with . (hidden dirs)
-            if !pattern.is_empty() && (pattern.starts_with('.') || !pattern.contains('.')) {
+            if let Some(pattern) = Self::gitignore_discovery_pattern(line) {
                 cleanable_patterns.push(pattern);
             }
         }
 
         cleanable_patterns
+    }
+
+    pub(crate) fn gitignore_discovery_pattern(line: &str) -> Option<String> {
+        let line = line.trim();
+
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+
+        // Skip negation patterns (starting with !)
+        if line.starts_with('!') {
+            return None;
+        }
+
+        // Skip file patterns (contains extension or is clearly a file)
+        if line.contains('.') && !line.ends_with('/') && !line.starts_with('.') {
+            // This might be a file pattern like *.log, skip it
+            return None;
+        }
+
+        // Clean up the pattern
+        let mut pattern = line.to_string();
+
+        // Remove leading slash
+        if pattern.starts_with('/') {
+            pattern = pattern[1..].to_string();
+        }
+
+        // Remove trailing slash
+        if pattern.ends_with('/') {
+            pattern = pattern[..pattern.len() - 1].to_string();
+        }
+
+        // Skip patterns with wildcards in the middle (too complex)
+        if pattern.contains('*') && !pattern.starts_with('*') && !pattern.ends_with('*') {
+            return None;
+        }
+
+        // Skip obviously protected directories
+        if matches!(
+            pattern.as_str(),
+            ".git" | ".svn" | ".hg" | "." | ".." | "src" | "lib" | "include"
+        ) {
+            return None;
+        }
+
+        // Skip common file patterns (even if they start with .)
+        if matches!(
+            pattern.as_str(),
+            ".env"
+                | ".DS_Store"
+                | ".gitignore"
+                | ".gitattributes"
+                | ".editorconfig"
+                | ".npmrc"
+                | ".yarnrc"
+        ) {
+            return None;
+        }
+
+        // Only include patterns that look like directories
+        // Typically: no extension, or starts with . (hidden dirs)
+        if !pattern.is_empty() && (pattern.starts_with('.') || !pattern.contains('.')) {
+            return Some(pattern);
+        }
+
+        None
     }
 
     /// Get cleanable directories including both default patterns and .gitignore patterns
@@ -410,11 +424,9 @@ impl ProjectDetector {
             }
         }
 
-        // Then .gitignore-derived patterns.
-        for pattern in Self::parse_gitignore(project_root) {
-            if pattern_matches(&pattern, basename, &relative_path) {
-                return format!("matched .gitignore pattern `{}`", pattern);
-            }
+        // Then `.gitignore`-derived patterns (conservative discovery).
+        if let Some(pattern) = explain_gitignore_discovery_pattern(project_root, cleanable_dir) {
+            return format!("matched .gitignore pattern `{}`", pattern);
         }
 
         // Finally, heuristics.
@@ -423,6 +435,20 @@ impl ProjectDetector {
         }
 
         "matched cleanable rules".to_string()
+    }
+}
+
+fn explain_gitignore_discovery_pattern(project_root: &Path, dir: &Path) -> Option<String> {
+    let mut builder = GitignoreBuilder::new(project_root);
+    let path = project_root.join(".gitignore");
+    if !path.is_file() {
+        return None;
+    }
+    let _ = builder.add(path);
+    let gi = builder.build().ok()?;
+    match gi.matched(dir, /* is_dir */ true) {
+        Match::Ignore(glob) => ProjectDetector::gitignore_discovery_pattern(glob.original()),
+        Match::None | Match::Whitelist(_) => None,
     }
 }
 

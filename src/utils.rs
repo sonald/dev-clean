@@ -89,6 +89,9 @@ mod tests {
         assert_eq!(parse_size("1KB").unwrap(), 1024);
         assert_eq!(parse_size("1 KB").unwrap(), 1024);
         assert_eq!(parse_size("1MB").unwrap(), 1024 * 1024);
-        assert_eq!(parse_size("1.5GB").unwrap(), (1.5 * 1024.0 * 1024.0 * 1024.0) as u64);
+        assert_eq!(
+            parse_size("1.5GB").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
     }
 }
