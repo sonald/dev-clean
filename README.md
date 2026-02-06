@@ -81,6 +81,7 @@ dev-cleaner clean
 # Auto-clean with filters (dry-run first!)
 dev-cleaner clean --older-than 60 --min-size 500 --dry-run
 dev-cleaner clean --older-than 60 --min-size 500 --auto
+dev-cleaner clean --dry-run --share
 
 # Include higher-risk targets (e.g. deps like node_modules)
 dev-cleaner scan --max-risk high
@@ -128,6 +129,7 @@ Options:
   --older-than <OLDER_THAN>     Older than N days
   --dry-run                     Preview without deleting
   --trash                       Move directories to Dev Cleaner's trash (undoable)
+  --share                       Print a copy-friendly share summary and log local share_generated event
   --auto                        Skip interactive selection
   -f, --force                   Skip all confirmations
   -v, --verbose                 Verbose output

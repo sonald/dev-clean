@@ -53,6 +53,9 @@ dev-cleaner tui ~/projects
 # Preview what would be deleted (dry-run)
 dev-cleaner clean --dry-run
 
+# Preview and print a copy-friendly share summary
+dev-cleaner clean --dry-run --share
+
 # Move directories to Dev Cleaner trash (undoable)
 dev-cleaner clean --trash
 

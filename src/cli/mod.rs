@@ -10,6 +10,7 @@ use crate::{Cleaner, CleanupPlan, Config, ProjectInfo, Scanner};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
+use serde_json::json;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -137,6 +138,10 @@ pub enum Commands {
         /// Force mode - skip all confirmations
         #[arg(short, long)]
         force: bool,
+
+        /// Print a copy-friendly share summary after cleaning
+        #[arg(long)]
+        share: bool,
 
         /// Verbose output
         #[arg(short, long)]
@@ -430,6 +435,7 @@ impl Cli {
                 trash,
                 auto,
                 force,
+                share,
                 verbose,
                 gitignore,
                 category,
@@ -444,6 +450,7 @@ impl Cli {
                     trash,
                     auto,
                     force,
+                    share,
                     verbose,
                     gitignore,
                     category,
@@ -737,6 +744,7 @@ fn run_clean(
     trash: bool,
     auto: bool,
     force: bool,
+    share: bool,
     verbose: bool,
     gitignore: bool,
     category: CategoryFilterArg,
@@ -824,6 +832,10 @@ fn run_clean(
         result.size_freed_human().green().bold()
     );
 
+    if share {
+        print_share_block_if_applicable(&result, dry_run, trash, auto, force, verbose);
+    }
+
     if let Some(batch_id) = &result.trash_batch_id {
         println!("  Trash batch: {}", batch_id.cyan().bold());
         println!(
@@ -840,6 +852,69 @@ fn run_clean(
     }
 
     Ok(())
+}
+
+fn build_share_snippet(
+    result: &crate::cleaner::CleanResult,
+    dry_run: bool,
+    trash: bool,
+) -> Option<String> {
+    if result.cleaned_count == 0 || result.bytes_freed == 0 {
+        return None;
+    }
+
+    let action = if dry_run { "could free" } else { "just freed" };
+    let undoable = if trash && !dry_run {
+        " (undoable via trash)"
+    } else {
+        ""
+    };
+
+    Some(format!(
+        "I {} {} by cleaning {} directories with dev-cleaner{}.\nTry: dev-cleaner scan",
+        action,
+        format_size(result.bytes_freed),
+        result.cleaned_count,
+        undoable
+    ))
+}
+
+fn print_share_block_if_applicable(
+    result: &crate::cleaner::CleanResult,
+    dry_run: bool,
+    trash: bool,
+    auto: bool,
+    force: bool,
+    verbose: bool,
+) {
+    let Some(snippet) = build_share_snippet(result, dry_run, trash) else {
+        return;
+    };
+
+    println!("\n{}", "Share this result:".cyan().bold());
+    println!("------------------------------");
+    println!("{}", snippet);
+    println!("------------------------------");
+
+    let props = json!({
+        "cleaned_count": result.cleaned_count,
+        "bytes_freed": result.bytes_freed,
+        "dry_run": dry_run,
+        "trash": trash,
+        "auto": auto,
+        "force": force,
+        "tool_version": env!("CARGO_PKG_VERSION"),
+    });
+
+    if let Err(err) = crate::metrics::log_event("share_generated", props) {
+        if verbose {
+            eprintln!(
+                "{} {}",
+                "Warning:".yellow().bold(),
+                format!("failed to write metrics event: {}", err).yellow()
+            );
+        }
+    }
 }
 
 fn display_projects(projects: &[ProjectInfo]) {
@@ -1498,4 +1573,42 @@ fn run_trash(command: TrashCommands) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cleaner::CleanResult;
+
+    fn result(cleaned_count: usize, bytes_freed: u64) -> CleanResult {
+        CleanResult {
+            cleaned_count,
+            bytes_freed,
+            skipped_count: 0,
+            bytes_skipped: 0,
+            failed_count: 0,
+            errors: Vec::new(),
+            trash_batch_id: None,
+        }
+    }
+
+    #[test]
+    fn share_snippet_omits_zero_freed() {
+        let snippet = build_share_snippet(&result(2, 0), false, false);
+        assert!(snippet.is_none());
+    }
+
+    #[test]
+    fn share_snippet_uses_dry_run_wording() {
+        let snippet = build_share_snippet(&result(2, 1024), true, false).unwrap();
+        assert!(snippet.contains("could free"));
+        assert!(snippet.contains("Try: dev-cleaner scan"));
+    }
+
+    #[test]
+    fn share_snippet_marks_undoable_trash() {
+        let snippet = build_share_snippet(&result(2, 1024), false, true).unwrap();
+        assert!(snippet.contains("just freed"));
+        assert!(snippet.contains("undoable via trash"));
+    }
 }
