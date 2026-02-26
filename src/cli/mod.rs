@@ -1,5 +1,7 @@
+use crate::audit::AuditLogger;
 use crate::cleaner::CleanOptions;
-use crate::recommend::recommend_projects;
+use crate::policy::KeepPolicy;
+use crate::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
 use crate::scanner::{Category, ProjectDetector, RiskLevel};
 use crate::trash::{
     default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
@@ -25,6 +27,10 @@ pub struct Cli {
     /// Config file path
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
+
+    /// Named scan profile from config
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -64,13 +70,35 @@ impl RiskArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum RecommendStrategyArg {
+    SafeFirst,
+    Balanced,
+    MaxSpace,
+}
+
+impl RecommendStrategyArg {
+    fn to_strategy(self) -> RecommendStrategy {
+        match self {
+            Self::SafeFirst => RecommendStrategy::SafeFirst,
+            Self::Balanced => RecommendStrategy::Balanced,
+            Self::MaxSpace => RecommendStrategy::MaxSpace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ExportFormatArg {
+    Json,
+    Csv,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Scan directories for cleanable projects
     Scan {
         /// Directory to scan
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        path: Option<PathBuf>,
 
         /// Maximum scan depth
         #[arg(short, long)]
@@ -103,13 +131,24 @@ pub enum Commands {
         /// Filter by max risk level (low/medium/high/all)
         #[arg(long, value_enum, default_value = "medium", alias = "risk")]
         max_risk: RiskArg,
+
+        /// Include protected targets in results
+        #[arg(long)]
+        include_protected: bool,
+
+        /// Include recently modified targets in results
+        #[arg(long)]
+        include_recent: bool,
+
+        /// Mark as recent when modified within N days
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
     },
 
     /// Clean project directories
     Clean {
         /// Directory to scan
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        path: Option<PathBuf>,
 
         /// Maximum scan depth
         #[arg(short, long)]
@@ -158,20 +197,46 @@ pub enum Commands {
         /// Filter by max risk level (low/medium/high/all)
         #[arg(long, value_enum, default_value = "medium", alias = "risk")]
         max_risk: RiskArg,
+
+        /// Include recently modified targets
+        #[arg(long)]
+        include_recent: bool,
+
+        /// Include protected targets
+        #[arg(long)]
+        include_protected: bool,
+
+        /// Allow deleting protected targets
+        #[arg(long)]
+        force_protected: bool,
+
+        /// Mark as recent when modified within N days
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
     },
 
     /// Launch interactive TUI mode
     Tui {
         /// Directory to scan
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        path: Option<PathBuf>,
+
+        /// Include recently modified targets
+        #[arg(long)]
+        include_recent: bool,
+
+        /// Include protected targets
+        #[arg(long)]
+        include_protected: bool,
+
+        /// Mark as recent when modified within N days
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
     },
 
     /// Show statistics about cleanable directories
     Stats {
         /// Directory to scan
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        path: Option<PathBuf>,
 
         /// Maximum scan depth
         #[arg(short, long)]
@@ -196,6 +261,18 @@ pub enum Commands {
         /// Filter by max risk level (low/medium/high/all)
         #[arg(long, value_enum, default_value = "medium", alias = "risk")]
         max_risk: RiskArg,
+
+        /// Include recently modified targets
+        #[arg(long)]
+        include_recent: bool,
+
+        /// Include protected targets
+        #[arg(long)]
+        include_protected: bool,
+
+        /// Mark as recent when modified within N days
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
     },
 
     /// Generate default config file
@@ -207,8 +284,7 @@ pub enum Commands {
     /// Generate a cleanup plan as JSON
     Plan {
         /// Directory to scan
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        path: Option<PathBuf>,
 
         /// Maximum scan depth
         #[arg(short, long)]
@@ -237,13 +313,24 @@ pub enum Commands {
         /// Filter by max risk level (low/medium/high/all)
         #[arg(long, value_enum, default_value = "medium", alias = "risk")]
         max_risk: RiskArg,
+
+        /// Include recently modified targets
+        #[arg(long)]
+        include_recent: bool,
+
+        /// Include protected targets
+        #[arg(long)]
+        include_protected: bool,
+
+        /// Mark as recent when modified within N days
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
     },
 
     /// Recommend a cleanup plan to meet a space goal (does not execute)
     Recommend {
         /// Directory to scan
-        #[arg(default_value = ".")]
-        path: PathBuf,
+        path: Option<PathBuf>,
 
         /// Maximum scan depth
         #[arg(short, long)]
@@ -272,6 +359,22 @@ pub enum Commands {
         /// Include in-use projects (default: false)
         #[arg(long)]
         include_in_use: bool,
+
+        /// Include recently modified targets
+        #[arg(long)]
+        include_recent: bool,
+
+        /// Include protected targets
+        #[arg(long)]
+        include_protected: bool,
+
+        /// Mark as recent when modified within N days
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
+
+        /// Recommendation strategy
+        #[arg(long, value_enum, default_value = "safe-first")]
+        strategy: RecommendStrategyArg,
 
         /// Output recommended plan to a JSON file
         #[arg(long)]
@@ -311,6 +414,22 @@ pub enum Commands {
         #[arg(short, long)]
         force: bool,
 
+        /// Disable plan target re-validation before applying
+        #[arg(long)]
+        no_verify: bool,
+
+        /// Include recently modified targets from plan
+        #[arg(long)]
+        include_recent: bool,
+
+        /// Allow deleting protected targets from plan
+        #[arg(long)]
+        force_protected: bool,
+
+        /// Mark as recent when modified within N days
+        #[arg(long, default_value = "7")]
+        recent_days: i64,
+
         /// Verbose output
         #[arg(short, long)]
         verbose: bool,
@@ -339,6 +458,18 @@ pub enum Commands {
     Trash {
         #[command(subcommand)]
         command: TrashCommands,
+    },
+
+    /// Manage named scan profiles
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
+
+    /// Query audit logs
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommands,
     },
 }
 
@@ -393,13 +524,90 @@ pub enum TrashCommands {
     },
 }
 
+#[derive(Subcommand)]
+pub enum ProfileCommands {
+    /// List profile names
+    List,
+    /// Show profile contents
+    Show {
+        /// Profile name
+        name: String,
+    },
+    /// Add or update a profile
+    Add {
+        /// Profile name
+        name: String,
+        /// Paths for this profile
+        #[arg(long, required = true)]
+        path: Vec<PathBuf>,
+        /// Default depth
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Default minimum size in MB
+        #[arg(long)]
+        min_size_mb: Option<u64>,
+        /// Default older-than days
+        #[arg(long)]
+        max_age_days: Option<i64>,
+        /// Respect .gitignore by default
+        #[arg(long)]
+        gitignore: bool,
+        /// Default category
+        #[arg(long, value_enum)]
+        category: Option<CategoryFilterArg>,
+        /// Default max risk
+        #[arg(long, value_enum)]
+        max_risk: Option<RiskArg>,
+    },
+    /// Remove a profile
+    Remove {
+        /// Profile name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AuditCommands {
+    /// List recent runs
+    List {
+        /// Show only top N runs
+        #[arg(long, default_value = "20")]
+        top: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show all records for a run
+    Show {
+        /// Run id
+        #[arg(long)]
+        run: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export audit records
+    Export {
+        /// Optional run id to export only one run
+        #[arg(long)]
+        run: Option<String>,
+        /// Export format
+        #[arg(long, value_enum, default_value = "json")]
+        format: ExportFormatArg,
+        /// Output path (stdout if omitted)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
 impl Cli {
     pub fn run(self) -> Result<()> {
-        let config = if let Some(config_path) = &self.config {
+        let mut config = if let Some(config_path) = &self.config {
             Config::load(config_path)?
         } else {
             Config::load_or_default(Config::default_path())?
         };
+        let profile = self.profile.clone();
 
         match self.command {
             Commands::Scan {
@@ -412,17 +620,24 @@ impl Cli {
                 explain,
                 category,
                 max_risk,
+                include_protected,
+                include_recent,
+                recent_days,
             } => {
                 run_scan(
                     path,
-                    depth.or(config.default_depth),
-                    min_size.or(config.min_size_mb),
-                    older_than.or(config.max_age_days),
+                    profile.as_deref(),
+                    depth,
+                    min_size,
+                    older_than,
                     gitignore,
                     json,
                     explain,
                     category,
                     max_risk,
+                    include_protected,
+                    include_recent,
+                    recent_days,
                     &config,
                 )?;
             }
@@ -440,12 +655,17 @@ impl Cli {
                 gitignore,
                 category,
                 max_risk,
+                include_recent,
+                include_protected,
+                force_protected,
+                recent_days,
             } => {
                 run_clean(
                     path,
-                    depth.or(config.default_depth),
-                    min_size.or(config.min_size_mb),
-                    older_than.or(config.max_age_days),
+                    profile.as_deref(),
+                    depth,
+                    min_size,
+                    older_than,
                     dry_run,
                     trash,
                     auto,
@@ -455,11 +675,27 @@ impl Cli {
                     gitignore,
                     category,
                     max_risk,
+                    include_recent,
+                    include_protected,
+                    force_protected,
+                    recent_days,
                     &config,
                 )?;
             }
-            Commands::Tui { path } => {
-                crate::tui::run_tui_with_config(path, &config)?;
+            Commands::Tui {
+                path,
+                include_recent,
+                include_protected,
+                recent_days,
+            } => {
+                run_tui(
+                    path,
+                    profile.as_deref(),
+                    include_recent,
+                    include_protected,
+                    recent_days,
+                    &config,
+                )?;
             }
             Commands::Stats {
                 path,
@@ -469,15 +705,22 @@ impl Cli {
                 gitignore,
                 category,
                 max_risk,
+                include_recent,
+                include_protected,
+                recent_days,
             } => {
                 run_stats(
                     path,
-                    depth.or(config.default_depth),
+                    profile.as_deref(),
+                    depth,
                     top,
                     json,
                     gitignore,
                     category,
                     max_risk,
+                    include_recent,
+                    include_protected,
+                    recent_days,
                     &config,
                 )?;
             }
@@ -493,16 +736,23 @@ impl Cli {
                 output,
                 category,
                 max_risk,
+                include_recent,
+                include_protected,
+                recent_days,
             } => {
                 run_plan(
                     path,
-                    depth.or(config.default_depth),
-                    min_size.or(config.min_size_mb),
-                    older_than.or(config.max_age_days),
+                    profile.as_deref(),
+                    depth,
+                    min_size,
+                    older_than,
                     gitignore,
                     output,
                     category,
                     max_risk,
+                    include_recent,
+                    include_protected,
+                    recent_days,
                     &config,
                 )?;
             }
@@ -515,6 +765,10 @@ impl Cli {
                 cleanup,
                 free_at_least,
                 include_in_use,
+                include_recent,
+                include_protected,
+                recent_days,
+                strategy,
                 output_plan,
                 json,
                 explain,
@@ -523,13 +777,18 @@ impl Cli {
             } => {
                 run_recommend(
                     path,
-                    depth.or(config.default_depth),
-                    min_size.or(config.min_size_mb),
-                    older_than.or(config.max_age_days),
+                    profile.as_deref(),
+                    depth,
+                    min_size,
+                    older_than,
                     gitignore,
                     cleanup,
                     free_at_least,
                     include_in_use,
+                    include_recent,
+                    include_protected,
+                    recent_days,
+                    strategy,
                     output_plan,
                     json,
                     explain,
@@ -543,9 +802,24 @@ impl Cli {
                 dry_run,
                 trash,
                 force,
+                no_verify,
+                include_recent,
+                force_protected,
+                recent_days,
                 verbose,
             } => {
-                run_apply(plan, dry_run, trash, force, verbose)?;
+                run_apply(
+                    plan,
+                    dry_run,
+                    trash,
+                    force,
+                    no_verify,
+                    include_recent,
+                    force_protected,
+                    recent_days,
+                    verbose,
+                    &config,
+                )?;
             }
             Commands::Undo {
                 batch,
@@ -553,10 +827,16 @@ impl Cli {
                 force,
                 verbose,
             } => {
-                run_undo(batch, dry_run, force, verbose)?;
+                run_undo(batch, dry_run, force, verbose, &config)?;
             }
             Commands::Trash { command } => {
-                run_trash(command)?;
+                run_trash(command, &config)?;
+            }
+            Commands::Profile { command } => {
+                run_profile(command, &mut config, self.config)?;
+            }
+            Commands::Audit { command } => {
+                run_audit(command, &config)?;
             }
         }
 
@@ -564,8 +844,139 @@ impl Cli {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedScanInput {
+    roots: Vec<PathBuf>,
+    depth: Option<usize>,
+    min_size_mb: Option<u64>,
+    older_than: Option<i64>,
+    gitignore: Option<bool>,
+    category: Option<Category>,
+    max_risk: Option<RiskLevel>,
+}
+
+impl ResolvedScanInput {
+    fn from_path(path: PathBuf) -> Self {
+        Self {
+            roots: vec![path],
+            depth: None,
+            min_size_mb: None,
+            older_than: None,
+            gitignore: None,
+            category: None,
+            max_risk: None,
+        }
+    }
+
+    fn from_profile(profile: &crate::config::ScanProfile) -> Self {
+        Self {
+            roots: profile.paths.clone(),
+            depth: profile.depth,
+            min_size_mb: profile.min_size_mb,
+            older_than: profile.max_age_days,
+            gitignore: profile.gitignore,
+            category: profile.category,
+            max_risk: profile.max_risk,
+        }
+    }
+}
+
+fn resolve_scan_inputs(
+    path: Option<PathBuf>,
+    profile: Option<&str>,
+    config: &Config,
+) -> Result<ResolvedScanInput> {
+    match (path, profile) {
+        (Some(_), Some(_)) => anyhow::bail!("Use either [PATH] or --profile, not both"),
+        (None, Some(name)) => {
+            let p = config
+                .scan_profiles
+                .get(name)
+                .with_context(|| format!("Profile `{}` not found", name))?;
+            if p.paths.is_empty() {
+                anyhow::bail!("Profile `{}` has no paths", name);
+            }
+            Ok(ResolvedScanInput::from_profile(p))
+        }
+        (Some(path), None) => Ok(ResolvedScanInput::from_path(path)),
+        (None, None) => Ok(ResolvedScanInput::from_path(PathBuf::from("."))),
+    }
+}
+
+fn enrich_project_flags(projects: &mut [ProjectInfo], keep_policy: &KeepPolicy, recent_days: i64) {
+    for project in projects {
+        let decision = keep_policy.evaluate(project);
+        project.protected = decision.protected;
+        project.protected_by = decision.reason;
+        project.recent = project.days_since_modified() < recent_days;
+    }
+}
+
+fn filter_by_visibility(
+    projects: Vec<ProjectInfo>,
+    include_protected: bool,
+    include_recent: bool,
+) -> Vec<ProjectInfo> {
+    projects
+        .into_iter()
+        .filter(|p| (include_protected || !p.protected) && (include_recent || !p.recent))
+        .collect()
+}
+
+fn deduplicate_projects(projects: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for project in projects {
+        if seen.insert(project.cleanable_dir.clone()) {
+            out.push(project);
+        }
+    }
+    out
+}
+
+fn scan_projects_for_roots(
+    roots: &[PathBuf],
+    depth: Option<usize>,
+    min_size_mb: Option<u64>,
+    older_than: Option<i64>,
+    gitignore: bool,
+    category: Option<Category>,
+    max_risk: RiskLevel,
+    config: &Config,
+) -> Result<Vec<ProjectInfo>> {
+    let mut all = Vec::new();
+    for root in roots {
+        let mut scanner = Scanner::new(root)
+            .exclude_dirs(&config.exclude_dirs)
+            .custom_patterns(&config.custom_patterns)
+            .max_risk(max_risk);
+
+        if let Some(category) = category {
+            scanner = scanner.category(category);
+        }
+        if let Some(depth) = depth {
+            scanner = scanner.max_depth(depth);
+        }
+        if let Some(min_size_mb) = min_size_mb {
+            scanner = scanner.min_size(min_size_mb * 1024 * 1024);
+        }
+        if let Some(older_than) = older_than {
+            scanner = scanner.max_age_days(older_than);
+        }
+        scanner = scanner.respect_gitignore(gitignore);
+        let mut projects = scanner.scan()?;
+        all.append(&mut projects);
+    }
+
+    let mut deduped = deduplicate_projects(all);
+    deduped.sort_by(|a, b| b.size.cmp(&a.size));
+    Ok(deduped)
+}
+
 fn run_scan(
-    path: PathBuf,
+    path: Option<PathBuf>,
+    profile: Option<&str>,
     depth: Option<usize>,
     min_size_mb: Option<u64>,
     older_than: Option<i64>,
@@ -574,68 +985,66 @@ fn run_scan(
     explain: bool,
     category: CategoryFilterArg,
     max_risk: RiskArg,
+    include_protected: bool,
+    include_recent: bool,
+    recent_days: i64,
     config: &Config,
 ) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
 
-    if json_output {
-        let mut scanner = Scanner::new(&path)
-            .exclude_dirs(&config.exclude_dirs)
-            .custom_patterns(&config.custom_patterns)
-            .max_risk(max_risk.to_max_risk());
+    let resolved = resolve_scan_inputs(path, profile, config)?;
+    let depth = depth.or(resolved.depth).or(config.default_depth);
+    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
+    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
+    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
+    let category = category.to_filter().or(resolved.category);
+    let max_risk = if matches!(max_risk, RiskArg::Medium) {
+        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
+    } else {
+        max_risk.to_max_risk()
+    };
+    let keep_policy = KeepPolicy::from_config(config);
 
-        if let Some(category) = category.to_filter() {
-            scanner = scanner.category(category);
-        }
-
-        if let Some(d) = depth {
-            scanner = scanner.max_depth(d);
-        }
-
-        if let Some(size_mb) = min_size_mb {
-            scanner = scanner.min_size(size_mb * 1024 * 1024);
-        }
-
-        if let Some(days) = older_than {
-            scanner = scanner.max_age_days(days);
-        }
-
-        scanner = scanner.respect_gitignore(gitignore);
-
-        let projects = scanner.scan()?;
+    if json_output || resolved.roots.len() > 1 {
+        let mut projects = scan_projects_for_roots(
+            &resolved.roots,
+            depth,
+            min_size_mb,
+            older_than,
+            gitignore,
+            category,
+            max_risk,
+            config,
+        )?;
+        enrich_project_flags(&mut projects, &keep_policy, recent_days);
+        projects = filter_by_visibility(projects, include_protected, include_recent);
         println!("{}", serde_json::to_string_pretty(&projects)?);
         return Ok(());
     }
 
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
+    let root = resolved.roots[0].clone();
 
-    let mut scanner = Scanner::new(&path)
+    let mut scanner = Scanner::new(&root)
         .exclude_dirs(&config.exclude_dirs)
         .custom_patterns(&config.custom_patterns)
-        .max_risk(max_risk.to_max_risk());
-
-    if let Some(category) = category.to_filter() {
+        .max_risk(max_risk);
+    if let Some(category) = category {
         scanner = scanner.category(category);
     }
-    let min_size_bytes = min_size_mb.map(|size_mb| size_mb * 1024 * 1024);
-
-    if let Some(d) = depth {
-        scanner = scanner.max_depth(d);
+    if let Some(depth) = depth {
+        scanner = scanner.max_depth(depth);
     }
-
-    if let Some(size_mb) = min_size_mb {
-        scanner = scanner.min_size(size_mb * 1024 * 1024);
+    if let Some(min_size_mb) = min_size_mb {
+        scanner = scanner.min_size(min_size_mb * 1024 * 1024);
     }
-
     if let Some(days) = older_than {
         scanner = scanner.max_age_days(days);
     }
-
     scanner = scanner.respect_gitignore(gitignore);
 
-    // Use streaming scan for real-time progress
+    let min_size_bytes = min_size_mb.map(|size_mb| size_mb * 1024 * 1024);
     let (total_count, rx) = scanner.scan_with_streaming()?;
-
     if total_count == 0 {
         println!("{}", "No cleanable directories found.".yellow());
         return Ok(());
@@ -646,7 +1055,6 @@ fn run_scan(
         total_count
     );
 
-    // Create progress bar
     let pb = ProgressBar::new(total_count as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -657,21 +1065,21 @@ fn run_scan(
 
     let mut projects = Vec::new();
     let mut total_size = 0u64;
-
-    // Receive and display results as they complete
-    for project in rx.iter() {
-        // Always advance progress (we calculate size for every candidate).
+    for mut project in rx.iter() {
         pb.inc(1);
+        if !min_size_bytes.map_or(true, |ms| project.size >= ms) {
+            continue;
+        }
 
-        // Apply size filter in CLI (streaming scanner reports all candidates).
-        let passes_size = min_size_bytes.map_or(true, |ms| project.size >= ms);
-        if !passes_size {
+        let decision = keep_policy.evaluate(&project);
+        project.protected = decision.protected;
+        project.protected_by = decision.reason;
+        project.recent = project.days_since_modified() < recent_days;
+        if (!include_protected && project.protected) || (!include_recent && project.recent) {
             continue;
         }
 
         total_size += project.size;
-
-        // Update progress bar message
         let dir_display = project.cleanable_dir.display().to_string();
         let short_path = if dir_display.len() > 50 {
             format!("...{}", &dir_display[dir_display.len() - 47..])
@@ -679,10 +1087,8 @@ fn run_scan(
             dir_display.clone()
         };
         pb.set_message(format!("{}: {}", short_path, project.size_human()));
-
-        // Print result immediately above progress bar (streaming output)
         pb.println(format!(
-            "  {} {} {} {} ({})",
+            "  {} {} {} {} ({}){}{}",
             "✓".green(),
             project.project_type_display_name().bright_cyan(),
             format!(
@@ -691,7 +1097,17 @@ fn run_scan(
             )
             .bright_black(),
             dir_display.bright_white(),
-            project.size_human().yellow()
+            project.size_human().yellow(),
+            if project.protected {
+                " [PROTECTED]".yellow().to_string()
+            } else {
+                String::new()
+            },
+            if project.recent {
+                " [RECENT]".bright_black().to_string()
+            } else {
+                String::new()
+            }
         ));
 
         if explain {
@@ -710,7 +1126,6 @@ fn run_scan(
 
         projects.push(project);
     }
-
     pb.finish_and_clear();
 
     if projects.is_empty() {
@@ -718,9 +1133,7 @@ fn run_scan(
         return Ok(());
     }
 
-    // Sort by size for summary
     projects.sort_by(|a, b| b.size.cmp(&a.size));
-
     println!(
         "\n{} {} cleanable directories found",
         "✓".green().bold(),
@@ -731,12 +1144,12 @@ fn run_scan(
         "Total size:".bold(),
         format_size(total_size).green().bold()
     );
-
     Ok(())
 }
 
 fn run_clean(
-    path: PathBuf,
+    path: Option<PathBuf>,
+    profile: Option<&str>,
     depth: Option<usize>,
     min_size_mb: Option<u64>,
     older_than: Option<i64>,
@@ -749,34 +1162,38 @@ fn run_clean(
     gitignore: bool,
     category: CategoryFilterArg,
     max_risk: RiskArg,
+    include_recent: bool,
+    include_protected: bool,
+    force_protected: bool,
+    recent_days: i64,
     config: &Config,
 ) -> Result<()> {
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
+    let resolved = resolve_scan_inputs(path, profile, config)?;
+    let depth = depth.or(resolved.depth).or(config.default_depth);
+    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
+    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
+    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
+    let category = category.to_filter().or(resolved.category);
+    let max_risk = if matches!(max_risk, RiskArg::Medium) {
+        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
+    } else {
+        max_risk.to_max_risk()
+    };
 
-    let mut scanner = Scanner::new(&path)
-        .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns)
-        .max_risk(max_risk.to_max_risk());
-
-    if let Some(category) = category.to_filter() {
-        scanner = scanner.category(category);
-    }
-
-    if let Some(d) = depth {
-        scanner = scanner.max_depth(d);
-    }
-
-    if let Some(size_mb) = min_size_mb {
-        scanner = scanner.min_size(size_mb * 1024 * 1024);
-    }
-
-    if let Some(days) = older_than {
-        scanner = scanner.max_age_days(days);
-    }
-
-    scanner = scanner.respect_gitignore(gitignore);
-
-    let mut projects = scanner.scan()?;
+    let mut projects = scan_projects_for_roots(
+        &resolved.roots,
+        depth,
+        min_size_mb,
+        older_than,
+        gitignore,
+        category,
+        max_risk,
+        config,
+    )?;
+    let keep_policy = KeepPolicy::from_config(config);
+    enrich_project_flags(&mut projects, &keep_policy, recent_days);
+    projects = filter_by_visibility(projects, include_protected, include_recent);
 
     if projects.is_empty() {
         println!("{}", "No cleanable directories found.".yellow());
@@ -808,6 +1225,67 @@ fn run_clean(
         }
     }
 
+    let audit = AuditLogger::from_config(config);
+    let run_id = audit.start_run("clean").ok();
+
+    let mut pre_skipped_count = 0usize;
+    let mut pre_skipped_bytes = 0u64;
+    let mut selected_for_clean = Vec::new();
+    for mut project in projects {
+        if project.protected && !force_protected {
+            project.skip_reason = Some("blocked_protected".to_string());
+            pre_skipped_count += 1;
+            pre_skipped_bytes = pre_skipped_bytes.saturating_add(project.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "clean",
+                    &project.cleanable_dir,
+                    "remove",
+                    "skipped",
+                    project.size,
+                    project.skip_reason.clone(),
+                );
+            }
+            continue;
+        }
+        if project.recent && !include_recent {
+            project.skip_reason = Some("blocked_recent".to_string());
+            pre_skipped_count += 1;
+            pre_skipped_bytes = pre_skipped_bytes.saturating_add(project.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "clean",
+                    &project.cleanable_dir,
+                    "remove",
+                    "skipped",
+                    project.size,
+                    project.skip_reason.clone(),
+                );
+            }
+            continue;
+        }
+        if project.in_use && !force {
+            project.skip_reason = Some("blocked_in_use".to_string());
+            pre_skipped_count += 1;
+            pre_skipped_bytes = pre_skipped_bytes.saturating_add(project.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "clean",
+                    &project.cleanable_dir,
+                    "remove",
+                    "skipped",
+                    project.size,
+                    project.skip_reason.clone(),
+                );
+            }
+            continue;
+        }
+        selected_for_clean.push(project);
+    }
+
     // Perform cleaning
     let options = CleanOptions {
         dry_run,
@@ -817,7 +1295,24 @@ fn run_clean(
     };
 
     let cleaner = Cleaner::with_options(options);
-    let result = cleaner.clean_multiple(&projects)?;
+    let mut result = cleaner.clean_multiple(&selected_for_clean)?;
+    result.skipped_count += pre_skipped_count;
+    result.bytes_skipped = result.bytes_skipped.saturating_add(pre_skipped_bytes);
+    result.run_id = run_id.clone();
+
+    if let Some(run_id) = &run_id {
+        for project in &selected_for_clean {
+            let _ = audit.log_item(
+                run_id,
+                "clean",
+                &project.cleanable_dir,
+                if dry_run { "dry_run" } else { "remove" },
+                "attempted",
+                project.size,
+                None,
+            );
+        }
+    }
 
     println!("\n{}", "Cleaning completed!".green().bold());
     println!("  Cleaned: {}", result.cleaned_count.to_string().green());
@@ -849,6 +1344,17 @@ fn run_clean(
         for error in &result.errors {
             println!("  {}", error.red());
         }
+    }
+
+    if let Some(run_id) = run_id {
+        let _ = audit.finish_run(
+            &run_id,
+            "clean",
+            result.cleaned_count,
+            result.skipped_count,
+            result.failed_count,
+            result.bytes_freed,
+        );
     }
 
     Ok(())
@@ -935,9 +1441,19 @@ fn display_projects(projects: &[ProjectInfo]) {
         } else {
             "".white()
         };
+        let protected = if project.protected {
+            " [PROTECTED]".yellow()
+        } else {
+            "".white()
+        };
+        let recent = if project.recent {
+            " [RECENT]".bright_black()
+        } else {
+            "".white()
+        };
 
         println!(
-            "{}. [{}] {} {} - {}{} ({})",
+            "{}. [{}] {} {} - {}{}{}{} ({})",
             (idx + 1).to_string().dimmed(),
             colored_type,
             format!(
@@ -948,6 +1464,8 @@ fn display_projects(projects: &[ProjectInfo]) {
             project.cleanable_dir.display().to_string().bold(),
             project.size_human().green(),
             in_use,
+            protected,
+            recent,
             format!("{} days old", project.days_since_modified()).dimmed()
         );
     }
@@ -988,36 +1506,47 @@ fn select_projects_interactive(projects: &[ProjectInfo]) -> Result<Vec<ProjectIn
 }
 
 fn run_stats(
-    path: PathBuf,
+    path: Option<PathBuf>,
+    profile: Option<&str>,
     depth: Option<usize>,
     top_n: usize,
     json_output: bool,
     gitignore: bool,
     category: CategoryFilterArg,
     max_risk: RiskArg,
+    include_recent: bool,
+    include_protected: bool,
+    recent_days: i64,
     config: &Config,
 ) -> Result<()> {
     use crate::Statistics;
 
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
+    let resolved = resolve_scan_inputs(path, profile, config)?;
+    let depth = depth.or(resolved.depth).or(config.default_depth);
+    let min_size_mb = resolved.min_size_mb.or(config.min_size_mb);
+    let older_than = resolved.older_than.or(config.max_age_days);
+    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
+    let category = category.to_filter().or(resolved.category);
+    let max_risk = if matches!(max_risk, RiskArg::Medium) {
+        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
+    } else {
+        max_risk.to_max_risk()
+    };
+    let keep_policy = KeepPolicy::from_config(config);
 
-    let mut scanner = Scanner::new(&path)
-        .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns)
-        .max_risk(max_risk.to_max_risk());
-
-    if let Some(category) = category.to_filter() {
-        scanner = scanner.category(category);
-    }
-
-    if let Some(d) = depth {
-        scanner = scanner.max_depth(d);
-    }
-
-    scanner = scanner.respect_gitignore(gitignore);
-
-    // Use regular scan for statistics (we need all results)
-    let projects = scanner.scan()?;
+    let mut projects = scan_projects_for_roots(
+        &resolved.roots,
+        depth,
+        min_size_mb,
+        older_than,
+        gitignore,
+        category,
+        max_risk,
+        config,
+    )?;
+    enrich_project_flags(&mut projects, &keep_policy, recent_days);
+    projects = filter_by_visibility(projects, include_protected, include_recent);
 
     if projects.is_empty() {
         println!("{}", "No cleanable directories found.".yellow());
@@ -1059,7 +1588,8 @@ fn init_config(path: Option<PathBuf>) -> Result<()> {
 }
 
 fn run_plan(
-    path: PathBuf,
+    path: Option<PathBuf>,
+    profile: Option<&str>,
     depth: Option<usize>,
     min_size_mb: Option<u64>,
     older_than: Option<i64>,
@@ -1067,34 +1597,49 @@ fn run_plan(
     output: Option<PathBuf>,
     category: CategoryFilterArg,
     max_risk: RiskArg,
+    include_recent: bool,
+    include_protected: bool,
+    recent_days: i64,
     config: &Config,
 ) -> Result<()> {
-    let scan_root = fs::canonicalize(&path).unwrap_or(path);
-    let mut scanner = Scanner::new(&scan_root)
-        .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns)
-        .max_risk(max_risk.to_max_risk());
+    let resolved = resolve_scan_inputs(path, profile, config)?;
+    let depth = depth.or(resolved.depth).or(config.default_depth);
+    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
+    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
+    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
+    let category_filter = category.to_filter().or(resolved.category);
+    let max_risk_level = if matches!(max_risk, RiskArg::Medium) {
+        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
+    } else {
+        max_risk.to_max_risk()
+    };
 
-    if let Some(category) = category.to_filter() {
-        scanner = scanner.category(category);
-    }
+    let scan_root = if resolved.roots.len() == 1 {
+        fs::canonicalize(&resolved.roots[0]).unwrap_or_else(|_| resolved.roots[0].clone())
+    } else {
+        PathBuf::from(".")
+    };
 
-    if let Some(d) = depth {
-        scanner = scanner.max_depth(d);
-    }
+    let keep_policy = KeepPolicy::from_config(config);
+    let mut projects = scan_projects_for_roots(
+        &resolved.roots,
+        depth,
+        min_size_mb,
+        older_than,
+        gitignore,
+        category_filter,
+        max_risk_level,
+        config,
+    )?;
+    enrich_project_flags(&mut projects, &keep_policy, recent_days);
+    projects = filter_by_visibility(projects, include_protected, include_recent);
 
-    if let Some(size_mb) = min_size_mb {
-        scanner = scanner.min_size(size_mb * 1024 * 1024);
-    }
-
-    if let Some(days) = older_than {
-        scanner = scanner.max_age_days(days);
-    }
-
-    scanner = scanner.respect_gitignore(gitignore);
-
-    let projects = scanner.scan()?;
-    let plan = CleanupPlan::new(scan_root, projects);
+    let mut params = crate::plan::PlanParams::default();
+    params.max_risk = Some(max_risk_level);
+    params.category = category_filter;
+    params.recent_days = Some(recent_days);
+    params.verify_mode = Some("strict".to_string());
+    let plan = CleanupPlan::new_with_params(scan_root, projects, params);
 
     if let Some(output_path) = output {
         plan.save_json(&output_path)?;
@@ -1111,7 +1656,8 @@ fn run_plan(
 }
 
 fn run_recommend(
-    path: PathBuf,
+    path: Option<PathBuf>,
+    profile: Option<&str>,
     depth: Option<usize>,
     min_size_mb: Option<u64>,
     older_than: Option<i64>,
@@ -1119,6 +1665,10 @@ fn run_recommend(
     cleanup: Option<String>,
     free_at_least: Option<String>,
     include_in_use: bool,
+    include_recent: bool,
+    include_protected: bool,
+    recent_days: i64,
+    strategy: RecommendStrategyArg,
     output_plan: Option<PathBuf>,
     json_output: bool,
     explain: bool,
@@ -1128,7 +1678,22 @@ fn run_recommend(
 ) -> Result<()> {
     use serde::Serialize;
 
-    let scan_root = fs::canonicalize(&path).unwrap_or(path);
+    let resolved = resolve_scan_inputs(path, profile, config)?;
+    let scan_root = if resolved.roots.len() == 1 {
+        fs::canonicalize(&resolved.roots[0]).unwrap_or_else(|_| resolved.roots[0].clone())
+    } else {
+        PathBuf::from(".")
+    };
+    let depth = depth.or(resolved.depth).or(config.default_depth);
+    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
+    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
+    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
+    let category = category.to_filter().or(resolved.category);
+    let max_risk = if matches!(max_risk, RiskArg::Medium) {
+        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
+    } else {
+        max_risk.to_max_risk()
+    };
 
     let cleanup_bytes = cleanup.as_deref().map(parse_size).transpose()?;
     let free_at_least_bytes = free_at_least.as_deref().map(parse_size).transpose()?;
@@ -1148,31 +1713,28 @@ fn run_recommend(
         }
     };
 
-    let mut scanner = Scanner::new(&scan_root)
-        .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns)
-        .max_risk(max_risk.to_max_risk());
+    let keep_policy = KeepPolicy::from_config(config);
+    let mut projects = scan_projects_for_roots(
+        &resolved.roots,
+        depth,
+        min_size_mb,
+        older_than,
+        gitignore,
+        category,
+        max_risk,
+        config,
+    )?;
+    enrich_project_flags(&mut projects, &keep_policy, recent_days);
 
-    if let Some(category) = category.to_filter() {
-        scanner = scanner.category(category);
-    }
+    let mut opts = RecommendOptions::new(target_bytes);
+    opts.include_in_use = include_in_use;
+    opts.include_recent = include_recent;
+    opts.include_protected = include_protected;
+    opts.recent_days = recent_days;
+    opts.strategy = strategy.to_strategy();
+    opts.max_risk = Some(max_risk);
 
-    if let Some(d) = depth {
-        scanner = scanner.max_depth(d);
-    }
-
-    if let Some(size_mb) = min_size_mb {
-        scanner = scanner.min_size(size_mb * 1024 * 1024);
-    }
-
-    if let Some(days) = older_than {
-        scanner = scanner.max_age_days(days);
-    }
-
-    scanner = scanner.respect_gitignore(gitignore);
-
-    let projects = scanner.scan()?;
-    let result = recommend_projects(projects, target_bytes, include_in_use);
+    let result = recommend_projects(projects, &opts);
 
     #[derive(Serialize)]
     struct RecommendOutput {
@@ -1180,6 +1742,8 @@ fn run_recommend(
         target_bytes: u64,
         selected_bytes: u64,
         selected_count: usize,
+        strategy: String,
+        blocked: serde_json::Value,
         projects: Vec<ProjectInfo>,
     }
 
@@ -1188,6 +1752,13 @@ fn run_recommend(
         target_bytes: result.target_bytes,
         selected_bytes: result.selected_bytes,
         selected_count: result.selected.len(),
+        strategy: opts.strategy.as_str().to_string(),
+        blocked: serde_json::json!({
+            "in_use": { "count": result.blocked.in_use_count, "bytes": result.blocked.in_use_bytes },
+            "protected": { "count": result.blocked.protected_count, "bytes": result.blocked.protected_bytes },
+            "recent": { "count": result.blocked.recent_count, "bytes": result.blocked.recent_bytes },
+            "risk": { "count": result.blocked.risk_count, "bytes": result.blocked.risk_bytes },
+        }),
         projects: result.selected.clone(),
     };
 
@@ -1195,8 +1766,10 @@ fn run_recommend(
         let mut params = crate::plan::PlanParams::default();
         params.cleanup_bytes = cleanup_bytes;
         params.free_at_least_bytes = free_at_least_bytes;
-        params.max_risk = Some(max_risk.to_max_risk());
-        params.category = category.to_filter();
+        params.max_risk = Some(max_risk);
+        params.category = category;
+        params.strategy = Some(opts.strategy.as_str().to_string());
+        params.recent_days = Some(recent_days);
 
         let plan = CleanupPlan::new_with_params(scan_root.clone(), result.selected.clone(), params);
         plan.save_json(plan_path)?;
@@ -1222,11 +1795,22 @@ fn run_recommend(
         }
         .green()
     );
+    println!("  Strategy: {}", opts.strategy.as_str().green().bold());
     println!(
         "  Selected: {} ({})",
         out.selected_count.to_string().green(),
         format_size(out.selected_bytes).green().bold()
     );
+
+    if !result.blocked.is_empty() {
+        println!(
+            "  Blocked: in_use={} protected={} recent={} risk={}",
+            result.blocked.in_use_count.to_string().yellow(),
+            result.blocked.protected_count.to_string().yellow(),
+            result.blocked.recent_count.to_string().yellow(),
+            result.blocked.risk_count.to_string().yellow()
+        );
+    }
 
     if out.projects.is_empty() {
         println!("{}", "No directories selected.".yellow());
@@ -1266,38 +1850,155 @@ fn run_apply(
     dry_run: bool,
     trash: bool,
     force: bool,
+    no_verify: bool,
+    include_recent: bool,
+    force_protected: bool,
+    recent_days: i64,
     verbose: bool,
+    config: &Config,
 ) -> Result<()> {
     let plan = CleanupPlan::load_json(&plan_path)?;
 
-    if plan.schema_version != 1 && plan.schema_version != 2 {
+    if plan.schema_version != 1 && plan.schema_version != 2 && plan.schema_version != 3 {
         anyhow::bail!("Unsupported plan schema_version: {}", plan.schema_version);
     }
+    let audit = AuditLogger::from_config(config);
+    let run_id = audit.start_run("apply").ok();
 
-    for project in &plan.projects {
-        if !project.cleanable_dir.starts_with(&plan.scan_root) {
-            anyhow::bail!(
-                "Plan contains path outside scan_root: {}",
-                project.cleanable_dir.display()
-            );
-        }
+    let keep_policy = KeepPolicy::from_config(config);
+    let mut scanner = Scanner::new(&plan.scan_root)
+        .exclude_dirs(&config.exclude_dirs)
+        .custom_patterns(&config.custom_patterns);
+    if let Some(max_risk) = plan.params.as_ref().and_then(|p| p.max_risk) {
+        scanner = scanner.max_risk(max_risk);
+    }
+    if let Some(category) = plan.params.as_ref().and_then(|p| p.category) {
+        scanner = scanner.category(category);
     }
 
-    let total_size: u64 = plan.projects.iter().map(|p| p.size).sum();
+    let mut verified_projects = Vec::new();
+    let mut skipped_pre = 0usize;
+    let mut skipped_pre_bytes = 0u64;
+    for project in &plan.projects {
+        if !project.cleanable_dir.starts_with(&plan.scan_root) {
+            skipped_pre += 1;
+            skipped_pre_bytes = skipped_pre_bytes.saturating_add(project.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "apply",
+                    &project.cleanable_dir,
+                    "verify",
+                    "skipped",
+                    project.size,
+                    Some("outside_scan_root".to_string()),
+                );
+            }
+            continue;
+        }
+
+        let mut candidate = if no_verify {
+            project.clone()
+        } else {
+            match scanner.revalidate_target(&project.cleanable_dir) {
+                Some(info) => info,
+                None => {
+                    skipped_pre += 1;
+                    skipped_pre_bytes = skipped_pre_bytes.saturating_add(project.size);
+                    if let Some(run_id) = &run_id {
+                        let _ = audit.log_item(
+                            run_id,
+                            "apply",
+                            &project.cleanable_dir,
+                            "verify",
+                            "skipped",
+                            project.size,
+                            Some("rule_mismatch_or_missing".to_string()),
+                        );
+                    }
+                    continue;
+                }
+            }
+        };
+
+        let decision = keep_policy.evaluate(&candidate);
+        candidate.protected = decision.protected;
+        candidate.protected_by = decision.reason;
+        candidate.recent = candidate.days_since_modified() < recent_days;
+
+        if candidate.protected && !force_protected {
+            skipped_pre += 1;
+            skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "apply",
+                    &candidate.cleanable_dir,
+                    "verify",
+                    "skipped",
+                    candidate.size,
+                    Some("blocked_protected".to_string()),
+                );
+            }
+            continue;
+        }
+        if candidate.recent && !include_recent {
+            skipped_pre += 1;
+            skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "apply",
+                    &candidate.cleanable_dir,
+                    "verify",
+                    "skipped",
+                    candidate.size,
+                    Some("blocked_recent".to_string()),
+                );
+            }
+            continue;
+        }
+        if candidate.in_use && !force {
+            skipped_pre += 1;
+            skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "apply",
+                    &candidate.cleanable_dir,
+                    "verify",
+                    "skipped",
+                    candidate.size,
+                    Some("blocked_in_use".to_string()),
+                );
+            }
+            continue;
+        }
+        verified_projects.push(candidate);
+    }
+
+    let total_size: u64 = verified_projects.iter().map(|p| p.size).sum();
     println!("{}", "Applying cleanup plan...".cyan().bold());
     println!("  Plan: {}", plan_path.display());
-    println!("  Projects: {}", plan.projects.len().to_string().green());
+    println!(
+        "  Projects: {} ({} skipped in verify)",
+        verified_projects.len().to_string().green(),
+        skipped_pre.to_string().yellow()
+    );
     println!("  Total size: {}", format_size(total_size).green().bold());
 
-    if plan.projects.is_empty() {
+    if verified_projects.is_empty() {
         println!("{}", "Nothing to clean.".yellow());
+        if let Some(run_id) = run_id {
+            let _ = audit.finish_run(&run_id, "apply", 0, skipped_pre, 0, 0);
+        }
         return Ok(());
     }
 
     if !force
         && !confirm(&format!(
             "Apply this plan and remove {} directories?",
-            plan.projects.len()
+            verified_projects.len()
         ))?
     {
         println!("{}", "Cancelled.".yellow());
@@ -1310,7 +2011,24 @@ fn run_apply(
         force,
         trash,
     });
-    let result = cleaner.clean_multiple(&plan.projects)?;
+    let mut result = cleaner.clean_multiple(&verified_projects)?;
+    result.skipped_count += skipped_pre;
+    result.bytes_skipped = result.bytes_skipped.saturating_add(skipped_pre_bytes);
+    result.run_id = run_id.clone();
+
+    if let Some(run_id) = &run_id {
+        for p in &verified_projects {
+            let _ = audit.log_item(
+                run_id,
+                "apply",
+                &p.cleanable_dir,
+                if dry_run { "dry_run" } else { "remove" },
+                "attempted",
+                p.size,
+                None,
+            );
+        }
+    }
 
     println!("\n{}", "Cleaning completed!".green().bold());
     println!("  Cleaned: {}", result.cleaned_count.to_string().green());
@@ -1340,6 +2058,17 @@ fn run_apply(
         }
     }
 
+    if let Some(run_id) = run_id {
+        let _ = audit.finish_run(
+            &run_id,
+            "apply",
+            result.cleaned_count,
+            result.skipped_count,
+            result.failed_count,
+            result.bytes_freed,
+        );
+    }
+
     Ok(())
 }
 
@@ -1354,8 +2083,16 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(input.as_str(), "y" | "yes"))
 }
 
-fn run_undo(batch: Option<String>, dry_run: bool, force: bool, verbose: bool) -> Result<()> {
+fn run_undo(
+    batch: Option<String>,
+    dry_run: bool,
+    force: bool,
+    verbose: bool,
+    config: &Config,
+) -> Result<()> {
     let trash_root = default_trash_root();
+    let audit = AuditLogger::from_config(config);
+    let run_id = audit.start_run("undo").ok();
     let batch_id = match batch {
         Some(b) => Some(b),
         None => latest_batch_id(&trash_root)?,
@@ -1384,11 +2121,37 @@ fn run_undo(batch: Option<String>, dry_run: bool, force: bool, verbose: bool) ->
         }
     }
 
+    if let Some(run_id) = &run_id {
+        let _ = audit.log_item(
+            run_id,
+            "undo",
+            &trash_root.join(&batch_id),
+            if dry_run {
+                "dry_run_restore"
+            } else {
+                "restore"
+            },
+            "completed",
+            0,
+            None,
+        );
+        let _ = audit.finish_run(
+            run_id,
+            "undo",
+            result.restored_count,
+            result.skipped_count,
+            result.failed_count,
+            0,
+        );
+    }
+
     Ok(())
 }
 
-fn run_trash(command: TrashCommands) -> Result<()> {
+fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
     let trash_root = default_trash_root();
+    let audit = AuditLogger::from_config(config);
+    let run_id = audit.start_run("trash").ok();
 
     match command {
         TrashCommands::List { top, json } => {
@@ -1496,6 +2259,17 @@ fn run_trash(command: TrashCommands) -> Result<()> {
                     println!("  {}", error.red());
                 }
             }
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "trash",
+                    &trash_root.join(&batch),
+                    "purge_batch",
+                    "completed",
+                    result.removed_bytes,
+                    None,
+                );
+            }
         }
         TrashCommands::Gc {
             keep_days,
@@ -1535,6 +2309,17 @@ fn run_trash(command: TrashCommands) -> Result<()> {
 
             if dry_run {
                 println!("{}", "Dry run only; no changes made.".bright_black());
+                if let Some(run_id) = &run_id {
+                    let _ = audit.log_item(
+                        run_id,
+                        "trash",
+                        &trash_root,
+                        "gc",
+                        "dry_run",
+                        result.removed_bytes,
+                        None,
+                    );
+                }
                 return Ok(());
             }
 
@@ -1569,10 +2354,210 @@ fn run_trash(command: TrashCommands) -> Result<()> {
                     println!("  {}", error.red());
                 }
             }
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "trash",
+                    &trash_root,
+                    "gc",
+                    "completed",
+                    applied.removed_bytes,
+                    None,
+                );
+            }
         }
     }
 
+    if let Some(run_id) = run_id {
+        let _ = audit.finish_run(&run_id, "trash", 0, 0, 0, 0);
+    }
+
     Ok(())
+}
+
+fn run_profile(
+    command: ProfileCommands,
+    config: &mut Config,
+    config_path: Option<PathBuf>,
+) -> Result<()> {
+    let path = config_path.unwrap_or_else(Config::default_path);
+    match command {
+        ProfileCommands::List => {
+            if config.scan_profiles.is_empty() {
+                println!("{}", "No profiles configured.".yellow());
+                return Ok(());
+            }
+            println!("{}", "Profiles:".cyan().bold());
+            for (name, profile) in &config.scan_profiles {
+                println!(
+                    "  {} ({} paths)",
+                    name.green().bold(),
+                    profile.paths.len().to_string().bright_black()
+                );
+            }
+        }
+        ProfileCommands::Show { name } => {
+            let profile = config
+                .scan_profiles
+                .get(&name)
+                .with_context(|| format!("Profile `{}` not found", name))?;
+            println!("{}", serde_json::to_string_pretty(profile)?);
+        }
+        ProfileCommands::Add {
+            name,
+            path: paths,
+            depth,
+            min_size_mb,
+            max_age_days,
+            gitignore,
+            category,
+            max_risk,
+        } => {
+            let profile = crate::config::ScanProfile {
+                paths,
+                depth,
+                min_size_mb,
+                max_age_days,
+                gitignore: if gitignore { Some(true) } else { None },
+                category: category.and_then(|c| c.to_filter()),
+                max_risk: max_risk.map(|r| r.to_max_risk()),
+            };
+            config.scan_profiles.insert(name.clone(), profile);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create config directory: {}", parent.display())
+                })?;
+            }
+            config.save(&path)?;
+            println!(
+                "{} {}",
+                "Saved profile:".green().bold(),
+                name.green().bold()
+            );
+        }
+        ProfileCommands::Remove { name } => {
+            if config.scan_profiles.remove(&name).is_none() {
+                anyhow::bail!("Profile `{}` not found", name);
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create config directory: {}", parent.display())
+                })?;
+            }
+            config.save(&path)?;
+            println!(
+                "{} {}",
+                "Removed profile:".green().bold(),
+                name.green().bold()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_audit(command: AuditCommands, config: &Config) -> Result<()> {
+    let logger = AuditLogger::from_config(config);
+    match command {
+        AuditCommands::List { top, json } => {
+            let runs = logger.list_runs()?;
+            let shown = runs.into_iter().take(top).collect::<Vec<_>>();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&shown)?);
+                return Ok(());
+            }
+            if shown.is_empty() {
+                println!("{}", "No audit runs found.".yellow());
+                println!("  Log path: {}", logger.path().display());
+                return Ok(());
+            }
+            println!("{}", "Audit runs:".cyan().bold());
+            println!("  Log path: {}", logger.path().display());
+            for run in shown {
+                println!(
+                    "  {}  {}  cleaned={} skipped={} failed={} freed={}",
+                    run.run_id.cyan().bold(),
+                    run.command.bright_black(),
+                    run.cleaned.to_string().green(),
+                    run.skipped.to_string().yellow(),
+                    run.failed.to_string().red(),
+                    format_size(run.freed_bytes).green()
+                );
+            }
+        }
+        AuditCommands::Show { run, json } => {
+            let records = logger.records_for_run(&run)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&records)?);
+                return Ok(());
+            }
+            if records.is_empty() {
+                println!("{}", "No records found for this run.".yellow());
+                return Ok(());
+            }
+            println!("{}", format!("Audit run {}", run).cyan().bold());
+            for record in records {
+                println!("{}", serde_json::to_string_pretty(&record)?);
+            }
+        }
+        AuditCommands::Export {
+            run,
+            format,
+            output,
+        } => {
+            let records = if let Some(run) = run {
+                logger.records_for_run(&run)?
+            } else {
+                logger.read_records()?
+            };
+            let content = match format {
+                ExportFormatArg::Json => serde_json::to_string_pretty(&records)?,
+                ExportFormatArg::Csv => AuditLogger::export_csv(&records),
+            };
+            if let Some(output) = output {
+                fs::write(&output, content)?;
+                println!(
+                    "{} {}",
+                    "Exported audit to".green().bold(),
+                    output.display()
+                );
+            } else {
+                println!("{}", content);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_tui(
+    path: Option<PathBuf>,
+    profile: Option<&str>,
+    include_recent: bool,
+    include_protected: bool,
+    recent_days: i64,
+    config: &Config,
+) -> Result<()> {
+    let resolved = resolve_scan_inputs(path, profile, config)?;
+    let depth = resolved.depth.or(config.default_depth);
+    let min_size_mb = resolved.min_size_mb.or(config.min_size_mb);
+    let older_than = resolved.older_than.or(config.max_age_days);
+    let gitignore = resolved.gitignore.unwrap_or(false);
+    let category = resolved.category;
+    let max_risk = resolved.max_risk.unwrap_or(RiskLevel::Medium);
+    let keep_policy = KeepPolicy::from_config(config);
+
+    let mut projects = scan_projects_for_roots(
+        &resolved.roots,
+        depth,
+        min_size_mb,
+        older_than,
+        gitignore,
+        category,
+        max_risk,
+        config,
+    )?;
+    enrich_project_flags(&mut projects, &keep_policy, recent_days);
+    projects = filter_by_visibility(projects, include_protected, include_recent);
+    crate::tui::run_tui_projects(projects, include_recent, include_protected, recent_days)
 }
 
 #[cfg(test)]
@@ -1589,6 +2574,7 @@ mod tests {
             failed_count: 0,
             errors: Vec::new(),
             trash_batch_id: None,
+            run_id: None,
         }
     }
 

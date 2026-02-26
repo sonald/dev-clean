@@ -1,8 +1,10 @@
+pub mod audit;
 pub mod cleaner;
 pub mod cli;
 pub mod config;
 pub mod metrics;
 pub mod plan;
+pub mod policy;
 pub mod recommend;
 pub mod scanner;
 pub mod stats;

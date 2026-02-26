@@ -166,6 +166,26 @@ pub struct ProjectInfo {
 
     /// Whether this directory is currently in use (based on lock files)
     pub in_use: bool,
+
+    /// Whether this target is protected by keep policy
+    #[serde(default)]
+    pub protected: bool,
+
+    /// Protection reason
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_by: Option<String>,
+
+    /// Whether this target is recently modified
+    #[serde(default)]
+    pub recent: bool,
+
+    /// Selection reason (recommend/apply explainability)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_reason: Option<String>,
+
+    /// Skip reason (recommend/apply/clean explainability)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -194,6 +214,11 @@ impl ProjectInfo {
             size_calculated: false,
             last_modified,
             in_use,
+            protected: false,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
         }
     }
 

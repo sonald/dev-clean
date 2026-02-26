@@ -22,6 +22,9 @@ sudo cp target/release/dev-cleaner /usr/local/bin/
 # Scan current directory
 dev-cleaner scan
 
+# Scan using a named profile
+dev-cleaner scan --profile work
+
 # Scan specific path
 dev-cleaner scan ~/projects
 
@@ -84,6 +87,9 @@ dev-cleaner apply plan.json
 # Apply but move to Dev Cleaner trash (undoable)
 dev-cleaner apply plan.json --trash
 
+# Skip plan re-validation (not recommended)
+dev-cleaner apply plan.json --no-verify
+
 # Undo the most recent trash batch
 dev-cleaner undo
 ```
@@ -93,6 +99,9 @@ dev-cleaner undo
 ```bash
 # Recommend a plan to free 10GB, and write plan.json
 dev-cleaner recommend ~/projects --cleanup 10GB --output-plan plan.json
+
+# Use strategy variants: safe-first / balanced / max-space
+dev-cleaner recommend ~/projects --cleanup 10GB --strategy balanced
 
 # Or: ensure at least 50GB free
 dev-cleaner recommend ~/projects --free-at-least 50GB --output-plan plan.json
@@ -107,6 +116,19 @@ dev-cleaner apply plan.json --trash
 dev-cleaner trash list
 dev-cleaner trash show --batch <BATCH_ID>
 dev-cleaner trash gc --keep-days 30 --keep-gb 20
+```
+
+### 7. Profiles and Audit
+
+```bash
+# Manage scan profiles
+dev-cleaner profile list
+dev-cleaner profile add work --path ~/Projects --path ~/GitHub --depth 4 --min-size-mb 50
+
+# Audit runs
+dev-cleaner audit list --top 10
+dev-cleaner audit show --run <RUN_ID>
+dev-cleaner audit export --format csv -o audit.csv
 ```
 
 ## Common Scenarios

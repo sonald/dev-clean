@@ -14,6 +14,9 @@ A fast, intelligent developer tool for scanning and cleaning temporary build dir
 - **Safe by Default**: Dry-run mode, confirmation prompts, in-use detection, and risk filtering (default: `--max-risk medium`)
 - **Fast & Parallel**: Leverages Rust's performance and parallel processing with streaming
 - **Configurable**: Custom rules, filters, and exclusions
+- **Profiles**: Named scan profiles via `--profile` + `profile list/show/add/remove`
+- **Keep/Protect**: `.dev-cleaner-keep`, `.dev-cleaner-keep-patterns`, and config keep rules
+- **Audit Log**: JSONL operation audit + `audit list/show/export`
 - **Trash & GC**: Undoable trash batches + `trash list/show/purge/gc`
 - **Goal-based Recommend**: `recommend --cleanup 10GB` / `recommend --free-at-least 50GB` with optional `--output-plan`
 
@@ -63,6 +66,9 @@ cargo install dev-cleaner
 # Scan current directory with real-time progress
 dev-cleaner scan
 
+# Scan with a named profile
+dev-cleaner scan --profile work
+
 # View comprehensive statistics
 dev-cleaner stats ~/projects
 
@@ -90,6 +96,9 @@ dev-cleaner clean --max-risk high --auto
 # Recommend a cleanup plan (does not delete), then apply it
 dev-cleaner recommend ~/projects --cleanup 10GB --output-plan plan.json
 dev-cleaner apply plan.json --trash
+
+# Audit recent runs
+dev-cleaner audit list --top 10
 
 # Manage trash batches
 dev-cleaner trash list
@@ -152,6 +161,9 @@ dev-cleaner apply plan.json
 # Apply the plan but move to Dev Cleaner trash (undoable)
 dev-cleaner apply plan.json --trash
 
+# Skip re-validation (not recommended)
+dev-cleaner apply plan.json --no-verify
+
 # Undo a trash batch (printed after clean/apply with --trash)
 dev-cleaner undo --batch <BATCH_ID>
 ```
@@ -174,6 +186,35 @@ dev-cleaner trash list
 dev-cleaner trash show --batch <BATCH_ID>
 dev-cleaner trash purge --batch <BATCH_ID>
 dev-cleaner trash gc --keep-days 30 --keep-gb 20
+```
+
+#### Profile
+
+Manage named scan profiles:
+
+```bash
+dev-cleaner profile list
+dev-cleaner profile show work
+dev-cleaner profile add work --path ~/Projects --path ~/GitHub --depth 4 --min-size-mb 50
+dev-cleaner profile remove work
+```
+
+Use a profile from any scan-like command:
+
+```bash
+dev-cleaner scan --profile work
+dev-cleaner clean --profile work --auto --trash
+dev-cleaner recommend --profile work --cleanup 10GB --strategy balanced
+```
+
+#### Audit
+
+Inspect and export operation logs:
+
+```bash
+dev-cleaner audit list --top 20
+dev-cleaner audit show --run <RUN_ID>
+dev-cleaner audit export --format csv -o audit.csv
 ```
 
 #### Stats

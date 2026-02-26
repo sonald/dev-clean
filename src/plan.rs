@@ -15,6 +15,12 @@ pub struct PlanParams {
     pub max_risk: Option<crate::scanner::RiskLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<crate::scanner::Category>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_days: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,7 +38,7 @@ pub struct CleanupPlan {
 impl CleanupPlan {
     pub fn new(scan_root: PathBuf, projects: Vec<ProjectInfo>) -> Self {
         Self {
-            schema_version: 2,
+            schema_version: 3,
             tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             created_at: Utc::now(),
             scan_root,
@@ -97,13 +103,18 @@ mod tests {
             size_calculated: true,
             last_modified: Utc::now(),
             in_use: false,
+            protected: false,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
         }];
 
         let plan = CleanupPlan::new(PathBuf::from("/scan"), projects);
 
         plan.save_json(&plan_path).unwrap();
         let loaded = CleanupPlan::load_json(&plan_path).unwrap();
-        assert_eq!(loaded.schema_version, 2);
+        assert_eq!(loaded.schema_version, 3);
         assert_eq!(loaded.projects.len(), 1);
     }
 }

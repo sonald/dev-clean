@@ -56,6 +56,9 @@ pub struct CleanResult {
 
     /// Trash batch id (when `trash=true`)
     pub trash_batch_id: Option<String>,
+
+    /// Optional audit run id
+    pub run_id: Option<String>,
 }
 
 impl CleanResult {
@@ -118,6 +121,7 @@ impl Cleaner {
                 failed_count: 0,
                 errors: Vec::new(),
                 trash_batch_id: None,
+                run_id: None,
             });
         }
 
@@ -202,6 +206,7 @@ impl Cleaner {
             failed_count,
             errors,
             trash_batch_id,
+            run_id: None,
         })
     }
 

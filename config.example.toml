@@ -36,3 +36,38 @@ marker_files = [".uproject"]
 # name = "Your Custom Project"
 # directory = "custom-build-dir"
 # marker_files = ["marker-file.txt", "another-marker.json"]
+
+# ------------------------------------------------------------------------------
+# Profile presets
+# ------------------------------------------------------------------------------
+
+# [scan_profiles.work]
+# paths = ["~/Projects", "~/GitHub"]
+# depth = 4
+# min_size_mb = 50
+# max_age_days = 7
+# gitignore = false
+# category = "build"        # cache/build/deps
+# max_risk = "medium"       # low/medium/high
+
+# ------------------------------------------------------------------------------
+# Keep / Protect
+# ------------------------------------------------------------------------------
+
+# Exact paths to protect
+# keep_paths = ["/Users/me/Projects/critical-app/node_modules"]
+
+# Glob paths to protect
+# keep_globs = ["~/Projects/critical-*/**/target"]
+
+# Protect entire project roots
+# keep_project_roots = ["~/Projects/never-clean-*"]
+
+# ------------------------------------------------------------------------------
+# Audit logging
+# ------------------------------------------------------------------------------
+
+# [audit]
+# enabled = true
+# path = "/Users/me/.local/share/dev-cleaner/operations.jsonl"
+# max_size_mb = 5

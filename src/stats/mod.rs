@@ -392,6 +392,11 @@ mod tests {
                 size_calculated: true,
                 last_modified: Utc::now(),
                 in_use: false,
+                protected: false,
+                protected_by: None,
+                recent: false,
+                selection_reason: None,
+                skip_reason: None,
             },
             ProjectInfo {
                 root: PathBuf::from("/test2"),
@@ -406,6 +411,11 @@ mod tests {
                 size_calculated: true,
                 last_modified: Utc::now(),
                 in_use: false,
+                protected: false,
+                protected_by: None,
+                recent: false,
+                selection_reason: None,
+                skip_reason: None,
             },
         ];
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,26 @@ pub struct Config {
     /// Maximum age in days
     #[serde(default)]
     pub max_age_days: Option<i64>,
+
+    /// Named scan profiles
+    #[serde(default)]
+    pub scan_profiles: BTreeMap<String, ScanProfile>,
+
+    /// Exact protected paths
+    #[serde(default)]
+    pub keep_paths: Vec<String>,
+
+    /// Glob protected paths
+    #[serde(default)]
+    pub keep_globs: Vec<String>,
+
+    /// Protected project roots
+    #[serde(default)]
+    pub keep_project_roots: Vec<String>,
+
+    /// Audit configuration
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 impl Default for Config {
@@ -39,8 +60,59 @@ impl Default for Config {
             default_depth: None,
             min_size_mb: None,
             max_age_days: None,
+            scan_profiles: BTreeMap::new(),
+            keep_paths: Vec::new(),
+            keep_globs: Vec::new(),
+            keep_project_roots: Vec::new(),
+            audit: AuditConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScanProfile {
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub depth: Option<usize>,
+    #[serde(default)]
+    pub min_size_mb: Option<u64>,
+    #[serde(default)]
+    pub max_age_days: Option<i64>,
+    #[serde(default)]
+    pub gitignore: Option<bool>,
+    #[serde(default)]
+    pub category: Option<crate::scanner::Category>,
+    #[serde(default)]
+    pub max_risk: Option<crate::scanner::RiskLevel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_audit_max_size_mb")]
+    pub max_size_mb: u64,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            path: None,
+            max_size_mb: default_audit_max_size_mb(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_audit_max_size_mb() -> u64 {
+    5
 }
 
 /// Custom cleanable pattern

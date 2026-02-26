@@ -352,6 +352,16 @@ impl Scanner {
         Ok((total_count, rx))
     }
 
+    /// Re-validate an existing cleanable target path against current rules.
+    pub fn revalidate_target<P: AsRef<Path>>(&self, cleanable_dir: P) -> Option<ProjectInfo> {
+        let dir = cleanable_dir.as_ref();
+        if !dir.is_dir() {
+            return None;
+        }
+        self.check_directory(dir)
+            .filter(|info| info.cleanable_dir == dir)
+    }
+
     fn candidate_matchers(&self) -> Arc<Option<CandidateMatchers>> {
         // We can safely prefilter only when high-risk results (including .gitignore-derived)
         // are filtered out, otherwise we could miss them.
@@ -635,6 +645,11 @@ impl Scanner {
             size_calculated: true,
             last_modified,
             in_use,
+            protected: false,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
         })
     }
 
