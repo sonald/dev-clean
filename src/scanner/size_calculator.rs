@@ -1,11 +1,10 @@
 use crate::ProjectInfo;
 use anyhow::Result;
-use crossbeam::channel::{self, Sender};
+use crossbeam::channel::Sender;
 use rayon::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Size calculator for parallel and streaming directory size computation
 pub struct SizeCalculator {
@@ -91,43 +90,34 @@ impl Default for SizeCalculator {
 
 /// Calculate directory size with timeout protection
 fn calculate_dir_size_with_timeout(dir: &Path, timeout: Duration) -> Result<u64> {
-    let dir = dir.to_path_buf();
-    let dir_for_error = dir.clone();
-
-    // Create a channel for the result
-    let (tx, rx) = channel::bounded(1);
-
-    // Spawn a thread to calculate size
-    thread::spawn(move || {
-        let result = calculate_dir_size(&dir);
-        let _ = tx.send(result);
-    });
-
-    // Wait for result with timeout
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(_) => Err(anyhow::anyhow!(
-            "Timeout calculating size for {:?}",
-            dir_for_error
-        )),
+    if timeout.is_zero() {
+        return Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir));
     }
-}
 
-/// Calculate total size of a directory recursively
-fn calculate_dir_size(dir: &Path) -> Result<u64> {
+    let start = Instant::now();
     let mut total = 0u64;
+    let mut checked_entries = 0usize;
 
     for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
     {
+        checked_entries += 1;
+        if checked_entries % 256 == 0 && start.elapsed() >= timeout {
+            return Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir));
+        }
+
         if entry.file_type().is_file() {
             total += entry.metadata()?.len();
         }
     }
 
-    Ok(total)
+    if start.elapsed() >= timeout {
+        Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir))
+    } else {
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +126,7 @@ mod tests {
     use crate::{ProjectInfo, ProjectType};
     use chrono::Utc;
     use std::fs;
+    use std::thread;
     use tempfile::TempDir;
 
     #[test]
@@ -182,7 +173,7 @@ mod tests {
             ));
         }
 
-        let (tx, rx) = channel::unbounded();
+        let (tx, rx) = crossbeam::channel::unbounded();
         let calculator = SizeCalculator::new();
 
         // Start calculation in background
@@ -205,6 +196,59 @@ mod tests {
         for project in results {
             assert!(project.size_calculated);
             assert!(project.size > 0);
+        }
+    }
+
+    #[test]
+    fn test_calculate_single_timeout_zero() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("timeout-dir");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("file.txt"), "content").unwrap();
+
+        let mut project = ProjectInfo::new_pending(
+            dir.clone(),
+            ProjectType::NodeJs,
+            dir,
+            Utc::now(),
+            false,
+        );
+
+        let calculator = SizeCalculator::with_timeout(0);
+        let result = calculator.calculate_single(&mut project);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_streaming_timeout_still_sends_all_projects() {
+        let temp = TempDir::new().unwrap();
+        let mut projects = vec![];
+
+        for i in 0..3 {
+            let dir = temp.path().join(format!("timeout{}", i));
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("file.txt"), "content").unwrap();
+
+            projects.push(ProjectInfo::new_pending(
+                dir.clone(),
+                ProjectType::NodeJs,
+                dir,
+                Utc::now(),
+                false,
+            ));
+        }
+
+        let expected_len = projects.len();
+        let (tx, rx) = crossbeam::channel::unbounded();
+        let calculator = SizeCalculator::with_timeout(0);
+        let completed = calculator.calculate_batch_streaming(projects, tx);
+
+        let results = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(completed, 0);
+        assert_eq!(results.len(), expected_len);
+        for project in results {
+            assert!(project.size_calculated);
+            assert_eq!(project.size, 0);
         }
     }
 }

@@ -914,6 +914,8 @@ fn classify_category(basename: &str, relative_path: &str) -> Category {
         || basename == ".build"
         || basename == ".next"
         || basename == ".nuxt"
+        || basename == ".gradle"
+        || basename == ".swiftpm"
         || basename == "bin"
         || basename == "obj"
         || basename.starts_with("cmake-build")
@@ -1203,5 +1205,65 @@ mod tests {
         assert_eq!(results[0].project_type, ProjectType::Generic);
         assert_eq!(results[0].project_name.as_deref(), Some("Unity"));
         assert!(results[0].cleanable_dir.ends_with("Library"));
+    }
+
+    #[test]
+    fn test_category_gradle_is_build() {
+        assert_eq!(classify_category(".gradle", ".gradle"), Category::Build);
+    }
+
+    #[test]
+    fn test_category_swiftpm_is_build() {
+        assert_eq!(classify_category(".swiftpm", ".swiftpm"), Category::Build);
+    }
+
+    #[test]
+    fn test_builtin_patterns_have_known_categories() {
+        const ALL_PROJECT_TYPES: [ProjectType; 20] = [
+            ProjectType::NodeJs,
+            ProjectType::Rust,
+            ProjectType::Python,
+            ProjectType::Java,
+            ProjectType::Kotlin,
+            ProjectType::Scala,
+            ProjectType::Clojure,
+            ProjectType::Dart,
+            ProjectType::Haskell,
+            ProjectType::Go,
+            ProjectType::C,
+            ProjectType::Cpp,
+            ProjectType::Ruby,
+            ProjectType::Swift,
+            ProjectType::Php,
+            ProjectType::Elixir,
+            ProjectType::DotNet,
+            ProjectType::Maven,
+            ProjectType::Gradle,
+            ProjectType::Generic,
+        ];
+
+        for project_type in ALL_PROJECT_TYPES {
+            for pattern in ProjectDetector::cleanable_dirs(project_type) {
+                let normalized = pattern.replace('\\', "/");
+                let sample_relative = if normalized.contains('*') {
+                    normalized.replace('*', "sample")
+                } else {
+                    normalized.clone()
+                };
+                let basename = sample_relative
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(sample_relative.as_str());
+                let category = classify_category(basename, &sample_relative);
+
+                assert_ne!(
+                    category,
+                    Category::Unknown,
+                    "pattern `{}` from {:?} should map to a known category",
+                    pattern,
+                    project_type
+                );
+            }
+        }
     }
 }

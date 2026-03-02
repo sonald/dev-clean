@@ -15,7 +15,7 @@ use colored::Colorize;
 use serde_json::json;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "dev-cleaner")]
@@ -903,6 +903,34 @@ fn resolve_scan_inputs(
     }
 }
 
+fn canonicalize_lossy(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let first = paths.first()?;
+    let mut ancestor = canonicalize_lossy(first);
+
+    for path in &paths[1..] {
+        let candidate = canonicalize_lossy(path);
+        while !candidate.starts_with(&ancestor) {
+            if !ancestor.pop() {
+                return None;
+            }
+        }
+    }
+
+    Some(ancestor)
+}
+
+fn derive_scan_root(roots: &[PathBuf]) -> PathBuf {
+    match roots.len() {
+        0 => PathBuf::from("."),
+        1 => canonicalize_lossy(&roots[0]),
+        _ => common_ancestor(roots).unwrap_or_else(|| canonicalize_lossy(&roots[0])),
+    }
+}
+
 fn enrich_project_flags(projects: &mut [ProjectInfo], keep_policy: &KeepPolicy, recent_days: i64) {
     for project in projects {
         let decision = keep_policy.evaluate(project);
@@ -1614,11 +1642,7 @@ fn run_plan(
         max_risk.to_max_risk()
     };
 
-    let scan_root = if resolved.roots.len() == 1 {
-        fs::canonicalize(&resolved.roots[0]).unwrap_or_else(|_| resolved.roots[0].clone())
-    } else {
-        PathBuf::from(".")
-    };
+    let scan_root = derive_scan_root(&resolved.roots);
 
     let keep_policy = KeepPolicy::from_config(config);
     let mut projects = scan_projects_for_roots(
@@ -1679,11 +1703,7 @@ fn run_recommend(
     use serde::Serialize;
 
     let resolved = resolve_scan_inputs(path, profile, config)?;
-    let scan_root = if resolved.roots.len() == 1 {
-        fs::canonicalize(&resolved.roots[0]).unwrap_or_else(|_| resolved.roots[0].clone())
-    } else {
-        PathBuf::from(".")
-    };
+    let scan_root = derive_scan_root(&resolved.roots);
     let depth = depth.or(resolved.depth).or(config.default_depth);
     let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
     let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
@@ -1866,21 +1886,38 @@ fn run_apply(
     let run_id = audit.start_run("apply").ok();
 
     let keep_policy = KeepPolicy::from_config(config);
-    let mut scanner = Scanner::new(&plan.scan_root)
-        .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns);
-    if let Some(max_risk) = plan.params.as_ref().and_then(|p| p.max_risk) {
-        scanner = scanner.max_risk(max_risk);
-    }
-    if let Some(category) = plan.params.as_ref().and_then(|p| p.category) {
-        scanner = scanner.category(category);
-    }
+    let params_max_risk = plan.params.as_ref().and_then(|p| p.max_risk);
+    let params_category = plan.params.as_ref().and_then(|p| p.category);
+    let scan_root = plan.scan_root.clone();
+    let scan_root_is_absolute = scan_root.is_absolute();
+    let mut scanner_cache: std::collections::HashMap<PathBuf, Scanner> =
+        std::collections::HashMap::new();
 
     let mut verified_projects = Vec::new();
     let mut skipped_pre = 0usize;
     let mut skipped_pre_bytes = 0u64;
     for project in &plan.projects {
-        if !project.cleanable_dir.starts_with(&plan.scan_root) {
+        let cleanable_dir = canonicalize_lossy(&project.cleanable_dir);
+        let project_root = canonicalize_lossy(&project.root);
+
+        if !cleanable_dir.starts_with(&project_root) {
+            skipped_pre += 1;
+            skipped_pre_bytes = skipped_pre_bytes.saturating_add(project.size);
+            if let Some(run_id) = &run_id {
+                let _ = audit.log_item(
+                    run_id,
+                    "apply",
+                    &project.cleanable_dir,
+                    "verify",
+                    "skipped",
+                    project.size,
+                    Some("outside_project_root".to_string()),
+                );
+            }
+            continue;
+        }
+
+        if scan_root_is_absolute && !cleanable_dir.starts_with(&scan_root) {
             skipped_pre += 1;
             skipped_pre_bytes = skipped_pre_bytes.saturating_add(project.size);
             if let Some(run_id) = &run_id {
@@ -1898,9 +1935,24 @@ fn run_apply(
         }
 
         let mut candidate = if no_verify {
-            project.clone()
+            let mut p = project.clone();
+            p.root = project_root.clone();
+            p.cleanable_dir = cleanable_dir.clone();
+            p
         } else {
-            match scanner.revalidate_target(&project.cleanable_dir) {
+            let scanner = scanner_cache.entry(project_root.clone()).or_insert_with(|| {
+                let mut scanner = Scanner::new(&project_root)
+                    .exclude_dirs(&config.exclude_dirs)
+                    .custom_patterns(&config.custom_patterns);
+                if let Some(max_risk) = params_max_risk {
+                    scanner = scanner.max_risk(max_risk);
+                }
+                if let Some(category) = params_category {
+                    scanner = scanner.category(category);
+                }
+                scanner
+            });
+            match scanner.revalidate_target(&cleanable_dir) {
                 Some(info) => info,
                 None => {
                     skipped_pre += 1;
@@ -2083,6 +2135,34 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(input.as_str(), "y" | "yes"))
 }
 
+struct AuditRunGuard<'a> {
+    audit: &'a AuditLogger,
+    run_id: Option<String>,
+    command: &'static str,
+}
+
+impl<'a> AuditRunGuard<'a> {
+    fn new(audit: &'a AuditLogger, command: &'static str) -> Self {
+        Self {
+            audit,
+            run_id: audit.start_run(command).ok(),
+            command,
+        }
+    }
+
+    fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
+    }
+}
+
+impl<'a> Drop for AuditRunGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(run_id) = &self.run_id {
+            let _ = self.audit.finish_run(run_id, self.command, 0, 0, 0, 0);
+        }
+    }
+}
+
 fn run_undo(
     batch: Option<String>,
     dry_run: bool,
@@ -2149,9 +2229,12 @@ fn run_undo(
 }
 
 fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
-    let trash_root = default_trash_root();
+    run_trash_with_root(command, config, default_trash_root())
+}
+
+fn run_trash_with_root(command: TrashCommands, config: &Config, trash_root: PathBuf) -> Result<()> {
     let audit = AuditLogger::from_config(config);
-    let run_id = audit.start_run("trash").ok();
+    let audit_run = AuditRunGuard::new(&audit, "trash");
 
     match command {
         TrashCommands::List { top, json } => {
@@ -2259,7 +2342,7 @@ fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
                     println!("  {}", error.red());
                 }
             }
-            if let Some(run_id) = &run_id {
+            if let Some(run_id) = audit_run.run_id() {
                 let _ = audit.log_item(
                     run_id,
                     "trash",
@@ -2309,7 +2392,7 @@ fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
 
             if dry_run {
                 println!("{}", "Dry run only; no changes made.".bright_black());
-                if let Some(run_id) = &run_id {
+                if let Some(run_id) = audit_run.run_id() {
                     let _ = audit.log_item(
                         run_id,
                         "trash",
@@ -2354,7 +2437,7 @@ fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
                     println!("  {}", error.red());
                 }
             }
-            if let Some(run_id) = &run_id {
+            if let Some(run_id) = audit_run.run_id() {
                 let _ = audit.log_item(
                     run_id,
                     "trash",
@@ -2366,10 +2449,6 @@ fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
                 );
             }
         }
-    }
-
-    if let Some(run_id) = run_id {
-        let _ = audit.finish_run(&run_id, "trash", 0, 0, 0, 0);
     }
 
     Ok(())
@@ -2563,7 +2642,14 @@ fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audit::AuditRecord;
     use crate::cleaner::CleanResult;
+    use crate::plan::CleanupPlan;
+    use crate::scanner::{Category, Confidence};
+    use crate::ProjectType;
+    use chrono::Utc;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn result(cleaned_count: usize, bytes_freed: u64) -> CleanResult {
         CleanResult {
@@ -2596,5 +2682,138 @@ mod tests {
         let snippet = build_share_snippet(&result(2, 1024), false, true).unwrap();
         assert!(snippet.contains("just freed"));
         assert!(snippet.contains("undoable via trash"));
+    }
+
+    #[test]
+    fn derive_scan_root_uses_common_ancestor_for_multi_roots() {
+        let temp = TempDir::new().unwrap();
+        let root_a = temp.path().join("workspace").join("a");
+        let root_b = temp.path().join("workspace").join("b").join("nested");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+
+        let derived = derive_scan_root(&vec![root_a, root_b]);
+        let expected = canonicalize_lossy(&temp.path().join("workspace"));
+        assert_eq!(derived, expected);
+    }
+
+    #[test]
+    fn run_apply_accepts_legacy_relative_scan_root() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("app");
+        let cleanable_dir = project_root.join("target");
+        fs::create_dir_all(&cleanable_dir).unwrap();
+        fs::write(cleanable_dir.join("artifact.bin"), "x").unwrap();
+
+        let plan_path = temp.path().join("plan.json");
+        let project = ProjectInfo {
+            root: project_root.clone(),
+            project_type: ProjectType::Rust,
+            project_name: None,
+            category: Category::Build,
+            risk_level: RiskLevel::Medium,
+            confidence: Confidence::High,
+            matched_rule: None,
+            cleanable_dir: cleanable_dir.clone(),
+            size: 1,
+            size_calculated: true,
+            last_modified: Utc::now(),
+            in_use: false,
+            protected: false,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
+        };
+
+        let plan = CleanupPlan {
+            schema_version: 3,
+            tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            created_at: Utc::now(),
+            scan_root: PathBuf::from("."),
+            params: Some(crate::plan::PlanParams::default()),
+            projects: vec![project],
+        };
+        plan.save_json(&plan_path).unwrap();
+
+        let mut config = Config::default();
+        let audit_path = temp.path().join("operations.jsonl");
+        config.audit.enabled = true;
+        config.audit.path = Some(audit_path);
+
+        run_apply(
+            plan_path,
+            true,
+            false,
+            true,
+            true,
+            true,
+            true,
+            7,
+            false,
+            &config,
+        )
+        .unwrap();
+
+        let records = AuditLogger::from_config(&config).read_records().unwrap();
+        let mut has_attempted = false;
+        let mut has_outside_scan_root = false;
+        for record in records {
+            if let AuditRecord::ItemAction {
+                action,
+                result,
+                reason,
+                ..
+            } = record
+            {
+                if action == "dry_run" && result == "attempted" {
+                    has_attempted = true;
+                }
+                if reason.as_deref() == Some("outside_scan_root") {
+                    has_outside_scan_root = true;
+                }
+            }
+        }
+
+        assert!(has_attempted);
+        assert!(!has_outside_scan_root);
+    }
+
+    #[test]
+    fn run_trash_list_json_finishes_audit_run_on_early_return() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.audit.enabled = true;
+        config.audit.path = Some(temp.path().join("operations.jsonl"));
+
+        run_trash_with_root(
+            TrashCommands::List {
+                top: 20,
+                json: true,
+            },
+            &config,
+            temp.path().join("trash-root"),
+        )
+        .unwrap();
+
+        let records = AuditLogger::from_config(&config).read_records().unwrap();
+        let mut started_ids = Vec::new();
+        let mut finished_ids = Vec::new();
+
+        for record in records {
+            match record {
+                AuditRecord::RunStarted {
+                    run_id, command, ..
+                } if command == "trash" => started_ids.push(run_id),
+                AuditRecord::RunFinished {
+                    run_id, command, ..
+                } if command == "trash" => finished_ids.push(run_id),
+                _ => {}
+            }
+        }
+
+        assert_eq!(started_ids.len(), 1);
+        assert_eq!(finished_ids.len(), 1);
+        assert_eq!(started_ids[0], finished_ids[0]);
     }
 }
