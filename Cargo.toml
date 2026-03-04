@@ -2,9 +2,10 @@
 name = "dev-cleaner"
 version = "0.2.0"
 edition = "2021"
-authors = ["Your Name"]
+authors = ["Sian Cao"]
 description = "A smart developer tool for cleaning temporary build directories"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sonald/dev-clean"
 
 [dependencies]
 # CLI
