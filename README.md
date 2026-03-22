@@ -147,6 +147,28 @@ Options:
   --max-risk <MAX_RISK>         Filter by max risk level (low/medium/high/all) (alias: --risk)
 ```
 
+When running in an interactive terminal (`TTY`) without `--auto` and without `--force`,
+`dev-cleaner clean` uses a keyboard-driven selector:
+
+```text
+↑/↓ or j/k  Move
+Space       Toggle selection
+a           Select all selectable targets
+d           Deselect all visible targets
+/           Enter search mode
+Backspace   Delete one search character
+Ctrl+U      Clear search
+s           Cycle sort (size/age/risk)
+o           Toggle sort order
+Enter       Confirm (auto-select current target if nothing is selected)
+q or Esc    Cancel
+```
+
+Notes:
+- Safe defaults: blocked targets (`IN_USE`, protected without `--force-protected`) are not selectable.
+- Recent targets are shown only when `--include-recent` is enabled and are unselected by default.
+- In non-TTY environments (CI/scripts), the tool falls back to the original numeric prompt (`all`/`none`).
+
 #### Plan / Apply / Undo
 
 Generate a machine-readable cleanup plan and apply it later:
@@ -167,6 +189,9 @@ dev-cleaner apply plan.json --no-verify
 # Undo a trash batch (printed after clean/apply with --trash)
 dev-cleaner undo --batch <BATCH_ID>
 ```
+
+`apply` now shows the same execution summary card as `clean` (selected size, mode, and blocked counts).
+In TTY mode, confirm with `Enter` or cancel with `Esc/q`. In non-TTY mode, it keeps the classic `y/N` prompt.
 
 #### Recommend
 

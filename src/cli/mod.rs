@@ -1,5 +1,6 @@
 use crate::audit::AuditLogger;
 use crate::cleaner::CleanOptions;
+use crate::interactive::{ProjectSelector, SelectorOptions};
 use crate::policy::KeepPolicy;
 use crate::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
 use crate::scanner::{Category, ProjectDetector, RiskLevel};
@@ -12,9 +13,13 @@ use crate::{Cleaner, CleanupPlan, Config, ProjectInfo, Scanner};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
+use crossterm::{
+    event::{self, Event, KeyCode},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use serde_json::json;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -1175,6 +1180,188 @@ fn run_scan(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BlockedSummary {
+    in_use_count: usize,
+    in_use_bytes: u64,
+    protected_count: usize,
+    protected_bytes: u64,
+    recent_count: usize,
+    recent_bytes: u64,
+}
+
+impl BlockedSummary {
+    fn note_in_use(&mut self, bytes: u64) {
+        self.in_use_count += 1;
+        self.in_use_bytes = self.in_use_bytes.saturating_add(bytes);
+    }
+
+    fn note_protected(&mut self, bytes: u64) {
+        self.protected_count += 1;
+        self.protected_bytes = self.protected_bytes.saturating_add(bytes);
+    }
+
+    fn note_recent(&mut self, bytes: u64) {
+        self.recent_count += 1;
+        self.recent_bytes = self.recent_bytes.saturating_add(bytes);
+    }
+
+    fn total_count(&self) -> usize {
+        self.in_use_count + self.protected_count + self.recent_count
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.in_use_bytes
+            .saturating_add(self.protected_bytes)
+            .saturating_add(self.recent_bytes)
+    }
+}
+
+struct CleanSelectionSplit {
+    selected: Vec<ProjectInfo>,
+    blocked: Vec<ProjectInfo>,
+    blocked_summary: BlockedSummary,
+}
+
+fn split_selected_projects_for_clean(
+    projects: Vec<ProjectInfo>,
+    include_recent: bool,
+    force: bool,
+    force_protected: bool,
+) -> CleanSelectionSplit {
+    let mut selected = Vec::new();
+    let mut blocked = Vec::new();
+    let mut blocked_summary = BlockedSummary::default();
+
+    for mut project in projects {
+        if project.protected && !force_protected {
+            project.skip_reason = Some("blocked_protected".to_string());
+            blocked_summary.note_protected(project.size);
+            blocked.push(project);
+            continue;
+        }
+        if project.recent && !include_recent {
+            project.skip_reason = Some("blocked_recent".to_string());
+            blocked_summary.note_recent(project.size);
+            blocked.push(project);
+            continue;
+        }
+        if project.in_use && !force {
+            project.skip_reason = Some("blocked_in_use".to_string());
+            blocked_summary.note_in_use(project.size);
+            blocked.push(project);
+            continue;
+        }
+        selected.push(project);
+    }
+
+    CleanSelectionSplit {
+        selected,
+        blocked,
+        blocked_summary,
+    }
+}
+
+fn is_interactive_tty() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn run_keyboard_selector(
+    projects: Vec<ProjectInfo>,
+    force: bool,
+    force_protected: bool,
+) -> Result<Vec<ProjectInfo>> {
+    let mut selector = ProjectSelector::new(
+        projects,
+        SelectorOptions {
+            force,
+            force_protected,
+        },
+    );
+    Ok(selector.run()?.unwrap_or_default())
+}
+
+fn execution_mode_label(dry_run: bool, trash: bool) -> &'static str {
+    if dry_run {
+        "dry-run"
+    } else if trash {
+        "trash (undoable)"
+    } else {
+        "permanent delete"
+    }
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn confirm_execution_summary(
+    operation: &str,
+    selected_count: usize,
+    selected_bytes: u64,
+    mode_label: &str,
+    blocked: BlockedSummary,
+    verify_skipped_total: usize,
+) -> Result<bool> {
+    println!("\n{}", "Execution summary".cyan().bold());
+    println!("  Operation: {}", operation);
+    println!(
+        "  Selected: {} ({})",
+        selected_count.to_string().green(),
+        format_size(selected_bytes).green().bold()
+    );
+    println!("  Mode: {}", mode_label);
+
+    if blocked.total_count() > 0 {
+        println!(
+            "  Blocked: in_use={} ({}) protected={} ({}) recent={} ({})",
+            blocked.in_use_count.to_string().yellow(),
+            format_size(blocked.in_use_bytes).yellow(),
+            blocked.protected_count.to_string().yellow(),
+            format_size(blocked.protected_bytes).yellow(),
+            blocked.recent_count.to_string().yellow(),
+            format_size(blocked.recent_bytes).yellow(),
+        );
+    }
+
+    if verify_skipped_total > 0 {
+        let verify_other = verify_skipped_total.saturating_sub(blocked.total_count());
+        if verify_other > 0 {
+            println!(
+                "  Verify skipped (other): {}",
+                verify_other.to_string().yellow()
+            );
+        }
+    }
+
+    if !is_interactive_tty() {
+        return confirm("Continue?");
+    }
+
+    println!("  Action: Enter to execute, Esc/q to cancel");
+    let _raw_mode = RawModeGuard::new()?;
+    loop {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Enter => return Ok(true),
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(false),
+                _ => {}
+            }
+        }
+    }
+}
+
 fn run_clean(
     path: Option<PathBuf>,
     profile: Option<&str>,
@@ -1245,7 +1432,11 @@ fn run_clean(
 
     // Filter or confirm
     if !auto && !force {
-        projects = select_projects_interactive(&projects)?;
+        projects = if is_interactive_tty() {
+            run_keyboard_selector(projects, force, force_protected)?
+        } else {
+            select_projects_interactive(&projects)?
+        };
 
         if projects.is_empty() {
             println!("{}", "No directories selected for cleaning.".yellow());
@@ -1253,65 +1444,55 @@ fn run_clean(
         }
     }
 
+    let split = split_selected_projects_for_clean(projects, include_recent, force, force_protected);
+    let selected_total_size: u64 = split.selected.iter().map(|p| p.size).sum();
+
+    if split.selected.is_empty() {
+        println!(
+            "{}",
+            "No directories are eligible for cleaning under current safety settings.".yellow()
+        );
+        if split.blocked_summary.total_count() > 0 {
+            println!(
+                "  Blocked: in_use={} protected={} recent={}",
+                split.blocked_summary.in_use_count.to_string().yellow(),
+                split.blocked_summary.protected_count.to_string().yellow(),
+                split.blocked_summary.recent_count.to_string().yellow()
+            );
+        }
+        return Ok(());
+    }
+
+    if !auto
+        && !force
+        && !confirm_execution_summary(
+            "clean",
+            split.selected.len(),
+            selected_total_size,
+            execution_mode_label(dry_run, trash),
+            split.blocked_summary,
+            0,
+        )?
+    {
+        println!("{}", "Cancelled.".yellow());
+        return Ok(());
+    }
+
     let audit = AuditLogger::from_config(config);
     let run_id = audit.start_run("clean").ok();
 
-    let mut pre_skipped_count = 0usize;
-    let mut pre_skipped_bytes = 0u64;
-    let mut selected_for_clean = Vec::new();
-    for mut project in projects {
-        if project.protected && !force_protected {
-            project.skip_reason = Some("blocked_protected".to_string());
-            pre_skipped_count += 1;
-            pre_skipped_bytes = pre_skipped_bytes.saturating_add(project.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "clean",
-                    &project.cleanable_dir,
-                    "remove",
-                    "skipped",
-                    project.size,
-                    project.skip_reason.clone(),
-                );
-            }
-            continue;
+    if let Some(run_id) = &run_id {
+        for project in &split.blocked {
+            let _ = audit.log_item(
+                run_id,
+                "clean",
+                &project.cleanable_dir,
+                "remove",
+                "skipped",
+                project.size,
+                project.skip_reason.clone(),
+            );
         }
-        if project.recent && !include_recent {
-            project.skip_reason = Some("blocked_recent".to_string());
-            pre_skipped_count += 1;
-            pre_skipped_bytes = pre_skipped_bytes.saturating_add(project.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "clean",
-                    &project.cleanable_dir,
-                    "remove",
-                    "skipped",
-                    project.size,
-                    project.skip_reason.clone(),
-                );
-            }
-            continue;
-        }
-        if project.in_use && !force {
-            project.skip_reason = Some("blocked_in_use".to_string());
-            pre_skipped_count += 1;
-            pre_skipped_bytes = pre_skipped_bytes.saturating_add(project.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "clean",
-                    &project.cleanable_dir,
-                    "remove",
-                    "skipped",
-                    project.size,
-                    project.skip_reason.clone(),
-                );
-            }
-            continue;
-        }
-        selected_for_clean.push(project);
     }
 
     // Perform cleaning
@@ -1323,13 +1504,15 @@ fn run_clean(
     };
 
     let cleaner = Cleaner::with_options(options);
-    let mut result = cleaner.clean_multiple(&selected_for_clean)?;
-    result.skipped_count += pre_skipped_count;
-    result.bytes_skipped = result.bytes_skipped.saturating_add(pre_skipped_bytes);
+    let mut result = cleaner.clean_multiple(&split.selected)?;
+    result.skipped_count += split.blocked_summary.total_count();
+    result.bytes_skipped = result
+        .bytes_skipped
+        .saturating_add(split.blocked_summary.total_bytes());
     result.run_id = run_id.clone();
 
     if let Some(run_id) = &run_id {
-        for project in &selected_for_clean {
+        for project in &split.selected {
             let _ = audit.log_item(
                 run_id,
                 "clean",
@@ -1896,6 +2079,7 @@ fn run_apply(
     let mut verified_projects = Vec::new();
     let mut skipped_pre = 0usize;
     let mut skipped_pre_bytes = 0u64;
+    let mut verify_blocked = BlockedSummary::default();
     for project in &plan.projects {
         let cleanable_dir = canonicalize_lossy(&project.cleanable_dir);
         let project_root = canonicalize_lossy(&project.root);
@@ -1940,18 +2124,20 @@ fn run_apply(
             p.cleanable_dir = cleanable_dir.clone();
             p
         } else {
-            let scanner = scanner_cache.entry(project_root.clone()).or_insert_with(|| {
-                let mut scanner = Scanner::new(&project_root)
-                    .exclude_dirs(&config.exclude_dirs)
-                    .custom_patterns(&config.custom_patterns);
-                if let Some(max_risk) = params_max_risk {
-                    scanner = scanner.max_risk(max_risk);
-                }
-                if let Some(category) = params_category {
-                    scanner = scanner.category(category);
-                }
-                scanner
-            });
+            let scanner = scanner_cache
+                .entry(project_root.clone())
+                .or_insert_with(|| {
+                    let mut scanner = Scanner::new(&project_root)
+                        .exclude_dirs(&config.exclude_dirs)
+                        .custom_patterns(&config.custom_patterns);
+                    if let Some(max_risk) = params_max_risk {
+                        scanner = scanner.max_risk(max_risk);
+                    }
+                    if let Some(category) = params_category {
+                        scanner = scanner.category(category);
+                    }
+                    scanner
+                });
             match scanner.revalidate_target(&cleanable_dir) {
                 Some(info) => info,
                 None => {
@@ -1981,6 +2167,7 @@ fn run_apply(
         if candidate.protected && !force_protected {
             skipped_pre += 1;
             skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
+            verify_blocked.note_protected(candidate.size);
             if let Some(run_id) = &run_id {
                 let _ = audit.log_item(
                     run_id,
@@ -1997,6 +2184,7 @@ fn run_apply(
         if candidate.recent && !include_recent {
             skipped_pre += 1;
             skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
+            verify_blocked.note_recent(candidate.size);
             if let Some(run_id) = &run_id {
                 let _ = audit.log_item(
                     run_id,
@@ -2013,6 +2201,7 @@ fn run_apply(
         if candidate.in_use && !force {
             skipped_pre += 1;
             skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
+            verify_blocked.note_in_use(candidate.size);
             if let Some(run_id) = &run_id {
                 let _ = audit.log_item(
                     run_id,
@@ -2038,6 +2227,14 @@ fn run_apply(
         skipped_pre.to_string().yellow()
     );
     println!("  Total size: {}", format_size(total_size).green().bold());
+    if verify_blocked.total_count() > 0 {
+        println!(
+            "  Blocked: in_use={} protected={} recent={}",
+            verify_blocked.in_use_count.to_string().yellow(),
+            verify_blocked.protected_count.to_string().yellow(),
+            verify_blocked.recent_count.to_string().yellow()
+        );
+    }
 
     if verified_projects.is_empty() {
         println!("{}", "Nothing to clean.".yellow());
@@ -2047,14 +2244,22 @@ fn run_apply(
         return Ok(());
     }
 
-    if !force
-        && !confirm(&format!(
-            "Apply this plan and remove {} directories?",
-            verified_projects.len()
-        ))?
-    {
-        println!("{}", "Cancelled.".yellow());
-        return Ok(());
+    if !force {
+        let should_continue = confirm_execution_summary(
+            "apply",
+            verified_projects.len(),
+            total_size,
+            execution_mode_label(dry_run, trash),
+            verify_blocked,
+            skipped_pre,
+        )?;
+        if !should_continue {
+            println!("{}", "Cancelled.".yellow());
+            if let Some(run_id) = &run_id {
+                let _ = audit.finish_run(run_id, "apply", 0, skipped_pre, 0, 0);
+            }
+            return Ok(());
+        }
     }
 
     let cleaner = Cleaner::with_options(CleanOptions {
@@ -2664,6 +2869,34 @@ mod tests {
         }
     }
 
+    fn project_for_clean(
+        path: &str,
+        size: u64,
+        in_use: bool,
+        protected: bool,
+        recent: bool,
+    ) -> ProjectInfo {
+        ProjectInfo {
+            root: PathBuf::from("/workspace"),
+            project_type: ProjectType::Rust,
+            project_name: None,
+            category: Category::Build,
+            risk_level: RiskLevel::Medium,
+            confidence: Confidence::High,
+            matched_rule: None,
+            cleanable_dir: PathBuf::from(path),
+            size,
+            size_calculated: true,
+            last_modified: Utc::now(),
+            in_use,
+            protected,
+            protected_by: None,
+            recent,
+            selection_reason: None,
+            skip_reason: None,
+        }
+    }
+
     #[test]
     fn share_snippet_omits_zero_freed() {
         let snippet = build_share_snippet(&result(2, 0), false, false);
@@ -2682,6 +2915,57 @@ mod tests {
         let snippet = build_share_snippet(&result(2, 1024), false, true).unwrap();
         assert!(snippet.contains("just freed"));
         assert!(snippet.contains("undoable via trash"));
+    }
+
+    #[test]
+    fn split_selected_projects_tracks_blocked_reasons() {
+        let projects = vec![
+            project_for_clean("/safe", 100, false, false, false),
+            project_for_clean("/in-use", 90, true, false, false),
+            project_for_clean("/protected", 80, false, true, false),
+            project_for_clean("/recent", 70, false, false, true),
+        ];
+
+        let split = split_selected_projects_for_clean(projects, false, false, false);
+
+        assert_eq!(split.selected.len(), 1);
+        assert_eq!(split.blocked_summary.in_use_count, 1);
+        assert_eq!(split.blocked_summary.protected_count, 1);
+        assert_eq!(split.blocked_summary.recent_count, 1);
+        assert_eq!(split.blocked_summary.total_count(), 3);
+        assert_eq!(split.blocked_summary.total_bytes(), 240);
+        assert!(split
+            .blocked
+            .iter()
+            .any(|p| p.skip_reason.as_deref() == Some("blocked_in_use")));
+        assert!(split
+            .blocked
+            .iter()
+            .any(|p| p.skip_reason.as_deref() == Some("blocked_protected")));
+        assert!(split
+            .blocked
+            .iter()
+            .any(|p| p.skip_reason.as_deref() == Some("blocked_recent")));
+    }
+
+    #[test]
+    fn split_selected_projects_respects_force_flags() {
+        let projects = vec![
+            project_for_clean("/in-use", 90, true, false, false),
+            project_for_clean("/protected", 80, false, true, false),
+            project_for_clean("/recent", 70, false, false, true),
+        ];
+
+        let split = split_selected_projects_for_clean(projects, true, true, true);
+        assert_eq!(split.selected.len(), 3);
+        assert_eq!(split.blocked_summary.total_count(), 0);
+    }
+
+    #[test]
+    fn execution_mode_label_formats_modes() {
+        assert_eq!(execution_mode_label(true, false), "dry-run");
+        assert_eq!(execution_mode_label(false, true), "trash (undoable)");
+        assert_eq!(execution_mode_label(false, false), "permanent delete");
     }
 
     #[test]
@@ -2742,16 +3026,7 @@ mod tests {
         config.audit.path = Some(audit_path);
 
         run_apply(
-            plan_path,
-            true,
-            false,
-            true,
-            true,
-            true,
-            true,
-            7,
-            false,
-            &config,
+            plan_path, true, false, true, true, true, true, 7, false, &config,
         )
         .unwrap();
 

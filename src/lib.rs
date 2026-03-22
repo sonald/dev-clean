@@ -2,6 +2,7 @@ pub mod audit;
 pub mod cleaner;
 pub mod cli;
 pub mod config;
+pub mod interactive;
 pub mod metrics;
 pub mod plan;
 pub mod policy;
