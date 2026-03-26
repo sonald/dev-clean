@@ -1,3 +1,4 @@
+use crate::evaluation::EvaluatedProject;
 use crate::scanner::{Category, RiskLevel};
 use crate::utils::format_size;
 use crate::{Cleaner, Config, ProjectInfo, Scanner};
@@ -44,7 +45,7 @@ impl SortKey {
 }
 
 struct AppState {
-    projects: Vec<ProjectInfo>,
+    projects: Vec<EvaluatedProject>,
     visible_indices: Vec<usize>,
     selected: Vec<bool>,
     list_state: ListState,
@@ -60,14 +61,18 @@ struct AppState {
 
 impl AppState {
     fn new(
-        mut projects: Vec<ProjectInfo>,
+        projects: Vec<ProjectInfo>,
         include_recent: bool,
         include_protected: bool,
         recent_days: i64,
     ) -> Self {
-        for project in &mut projects {
-            project.recent = project.days_since_modified() < recent_days;
-        }
+        let projects = projects
+            .into_iter()
+            .map(|project| {
+                let recent = project.days_since_modified() < recent_days;
+                EvaluatedProject::from(project).mark_recent(recent)
+            })
+            .collect::<Vec<_>>();
         let mut app = Self {
             selected: vec![false; projects.len()],
             projects,
@@ -95,26 +100,31 @@ impl AppState {
     fn recompute_visible(&mut self) {
         self.visible_indices.clear();
         for (idx, p) in self.projects.iter().enumerate() {
-            if !self.include_protected && p.protected {
+            if !self.include_protected && p.safety.protected {
                 continue;
             }
-            if !self.include_recent && p.recent {
+            if !self.include_recent && p.safety.recent {
                 continue;
             }
             if let Some(category) = self.category_filter {
-                if p.category != category {
+                if p.project.category != category {
                     continue;
                 }
             }
             if let Some(risk) = self.risk_filter {
-                if p.risk_level != risk {
+                if p.project.risk_level != risk {
                     continue;
                 }
             }
             if !self.query.is_empty() {
                 let q = self.query.to_ascii_lowercase();
-                let path = p.cleanable_dir.display().to_string().to_ascii_lowercase();
-                let name = p.project_type_display_name().to_ascii_lowercase();
+                let path = p
+                    .project
+                    .cleanable_dir
+                    .display()
+                    .to_string()
+                    .to_ascii_lowercase();
+                let name = p.project.project_type_display_name().to_ascii_lowercase();
                 if !path.contains(&q) && !name.contains(&q) {
                     continue;
                 }
@@ -124,21 +134,35 @@ impl AppState {
 
         self.visible_indices.sort_by(|a, b| match self.sort_key {
             SortKey::Size => self.projects[*b]
+                .project
                 .size
-                .cmp(&self.projects[*a].size)
+                .cmp(&self.projects[*a].project.size)
                 .then_with(|| {
                     self.projects[*b]
+                        .project
                         .days_since_modified()
-                        .cmp(&self.projects[*a].days_since_modified())
+                        .cmp(&self.projects[*a].project.days_since_modified())
                 }),
             SortKey::Age => self.projects[*b]
+                .project
                 .days_since_modified()
-                .cmp(&self.projects[*a].days_since_modified())
-                .then_with(|| self.projects[*b].size.cmp(&self.projects[*a].size)),
+                .cmp(&self.projects[*a].project.days_since_modified())
+                .then_with(|| {
+                    self.projects[*b]
+                        .project
+                        .size
+                        .cmp(&self.projects[*a].project.size)
+                }),
             SortKey::Risk => self.projects[*a]
+                .project
                 .risk_level
-                .cmp(&self.projects[*b].risk_level)
-                .then_with(|| self.projects[*b].size.cmp(&self.projects[*a].size)),
+                .cmp(&self.projects[*b].project.risk_level)
+                .then_with(|| {
+                    self.projects[*b]
+                        .project
+                        .size
+                        .cmp(&self.projects[*a].project.size)
+                }),
         });
 
         let current = self.list_state.selected().unwrap_or(0);
@@ -160,14 +184,14 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(idx, _)| self.selected[*idx])
-            .map(|(_, p)| p.size)
+            .map(|(_, p)| p.project.size)
             .sum()
     }
 
     fn visible_total_size(&self) -> u64 {
         self.visible_indices
             .iter()
-            .map(|idx| self.projects[*idx].size)
+            .map(|idx| self.projects[*idx].project.size)
             .sum()
     }
 
@@ -176,11 +200,11 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(idx, _)| self.selected[*idx])
-            .map(|(_, p)| p.clone())
+            .map(|(_, p)| p.to_project_info())
             .collect()
     }
 
-    fn selected_project(&self) -> Option<&ProjectInfo> {
+    fn selected_project(&self) -> Option<&EvaluatedProject> {
         let idx = self.list_state.selected()?;
         let project_idx = *self.visible_indices.get(idx)?;
         self.projects.get(project_idx)
@@ -262,8 +286,10 @@ impl AppState {
     }
 }
 
-fn default_selectable(project: &ProjectInfo, recent_days: i64) -> bool {
-    !project.in_use && !project.protected && project.days_since_modified() >= recent_days
+fn default_selectable(project: &EvaluatedProject, recent_days: i64) -> bool {
+    !project.project.in_use
+        && !project.safety.protected
+        && project.project.days_since_modified() >= recent_days
 }
 
 pub fn run_tui(path: PathBuf) -> Result<()> {
@@ -471,13 +497,13 @@ fn draw_project_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             let p = &app.projects[*idx];
             let selected_marker = if app.selected[*idx] { "[✓]" } else { "[ ]" };
             let mut tags = Vec::new();
-            if p.in_use {
+            if p.project.in_use {
                 tags.push("IN_USE");
             }
-            if p.protected {
+            if p.safety.protected {
                 tags.push("PROTECTED");
             }
-            if p.recent {
+            if p.safety.recent {
                 tags.push("RECENT");
             }
             let tags = if tags.is_empty() {
@@ -488,10 +514,10 @@ fn draw_project_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             let line = format!(
                 "{} {:<10} {:>9} {:<12} {}{}",
                 selected_marker,
-                p.project_type_display_name(),
-                format_size(p.size),
-                format!("[{}/{}]", p.category, p.risk_level),
-                p.cleanable_dir.display(),
+                p.project.project_type_display_name(),
+                format_size(p.project.size),
+                format!("[{}/{}]", p.project.category, p.project.risk_level),
+                p.project.cleanable_dir.display(),
                 tags
             );
             ListItem::new(line)
@@ -513,28 +539,35 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &AppState) {
     let text = if let Some(p) = app.selected_project() {
         vec![
             Line::from(Span::styled(
-                p.cleanable_dir.display().to_string(),
+                p.project.cleanable_dir.display().to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
-            Line::from(format!("Project: {}", p.project_type_display_name())),
-            Line::from(format!("Size: {}", format_size(p.size))),
-            Line::from(format!("Age: {} days", p.days_since_modified())),
-            Line::from(format!("Category: {}", p.category)),
-            Line::from(format!("Risk: {}", p.risk_level)),
-            Line::from(format!("Confidence: {}", p.confidence)),
-            Line::from(format!("In use: {}", p.in_use)),
-            Line::from(format!("Protected: {}", p.protected)),
-            Line::from(format!("Recent: {}", p.recent)),
+            Line::from(format!(
+                "Project: {}",
+                p.project.project_type_display_name()
+            )),
+            Line::from(format!("Size: {}", format_size(p.project.size))),
+            Line::from(format!("Age: {} days", p.project.days_since_modified())),
+            Line::from(format!("Category: {}", p.project.category)),
+            Line::from(format!("Risk: {}", p.project.risk_level)),
+            Line::from(format!("Confidence: {}", p.project.confidence)),
+            Line::from(format!("In use: {}", p.project.in_use)),
+            Line::from(format!("Protected: {}", p.safety.protected)),
+            Line::from(format!("Recent: {}", p.safety.recent)),
             Line::from(format!(
                 "Rule: {}",
-                p.matched_rule
+                p.project
+                    .matched_rule
                     .as_ref()
                     .map(|r| format!("{:?}:{}", r.source, r.pattern))
                     .unwrap_or_else(|| "-".to_string())
             )),
             Line::from(format!(
                 "Protected by: {}",
-                p.protected_by.clone().unwrap_or_else(|| "-".to_string())
+                p.safety
+                    .protected_by
+                    .clone()
+                    .unwrap_or_else(|| "-".to_string())
             )),
         ]
     } else {

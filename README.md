@@ -58,6 +58,29 @@ sudo cp target/release/dev-cleaner /usr/local/bin/
 cargo install dev-cleaner
 ```
 
+## Performance Baselines
+
+Use the synthetic benchmark suite to establish a repeatable local baseline for `scan`:
+
+```bash
+# Run the synthetic scan baselines in release mode
+cargo bench --bench scan_baselines
+
+# Save a named baseline, then compare a later run against it
+cargo bench --bench scan_baselines -- --save-baseline before
+cargo bench --bench scan_baselines -- --baseline before
+```
+
+The benchmark generates deterministic temporary directory trees at runtime and validates
+that `scan()` and `scan_with_streaming()` return the same result set before timing them.
+
+For real-directory experiments, emit phase timing to stderr without changing normal CLI
+output or JSON payloads:
+
+```bash
+DEV_CLEANER_PERF_TRACE=json cargo run -- scan . --depth 2 2>scan-trace.jsonl
+```
+
 ## Usage
 
 ### Quick Start

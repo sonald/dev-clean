@@ -1,3 +1,4 @@
+use crate::evaluation::{EvaluatedProject, SelectionReason, SkipReason};
 use crate::scanner::RiskLevel;
 use crate::ProjectInfo;
 
@@ -79,47 +80,54 @@ pub fn recommend_projects(
     let mut blocked = BlockedSummary::default();
     let mut eligible = Vec::new();
 
-    for mut p in candidates {
-        p.recent = p.days_since_modified() < options.recent_days;
+    for project in candidates {
+        let mut evaluated = EvaluatedProject::from(project);
+        evaluated.safety.recent = evaluated.project.days_since_modified() < options.recent_days;
 
         if let Some(max_risk) = options.max_risk {
-            if p.risk_level > max_risk {
+            if evaluated.project.risk_level > max_risk {
                 blocked.risk_count += 1;
-                blocked.risk_bytes = blocked.risk_bytes.saturating_add(p.size);
-                p.skip_reason = Some("blocked_by_risk".to_string());
+                blocked.risk_bytes = blocked.risk_bytes.saturating_add(evaluated.project.size);
+                let _ = evaluated.mark_skip_reason(SkipReason::Risk);
                 continue;
             }
         }
 
-        if !options.include_in_use && p.in_use {
+        if !options.include_in_use && evaluated.project.in_use {
             blocked.in_use_count += 1;
-            blocked.in_use_bytes = blocked.in_use_bytes.saturating_add(p.size);
-            p.skip_reason = Some("blocked_in_use".to_string());
+            blocked.in_use_bytes = blocked.in_use_bytes.saturating_add(evaluated.project.size);
+            let _ = evaluated.mark_skip_reason(SkipReason::InUse);
             continue;
         }
 
-        if !options.include_protected && p.protected {
+        if !options.include_protected && evaluated.safety.protected {
             blocked.protected_count += 1;
-            blocked.protected_bytes = blocked.protected_bytes.saturating_add(p.size);
-            p.skip_reason = Some("blocked_protected".to_string());
+            blocked.protected_bytes = blocked
+                .protected_bytes
+                .saturating_add(evaluated.project.size);
+            let _ = evaluated.mark_skip_reason(SkipReason::Protected);
             continue;
         }
 
-        if !options.include_recent && p.recent {
+        if !options.include_recent && evaluated.safety.recent {
             blocked.recent_count += 1;
-            blocked.recent_bytes = blocked.recent_bytes.saturating_add(p.size);
-            p.skip_reason = Some("blocked_recent".to_string());
+            blocked.recent_bytes = blocked.recent_bytes.saturating_add(evaluated.project.size);
+            let _ = evaluated.mark_skip_reason(SkipReason::Recent);
             continue;
         }
 
-        eligible.push(p);
+        eligible.push(evaluated);
     }
 
     eligible.sort_by(|a, b| {
         score_project(b, options.strategy)
             .cmp(&score_project(a, options.strategy))
-            .then_with(|| b.size.cmp(&a.size))
-            .then_with(|| b.days_since_modified().cmp(&a.days_since_modified()))
+            .then_with(|| b.project.size.cmp(&a.project.size))
+            .then_with(|| {
+                b.project
+                    .days_since_modified()
+                    .cmp(&a.project.days_since_modified())
+            })
     });
 
     let mut selected = Vec::new();
@@ -129,13 +137,13 @@ pub fn recommend_projects(
         if selected_bytes >= options.target_bytes {
             break;
         }
-        selected_bytes = selected_bytes.saturating_add(project.size);
-        project.selection_reason = Some(match options.strategy {
-            RecommendStrategy::SafeFirst => "strategy_safe_first".to_string(),
-            RecommendStrategy::Balanced => "strategy_balanced".to_string(),
-            RecommendStrategy::MaxSpace => "strategy_max_space".to_string(),
+        selected_bytes = selected_bytes.saturating_add(project.project.size);
+        project = project.mark_selection_reason(match options.strategy {
+            RecommendStrategy::SafeFirst => SelectionReason::StrategySafeFirst,
+            RecommendStrategy::Balanced => SelectionReason::StrategyBalanced,
+            RecommendStrategy::MaxSpace => SelectionReason::StrategyMaxSpace,
         });
-        selected.push(project);
+        selected.push(project.into_project_info());
     }
 
     RecommendResult {
@@ -146,14 +154,14 @@ pub fn recommend_projects(
     }
 }
 
-fn score_project(p: &ProjectInfo, strategy: RecommendStrategy) -> i64 {
-    let risk_penalty = match p.risk_level {
+fn score_project(p: &EvaluatedProject, strategy: RecommendStrategy) -> i64 {
+    let risk_penalty = match p.project.risk_level {
         RiskLevel::Low => 0,
         RiskLevel::Medium => 30,
         RiskLevel::High => 80,
     };
-    let age_bonus = p.days_since_modified().clamp(0, 365);
-    let size_mb = (p.size / (1024 * 1024)) as i64;
+    let age_bonus = p.project.days_since_modified().clamp(0, 365);
+    let size_mb = (p.project.size / (1024 * 1024)) as i64;
 
     match strategy {
         RecommendStrategy::SafeFirst => age_bonus * 2 + size_mb - risk_penalty * 3,
@@ -207,6 +215,10 @@ mod tests {
         let result = recommend_projects(projects, &opts);
         assert_eq!(result.selected.len(), 1);
         assert_eq!(result.selected[0].size, 500 * 1024 * 1024);
+        assert_eq!(
+            result.selected[0].selection_reason.as_deref(),
+            Some("strategy_max_space")
+        );
     }
 
     #[test]
@@ -216,5 +228,18 @@ mod tests {
         let result = recommend_projects(projects, &opts);
         assert!(result.selected.is_empty());
         assert_eq!(result.blocked.recent_count, 1);
+    }
+
+    #[test]
+    fn recommend_does_not_mutate_input_projects() {
+        let project = mk_project(10 * 1024 * 1024, 1, RiskLevel::Low);
+        let original = project.clone();
+        let opts = RecommendOptions::new(1024);
+
+        let result = recommend_projects(vec![project], &opts);
+        assert!(result.selected.is_empty());
+        assert_eq!(original.recent, false);
+        assert_eq!(original.skip_reason, None);
+        assert_eq!(original.selection_reason, None);
     }
 }

@@ -8,6 +8,7 @@ pub use walker::Scanner;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::PathBuf;
 use std::{fmt, fmt::Display};
 
@@ -241,5 +242,25 @@ impl ProjectInfo {
     pub fn days_since_modified(&self) -> i64 {
         let now = Utc::now();
         (now - self.last_modified).num_days()
+    }
+}
+
+pub(crate) fn perf_trace_enabled() -> bool {
+    matches!(
+        std::env::var("DEV_CLEANER_PERF_TRACE"),
+        Ok(value) if value.eq_ignore_ascii_case("json")
+    )
+}
+
+pub(crate) fn emit_perf_trace<T: Serialize>(scope: &str, payload: &T) {
+    if !perf_trace_enabled() {
+        return;
+    }
+
+    if let Ok(line) = serde_json::to_string(&json!({
+        "scope": scope,
+        "payload": payload,
+    })) {
+        eprintln!("{line}");
     }
 }

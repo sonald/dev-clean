@@ -1,25 +1,64 @@
 use super::{
-    Category, Confidence, ProjectDetector, ProjectInfo, ProjectType, RiskLevel, RuleRef,
-    RuleSource, SizeCalculator,
+    emit_perf_trace, Category, Confidence, ProjectDetector, ProjectInfo, ProjectType, RiskLevel,
+    RuleRef, RuleSource, SizeCalculator,
 };
 use crate::config::{CustomPattern, MarkerMode};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossbeam::channel::{self, Receiver};
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::{Match, WalkBuilder, WalkState};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
+enum PatternTarget {
+    Basename,
+    RelativePath,
+}
+
+struct CompiledPattern {
+    pattern: String,
+    target: PatternTarget,
+    matcher: GlobMatcher,
+}
+
+impl CompiledPattern {
+    fn new(pattern: &str) -> Option<Self> {
+        let pattern = pattern.replace('\\', "/");
+        let target = if pattern.contains('/') {
+            PatternTarget::RelativePath
+        } else {
+            PatternTarget::Basename
+        };
+        let glob = GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .build()
+            .ok()?;
+        Some(Self {
+            pattern,
+            target,
+            matcher: glob.compile_matcher(),
+        })
+    }
+
+    fn matches(&self, basename: &str, relative_path: &str) -> bool {
+        match self.target {
+            PatternTarget::Basename => self.matcher.is_match(basename),
+            PatternTarget::RelativePath => self.matcher.is_match(relative_path),
+        }
+    }
+}
+
 struct CleanableMatchers {
     basename: GlobSet,
     relative_path: GlobSet,
-    builtin_patterns: Vec<String>,
+    builtin_patterns: Vec<CompiledPattern>,
 }
 
 impl CleanableMatchers {
@@ -28,11 +67,15 @@ impl CleanableMatchers {
     }
 
     fn matched_rule(&self, basename: &str, relative_path: &str) -> Option<RuleRef> {
+        if !self.matches(basename, relative_path) {
+            return None;
+        }
+
         for pattern in &self.builtin_patterns {
-            if pattern_matches(pattern, basename, relative_path) {
+            if pattern.matches(basename, relative_path) {
                 return Some(RuleRef {
                     source: RuleSource::Builtin,
-                    pattern: pattern.clone(),
+                    pattern: pattern.pattern.clone(),
                     name: None,
                 });
             }
@@ -42,7 +85,6 @@ impl CleanableMatchers {
     }
 }
 
-#[derive(Debug)]
 struct CandidateMatchers {
     basename: GlobSet,
     relative_path: GlobSet,
@@ -53,6 +95,43 @@ impl CandidateMatchers {
         self.basename.is_match(basename)
             || self.relative_path.is_match(relative_path_from_scan_root)
     }
+}
+
+struct CompiledCustomPattern {
+    name: String,
+    directory: String,
+    marker_files: Vec<String>,
+    marker_mode: MarkerMode,
+    matcher: CompiledPattern,
+}
+
+impl CompiledCustomPattern {
+    fn matches(&self, basename: &str, relative_path: &str) -> bool {
+        self.matcher.matches(basename, relative_path)
+    }
+}
+
+struct DiscoveryResult {
+    pending_projects: Vec<ProjectInfo>,
+    discovery_ms: u128,
+    dedup_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ScanPerfTrace {
+    mode: &'static str,
+    root: String,
+    discovery_ms: u128,
+    dedup_ms: u128,
+    size_calc_ms: u128,
+    total_ms: u128,
+    discovered_candidates: usize,
+    final_results: usize,
+    max_depth: Option<usize>,
+    min_size_bytes: Option<u64>,
+    max_age_days: Option<i64>,
+    max_risk: Option<RiskLevel>,
+    respect_gitignore: bool,
 }
 
 /// Main scanner for finding cleanable project directories
@@ -78,11 +157,20 @@ pub struct Scanner {
     /// Cache of compiled `.gitignore` matchers per project root
     gitignore_cache: Mutex<HashMap<PathBuf, Arc<Gitignore>>>,
 
+    /// Cache of project type detection per traversed directory
+    project_type_cache: Mutex<HashMap<PathBuf, Option<ProjectType>>>,
+
+    /// Cache of custom root marker checks per project root and custom pattern index
+    custom_root_cache: Mutex<HashMap<(PathBuf, usize), bool>>,
+
     /// Directories to always exclude from scanning (by basename)
     exclude_dirs: HashSet<String>,
 
     /// Custom patterns from user config
     custom_patterns: Vec<CustomPattern>,
+
+    /// Compiled custom patterns for hot-path matching
+    compiled_custom_patterns: Arc<Vec<CompiledCustomPattern>>,
 
     /// Filter results by category (None = all)
     category_filter: Option<Category>,
@@ -102,8 +190,11 @@ impl Scanner {
             max_age_days: None,
             matcher_cache: Mutex::new(HashMap::new()),
             gitignore_cache: Mutex::new(HashMap::new()),
+            project_type_cache: Mutex::new(HashMap::new()),
+            custom_root_cache: Mutex::new(HashMap::new()),
             exclude_dirs: HashSet::new(),
             custom_patterns: Vec::new(),
+            compiled_custom_patterns: Arc::new(Vec::new()),
             category_filter: None,
             max_risk: None,
         }
@@ -118,6 +209,7 @@ impl Scanner {
     /// Set custom patterns from config
     pub fn custom_patterns(mut self, patterns: &[CustomPattern]) -> Self {
         self.custom_patterns = patterns.to_vec();
+        self.compiled_custom_patterns = Arc::new(compile_custom_patterns(patterns));
         self
     }
 
@@ -157,84 +249,37 @@ impl Scanner {
 
     /// Scan and return list of cleanable projects
     pub fn scan(&self) -> Result<Vec<ProjectInfo>> {
-        let results = Arc::new(Mutex::new(Vec::new()));
-        let candidate_matchers = self.candidate_matchers();
+        let started = Instant::now();
+        let discovery = self.discover_pending_projects()?;
+        let discovered_candidates = discovery.pending_projects.len();
+        let size_started = Instant::now();
+        let mut final_results = SizeCalculator::new().calculate_batch(discovery.pending_projects);
+        let size_calc_ms = size_started.elapsed().as_millis();
 
-        // Build walker with Ripgrep-style configuration
-        let mut walker = WalkBuilder::new(&self.root);
-        let exclude_dirs = self.exclude_dirs.clone();
-        walker
-            .hidden(false) // Don't skip hidden files/dirs
-            .ignore(self.respect_gitignore) // Respect .gitignore if enabled
-            .git_ignore(self.respect_gitignore)
-            .git_exclude(self.respect_gitignore)
-            .filter_entry(move |entry| {
-                // Skip common VCS directories that should never be scanned
-                let file_name = entry.file_name().to_string_lossy();
-                !matches!(file_name.as_ref(), ".git" | ".svn" | ".hg")
-                    && !exclude_dirs.contains(file_name.as_ref())
-            });
+        // Keep batch consumers on the old contract: only include entries whose size was measured.
+        final_results.retain(|project| project.size_calculated);
 
-        if let Some(depth) = self.max_depth {
-            walker.max_depth(Some(depth));
+        if let Some(min_size) = self.min_size {
+            final_results.retain(|project| project.size >= min_size);
         }
 
-        // Use parallel walker for better performance
-        walker.threads(num_cpus::get());
-
-        let scanner = self;
-        walker.build_parallel().run(|| {
-            let results = Arc::clone(&results);
-            let candidate_matchers = Arc::clone(&candidate_matchers);
-            Box::new(move |entry| {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => return WalkState::Continue,
-                };
-
-                if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                    return WalkState::Continue;
-                }
-
-                let dir = entry.path();
-
-                if let Some(candidate_matchers) = candidate_matchers.as_ref() {
-                    let Some(dir_name) = dir.file_name().map(|s| s.to_string_lossy()) else {
-                        return WalkState::Continue;
-                    };
-                    let relative_path = dir
-                        .strip_prefix(&scanner.root)
-                        .ok()
-                        .map(normalize_relative_path)
-                        .unwrap_or_else(|| dir.display().to_string().replace('\\', "/"));
-
-                    if !candidate_matchers.matches(dir_name.as_ref(), &relative_path)
-                        && !ProjectDetector::is_cmake_build_dir(dir)
-                    {
-                        return WalkState::Continue;
-                    }
-                }
-
-                if let Some(project_info) = scanner.check_directory(dir) {
-                    if scanner.passes_filters(&project_info) {
-                        results.lock().unwrap().push(project_info);
-                    }
-                    // If we found a cleanable directory, avoid walking into it.
-                    return WalkState::Skip;
-                }
-
-                WalkState::Continue
-            })
-        });
-
-        let mut final_results = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
-
-        // Remove nested cleanable directories to avoid duplicates
-        // For example, if we have both .venv and .venv/lib/.../pycache, keep only .venv
-        final_results = self.deduplicate_nested_dirs(final_results);
-
-        // Sort by size (largest first)
         final_results.sort_by(|a, b| b.size.cmp(&a.size));
+
+        self.emit_scan_trace(ScanPerfTrace {
+            mode: "scan",
+            root: self.root.display().to_string(),
+            discovery_ms: discovery.discovery_ms,
+            dedup_ms: discovery.dedup_ms,
+            size_calc_ms,
+            total_ms: started.elapsed().as_millis(),
+            discovered_candidates,
+            final_results: final_results.len(),
+            max_depth: self.max_depth,
+            min_size_bytes: self.min_size,
+            max_age_days: self.max_age_days,
+            max_risk: self.max_risk,
+            respect_gitignore: self.respect_gitignore,
+        });
 
         Ok(final_results)
     }
@@ -262,29 +307,46 @@ impl Scanner {
     /// }
     /// ```
     pub fn scan_with_streaming(&self) -> Result<(usize, Receiver<ProjectInfo>)> {
-        // Step 1: Fast scan without size calculation
+        let started = Instant::now();
+        let discovery = self.discover_pending_projects()?;
+        let total_count = discovery.pending_projects.len();
+        let (tx, rx) = channel::unbounded();
+        let trace = ScanPerfTrace {
+            mode: "scan_with_streaming",
+            root: self.root.display().to_string(),
+            discovery_ms: discovery.discovery_ms,
+            dedup_ms: discovery.dedup_ms,
+            size_calc_ms: 0,
+            total_ms: 0,
+            discovered_candidates: total_count,
+            final_results: total_count,
+            max_depth: self.max_depth,
+            min_size_bytes: self.min_size,
+            max_age_days: self.max_age_days,
+            max_risk: self.max_risk,
+            respect_gitignore: self.respect_gitignore,
+        };
+
+        // Step 2: Calculate sizes in parallel and stream results.
+        thread::spawn(move || {
+            let size_started = Instant::now();
+            let calculator = SizeCalculator::new();
+            calculator.calculate_batch_streaming(discovery.pending_projects, tx);
+
+            let mut trace = trace;
+            trace.size_calc_ms = size_started.elapsed().as_millis();
+            trace.total_ms = started.elapsed().as_millis();
+            emit_perf_trace("scan", &trace);
+        });
+
+        Ok((total_count, rx))
+    }
+
+    fn discover_pending_projects(&self) -> Result<DiscoveryResult> {
+        let discovery_started = Instant::now();
         let results = Arc::new(Mutex::new(Vec::new()));
         let candidate_matchers = self.candidate_matchers();
-
-        // Build walker with Ripgrep-style configuration
-        let mut walker = WalkBuilder::new(&self.root);
-        let exclude_dirs = self.exclude_dirs.clone();
-        walker
-            .hidden(false)
-            .ignore(self.respect_gitignore)
-            .git_ignore(self.respect_gitignore)
-            .git_exclude(self.respect_gitignore)
-            .filter_entry(move |entry| {
-                let file_name = entry.file_name().to_string_lossy();
-                !matches!(file_name.as_ref(), ".git" | ".svn" | ".hg")
-                    && !exclude_dirs.contains(file_name.as_ref())
-            });
-
-        if let Some(depth) = self.max_depth {
-            walker.max_depth(Some(depth));
-        }
-
-        walker.threads(num_cpus::get());
+        let walker = self.build_walker();
 
         let scanner = self;
         walker.build_parallel().run(|| {
@@ -334,22 +396,16 @@ impl Scanner {
         });
 
         let mut pending_projects = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
-
-        // Deduplicate
+        let discovery_ms = discovery_started.elapsed().as_millis();
+        let dedup_started = Instant::now();
         pending_projects = self.deduplicate_nested_dirs(pending_projects);
+        let dedup_ms = dedup_started.elapsed().as_millis();
 
-        let total_count = pending_projects.len();
-
-        // Step 2: Calculate sizes in parallel and stream results
-        let (tx, rx) = channel::unbounded();
-
-        // Spawn background thread for size calculation
-        thread::spawn(move || {
-            let calculator = SizeCalculator::new();
-            calculator.calculate_batch_streaming(pending_projects, tx);
-        });
-
-        Ok((total_count, rx))
+        Ok(DiscoveryResult {
+            pending_projects,
+            discovery_ms,
+            dedup_ms,
+        })
     }
 
     /// Re-validate an existing cleanable target path against current rules.
@@ -360,6 +416,32 @@ impl Scanner {
         }
         self.check_directory(dir)
             .filter(|info| info.cleanable_dir == dir)
+    }
+
+    fn build_walker(&self) -> WalkBuilder {
+        let mut walker = WalkBuilder::new(&self.root);
+        let exclude_dirs = self.exclude_dirs.clone();
+        walker
+            .hidden(false)
+            .ignore(self.respect_gitignore)
+            .git_ignore(self.respect_gitignore)
+            .git_exclude(self.respect_gitignore)
+            .filter_entry(move |entry| {
+                let file_name = entry.file_name().to_string_lossy();
+                !matches!(file_name.as_ref(), ".git" | ".svn" | ".hg")
+                    && !exclude_dirs.contains(file_name.as_ref())
+            });
+
+        if let Some(depth) = self.max_depth {
+            walker.max_depth(Some(depth));
+        }
+
+        walker.threads(num_cpus::get());
+        walker
+    }
+
+    fn emit_scan_trace(&self, trace: ScanPerfTrace) {
+        emit_perf_trace("scan", &trace);
     }
 
     fn candidate_matchers(&self) -> Arc<Option<CandidateMatchers>> {
@@ -374,24 +456,33 @@ impl Scanner {
     }
 
     /// Remove nested cleanable directories, keeping only the topmost ones
-    fn deduplicate_nested_dirs(&self, results: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
+    fn deduplicate_nested_dirs(&self, mut results: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
+        results.sort_by(|a, b| {
+            let depth_a = a.cleanable_dir.components().count();
+            let depth_b = b.cleanable_dir.components().count();
+            depth_a
+                .cmp(&depth_b)
+                .then_with(|| a.cleanable_dir.cmp(&b.cleanable_dir))
+        });
+
+        let mut kept_paths = HashSet::new();
         let mut deduplicated = Vec::new();
 
-        for info in &results {
-            // Check if this directory is nested inside any other cleanable directory
-            let is_nested = results.iter().any(|other| {
-                // Skip self-comparison
-                if info.cleanable_dir == other.cleanable_dir {
-                    return false;
+        for info in results {
+            let mut ancestor = info.cleanable_dir.parent();
+            let mut is_nested = false;
+            while let Some(parent) = ancestor {
+                if kept_paths.contains(parent) {
+                    is_nested = true;
+                    break;
                 }
-
-                // Check if info.cleanable_dir is a subdirectory of other.cleanable_dir
-                info.cleanable_dir.starts_with(&other.cleanable_dir)
-            });
+                ancestor = parent.parent();
+            }
 
             // Only keep this directory if it's not nested inside another
             if !is_nested {
-                deduplicated.push(info.clone());
+                kept_paths.insert(info.cleanable_dir.clone());
+                deduplicated.push(info);
             }
         }
 
@@ -421,12 +512,12 @@ impl Scanner {
             let relative_path = normalize_relative_path(dir.strip_prefix(parent).ok()?);
 
             // Custom patterns (higher priority than builtin/.gitignore patterns)
-            for custom in &self.custom_patterns {
-                if !custom_root_matches(parent, custom) {
+            for (custom_index, custom) in self.compiled_custom_patterns.iter().enumerate() {
+                if !self.custom_root_matches(parent, custom_index, custom) {
                     continue;
                 }
 
-                if !pattern_matches(&custom.directory, dir_name.as_ref(), &relative_path) {
+                if !custom.matches(dir_name.as_ref(), &relative_path) {
                     continue;
                 }
 
@@ -448,13 +539,14 @@ impl Scanner {
                 }
             }
 
-            if let Some(project_type) = ProjectDetector::detect(parent) {
+            if let Some(project_type) = self.project_type_for(parent) {
                 // Check if current directory is a cleanable dir for this project type
                 // This includes both default patterns AND patterns from `.gitignore` discovery.
                 let matchers = self.matchers_for(project_type, parent);
                 let gitignore_rule = self.gitignore_rule_for(parent, dir, dir_name.as_ref());
+                let builtin_rule = matchers.matched_rule(dir_name.as_ref(), &relative_path);
 
-                if matchers.matches(dir_name.as_ref(), &relative_path) || gitignore_rule.is_some() {
+                if builtin_rule.is_some() || gitignore_rule.is_some() {
                     let info = if fast_mode {
                         self.build_project_info_fast(parent, project_type, dir)
                     } else {
@@ -462,8 +554,7 @@ impl Scanner {
                     };
 
                     if let Some(mut info) = info {
-                        if let Some(rule) = matchers.matched_rule(dir_name.as_ref(), &relative_path)
-                        {
+                        if let Some(rule) = builtin_rule {
                             apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
                         } else if let Some(rule) = gitignore_rule {
                             apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
@@ -522,6 +613,51 @@ impl Scanner {
         }
 
         None
+    }
+
+    fn project_type_for(&self, dir: &Path) -> Option<ProjectType> {
+        let key = dir.to_path_buf();
+
+        if let Some(cached) = self.project_type_cache.lock().unwrap().get(&key).copied() {
+            return cached;
+        }
+
+        let detected = ProjectDetector::detect(dir);
+        let mut cache = self.project_type_cache.lock().unwrap();
+        cache.insert(key, detected);
+        detected
+    }
+
+    fn custom_root_matches(
+        &self,
+        project_root: &Path,
+        custom_index: usize,
+        custom: &CompiledCustomPattern,
+    ) -> bool {
+        let key = (project_root.to_path_buf(), custom_index);
+
+        if let Some(cached) = self.custom_root_cache.lock().unwrap().get(&key).copied() {
+            return cached;
+        }
+
+        let matched = if custom.marker_files.is_empty() {
+            false
+        } else {
+            match custom.marker_mode {
+                MarkerMode::AnyOf => custom
+                    .marker_files
+                    .iter()
+                    .any(|marker| project_root.join(marker).exists()),
+                MarkerMode::AllOf => custom
+                    .marker_files
+                    .iter()
+                    .all(|marker| project_root.join(marker).exists()),
+            }
+        };
+
+        let mut cache = self.custom_root_cache.lock().unwrap();
+        cache.insert(key, matched);
+        matched
     }
 
     fn matchers_for(
@@ -783,12 +919,32 @@ fn build_candidate_matchers(custom_patterns: &[CustomPattern]) -> CandidateMatch
     }
 }
 
+fn compile_custom_patterns(patterns: &[CustomPattern]) -> Vec<CompiledCustomPattern> {
+    let mut compiled = Vec::new();
+
+    for pattern in patterns {
+        let Some(matcher) = CompiledPattern::new(&pattern.directory) else {
+            continue;
+        };
+
+        compiled.push(CompiledCustomPattern {
+            name: pattern.name.clone(),
+            directory: pattern.directory.clone(),
+            marker_files: pattern.marker_files.clone(),
+            marker_mode: pattern.marker_mode,
+            matcher,
+        });
+    }
+
+    compiled
+}
+
 fn build_matchers(project_type: ProjectType, _project_root: &Path) -> CleanableMatchers {
     let builtin_patterns = ProjectDetector::cleanable_dirs(project_type)
         .iter()
-        .map(|s| s.to_string())
+        .filter_map(|pattern| CompiledPattern::new(pattern))
         .collect::<Vec<_>>();
-    let patterns = builtin_patterns.clone();
+    let patterns = ProjectDetector::cleanable_dirs(project_type);
 
     let mut basename_builder = GlobSetBuilder::new();
     let mut relpath_builder = GlobSetBuilder::new();
@@ -825,39 +981,6 @@ fn build_matchers(project_type: ProjectType, _project_root: &Path) -> CleanableM
 
 fn normalize_relative_path(relative: &Path) -> String {
     relative.to_string_lossy().replace('\\', "/")
-}
-
-fn custom_root_matches(project_root: &Path, custom: &CustomPattern) -> bool {
-    if custom.marker_files.is_empty() {
-        return false;
-    }
-
-    match custom.marker_mode {
-        MarkerMode::AnyOf => custom
-            .marker_files
-            .iter()
-            .any(|marker| project_root.join(marker).exists()),
-        MarkerMode::AllOf => custom
-            .marker_files
-            .iter()
-            .all(|marker| project_root.join(marker).exists()),
-    }
-}
-
-fn pattern_matches(pattern: &str, basename: &str, relative_path: &str) -> bool {
-    let pattern = pattern.replace('\\', "/");
-    let text = if pattern.contains('/') {
-        relative_path
-    } else {
-        basename
-    };
-
-    let glob = match GlobBuilder::new(&pattern).literal_separator(true).build() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-
-    glob.compile_matcher().is_match(text)
 }
 
 fn apply_matched_rule(info: &mut ProjectInfo, rule: RuleRef, basename: &str, relative_path: &str) {
@@ -979,8 +1102,26 @@ fn system_time_to_datetime(time: SystemTime) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use std::fs;
     use tempfile::TempDir;
+
+    fn snapshot(results: &[ProjectInfo]) -> Vec<(String, u64, String, String, String)> {
+        let mut snapshot = results
+            .iter()
+            .map(|project| {
+                (
+                    project.cleanable_dir.display().to_string(),
+                    project.size,
+                    project.project_type_display_name(),
+                    project.category.to_string(),
+                    project.risk_level.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        snapshot.sort();
+        snapshot
+    }
 
     #[test]
     fn test_scanner_basic() {
@@ -1205,6 +1346,74 @@ mod tests {
         assert_eq!(results[0].project_type, ProjectType::Generic);
         assert_eq!(results[0].project_name.as_deref(), Some("Unity"));
         assert!(results[0].cleanable_dir.ends_with("Library"));
+    }
+
+    #[test]
+    fn test_scan_and_streaming_return_same_results() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        for idx in 0..3 {
+            let rust_project = root.join(format!("rust-project-{idx}"));
+            fs::create_dir_all(rust_project.join("target").join("debug")).unwrap();
+            fs::write(rust_project.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+            fs::write(
+                rust_project
+                    .join("target")
+                    .join("debug")
+                    .join("artifact.bin"),
+                "binary-data",
+            )
+            .unwrap();
+
+            let node_project = root.join(format!("node-project-{idx}"));
+            fs::create_dir_all(node_project.join(".next").join("cache")).unwrap();
+            fs::write(node_project.join("package.json"), "{}").unwrap();
+            fs::write(
+                node_project.join(".next").join("cache").join("artifact.js"),
+                "console.log('x');",
+            )
+            .unwrap();
+        }
+
+        let scanner = Scanner::new(root).max_risk(RiskLevel::Medium);
+        let scan_results = scanner.scan().unwrap();
+
+        let scanner = Scanner::new(root).max_risk(RiskLevel::Medium);
+        let (expected, rx) = scanner.scan_with_streaming().unwrap();
+        let mut streaming_results = rx.iter().collect::<Vec<_>>();
+        streaming_results.sort_by(|a, b| b.size.cmp(&a.size));
+
+        assert_eq!(expected, streaming_results.len());
+        assert_eq!(snapshot(&scan_results), snapshot(&streaming_results));
+    }
+
+    #[test]
+    fn test_deduplicate_nested_dirs_keeps_topmost_path() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let scanner = Scanner::new(&root);
+        let now = Utc::now();
+
+        let parent = root.join("project").join("target");
+        let child = parent.join("debug").join("incremental");
+        let sibling = root.join("project").join("dist");
+
+        let results = vec![
+            ProjectInfo::new_pending(root.clone(), ProjectType::Rust, child.clone(), now, false),
+            ProjectInfo::new_pending(root.clone(), ProjectType::Rust, sibling.clone(), now, false),
+            ProjectInfo::new_pending(root.clone(), ProjectType::Rust, parent.clone(), now, false),
+        ];
+
+        let deduped = scanner.deduplicate_nested_dirs(results);
+        let deduped_paths = deduped
+            .into_iter()
+            .map(|project| project.cleanable_dir)
+            .collect::<Vec<_>>();
+
+        assert!(deduped_paths.contains(&parent));
+        assert!(deduped_paths.contains(&sibling));
+        assert!(!deduped_paths.contains(&child));
     }
 
     #[test]

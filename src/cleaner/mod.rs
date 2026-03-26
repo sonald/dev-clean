@@ -68,6 +68,39 @@ impl CleanResult {
     }
 }
 
+/// The type of cleanup being performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanAction {
+    Delete,
+    Trash,
+}
+
+impl CleanAction {
+    fn dry_run_label(self) -> &'static str {
+        match self {
+            Self::Delete => "[DRY RUN] Would remove",
+            Self::Trash => "[DRY RUN] Would move to trash",
+        }
+    }
+}
+
+/// Observer for cleanup lifecycle events.
+pub trait CleanObserver {
+    fn on_start(&mut self, _total_projects: usize, _total_size: u64) {}
+    fn on_project(&mut self, _project: &ProjectInfo) {}
+    fn on_skipped_in_use(&mut self, _project: &ProjectInfo) {}
+    fn on_dry_run(&mut self, _project: &ProjectInfo, _action: CleanAction) {}
+    fn on_cleaned(&mut self, _project: &ProjectInfo, _size: u64) {}
+    fn on_failed(&mut self, _project: &ProjectInfo, _error: &anyhow::Error) {}
+    fn on_finish(&mut self, _result: &CleanResult) {}
+}
+
+/// No-op cleanup observer.
+#[derive(Debug, Default)]
+pub struct NoopCleanObserver;
+
+impl CleanObserver for NoopCleanObserver {}
+
 /// Main cleaner for removing project directories
 pub struct Cleaner {
     options: CleanOptions,
@@ -112,30 +145,22 @@ impl Cleaner {
 
     /// Clean multiple projects with progress bar
     pub fn clean_multiple(&self, projects: &[ProjectInfo]) -> Result<CleanResult> {
+        let mut observer = TerminalCleanObserver::new(self.options.verbose);
+        self.clean_multiple_with_observer(projects, &mut observer)
+    }
+
+    /// Clean multiple projects while reporting progress through an observer.
+    pub fn clean_multiple_with_observer<O: CleanObserver>(
+        &self,
+        projects: &[ProjectInfo],
+        observer: &mut O,
+    ) -> Result<CleanResult> {
         if projects.is_empty() {
-            return Ok(CleanResult {
-                cleaned_count: 0,
-                bytes_freed: 0,
-                skipped_count: 0,
-                bytes_skipped: 0,
-                failed_count: 0,
-                errors: Vec::new(),
-                trash_batch_id: None,
-                run_id: None,
-            });
+            return Ok(empty_clean_result());
         }
 
-        let multi_progress = MultiProgress::new();
         let total_size: u64 = projects.iter().map(|p| p.size).sum();
-
-        let main_pb = multi_progress.add(ProgressBar::new(projects.len() as u64));
-        main_pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{msg}\n{bar:40.cyan/blue} {pos}/{len} projects")
-                .unwrap()
-                .progress_chars("=>-"),
-        );
-        main_pb.set_message(format!("Cleaning {} total", format_size(total_size)));
+        observer.on_start(projects.len(), total_size);
 
         let mut cleaned_count = 0;
         let mut bytes_freed = 0u64;
@@ -152,53 +177,34 @@ impl Cleaner {
         let trash_batch_id = trash_manager.as_ref().map(|m| m.batch_id.clone());
 
         for project in projects {
-            let path_str = project.cleanable_dir.display().to_string();
-            main_pb.set_message(format!("Cleaning: {}", path_str));
+            observer.on_project(project);
 
             if project.in_use && !self.options.force {
                 skipped_count += 1;
                 bytes_skipped += project.size;
-
-                if self.options.verbose {
-                    println!("↷ Skipped {} (in use)", path_str);
-                }
-
-                main_pb.inc(1);
+                observer.on_skipped_in_use(project);
                 continue;
             }
 
-            match self.clean_single_impl(project, trash_manager.as_ref()) {
+            match self.clean_single_impl(project, trash_manager.as_ref(), observer) {
                 Ok(size) => {
                     cleaned_count += 1;
                     bytes_freed += size;
-
-                    if self.options.verbose {
-                        println!("✓ Cleaned {} (freed {})", path_str, format_size(size));
+                    if !self.options.dry_run {
+                        observer.on_cleaned(project, size);
                     }
                 }
                 Err(e) => {
                     failed_count += 1;
-                    let error_msg = format!("Failed to clean {}: {}", path_str, e);
+                    let error_msg =
+                        format!("Failed to clean {}: {}", project.cleanable_dir.display(), e);
                     errors.push(error_msg.clone());
-
-                    if self.options.verbose {
-                        eprintln!("✗ {}", error_msg);
-                    }
+                    observer.on_failed(project, &e);
                 }
             }
-
-            main_pb.inc(1);
         }
 
-        main_pb.finish_with_message(format!(
-            "Completed: {} cleaned, {} skipped, {} failed, {} freed",
-            cleaned_count,
-            skipped_count,
-            failed_count,
-            format_size(bytes_freed)
-        ));
-
-        Ok(CleanResult {
+        let result = CleanResult {
             cleaned_count,
             bytes_freed,
             skipped_count,
@@ -207,23 +213,82 @@ impl Cleaner {
             errors,
             trash_batch_id,
             run_id: None,
-        })
+        };
+        observer.on_finish(&result);
+        Ok(result)
     }
 
     /// Clean a single project directory
     pub fn clean_single(&self, project: &ProjectInfo) -> Result<u64> {
+        let mut observer = TerminalCleanObserver::new(self.options.verbose);
+        self.clean_single_with_observer(project, &mut observer)
+    }
+
+    /// Clean a single project directory while reporting through an observer.
+    pub fn clean_single_with_observer<O: CleanObserver>(
+        &self,
+        project: &ProjectInfo,
+        observer: &mut O,
+    ) -> Result<u64> {
+        let existed = project.cleanable_dir.exists();
         let trash_manager = if self.options.trash && !self.options.dry_run {
             Some(TrashManager::new_default()?)
         } else {
             None
         };
-        self.clean_single_impl(project, trash_manager.as_ref())
+        observer.on_start(1, project.size);
+        observer.on_project(project);
+
+        match self.clean_single_impl(project, trash_manager.as_ref(), observer) {
+            Ok(size) => {
+                if !self.options.dry_run && existed {
+                    observer.on_cleaned(project, size);
+                }
+
+                let result = CleanResult {
+                    cleaned_count: usize::from(existed),
+                    bytes_freed: if existed { size } else { 0 },
+                    skipped_count: 0,
+                    bytes_skipped: 0,
+                    failed_count: 0,
+                    errors: Vec::new(),
+                    trash_batch_id: trash_manager
+                        .as_ref()
+                        .map(|manager| manager.batch_id.clone()),
+                    run_id: None,
+                };
+                observer.on_finish(&result);
+                Ok(size)
+            }
+            Err(error) => {
+                observer.on_failed(project, &error);
+                let result = CleanResult {
+                    cleaned_count: 0,
+                    bytes_freed: 0,
+                    skipped_count: 0,
+                    bytes_skipped: 0,
+                    failed_count: 1,
+                    errors: vec![format!(
+                        "Failed to clean {}: {}",
+                        project.cleanable_dir.display(),
+                        error
+                    )],
+                    trash_batch_id: trash_manager
+                        .as_ref()
+                        .map(|manager| manager.batch_id.clone()),
+                    run_id: None,
+                };
+                observer.on_finish(&result);
+                Err(error)
+            }
+        }
     }
 
     fn clean_single_impl(
         &self,
         project: &ProjectInfo,
         trash_manager: Option<&TrashManager>,
+        observer: &mut dyn CleanObserver,
     ) -> Result<u64> {
         let path = &project.cleanable_dir;
 
@@ -234,19 +299,14 @@ impl Cleaner {
         let size = project.size;
 
         if self.options.dry_run {
-            if self.options.trash {
-                println!(
-                    "[DRY RUN] Would move to trash: {} ({})",
-                    path.display(),
-                    format_size(size)
-                );
-            } else {
-                println!(
-                    "[DRY RUN] Would remove: {} ({})",
-                    path.display(),
-                    format_size(size)
-                );
-            }
+            observer.on_dry_run(
+                project,
+                if self.options.trash {
+                    CleanAction::Trash
+                } else {
+                    CleanAction::Delete
+                },
+            );
             return Ok(size);
         }
 
@@ -277,13 +337,313 @@ fn remove_dir_all(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn empty_clean_result() -> CleanResult {
+    CleanResult {
+        cleaned_count: 0,
+        bytes_freed: 0,
+        skipped_count: 0,
+        bytes_skipped: 0,
+        failed_count: 0,
+        errors: Vec::new(),
+        trash_batch_id: None,
+        run_id: None,
+    }
+}
+
+struct TerminalCleanObserver {
+    verbose: bool,
+    progress: Option<ProgressBar>,
+    multi_progress: MultiProgress,
+}
+
+impl TerminalCleanObserver {
+    fn new(verbose: bool) -> Self {
+        Self {
+            verbose,
+            progress: None,
+            multi_progress: MultiProgress::new(),
+        }
+    }
+
+    fn progress_bar(&self) -> Option<&ProgressBar> {
+        self.progress.as_ref()
+    }
+
+    fn inc(&self) {
+        if let Some(progress) = self.progress_bar() {
+            progress.inc(1);
+        }
+    }
+}
+
+impl CleanObserver for TerminalCleanObserver {
+    fn on_start(&mut self, total_projects: usize, total_size: u64) {
+        let progress = self
+            .multi_progress
+            .add(ProgressBar::new(total_projects as u64));
+        progress.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg}\n{bar:40.cyan/blue} {pos}/{len} projects")
+                .unwrap()
+                .progress_chars("=>-"),
+        );
+        progress.set_message(format!("Cleaning {} total", format_size(total_size)));
+        self.progress = Some(progress);
+    }
+
+    fn on_project(&mut self, project: &ProjectInfo) {
+        if let Some(progress) = self.progress_bar() {
+            progress.set_message(format!("Cleaning: {}", project.cleanable_dir.display()));
+        }
+    }
+
+    fn on_skipped_in_use(&mut self, project: &ProjectInfo) {
+        if self.verbose {
+            println!("↷ Skipped {} (in use)", project.cleanable_dir.display());
+        }
+        self.inc();
+    }
+
+    fn on_dry_run(&mut self, project: &ProjectInfo, action: CleanAction) {
+        println!(
+            "{}: {} ({})",
+            action.dry_run_label(),
+            project.cleanable_dir.display(),
+            format_size(project.size)
+        );
+        self.inc();
+    }
+
+    fn on_cleaned(&mut self, project: &ProjectInfo, size: u64) {
+        if self.verbose {
+            println!(
+                "✓ Cleaned {} (freed {})",
+                project.cleanable_dir.display(),
+                format_size(size)
+            );
+        }
+        self.inc();
+    }
+
+    fn on_failed(&mut self, project: &ProjectInfo, error: &anyhow::Error) {
+        let error_msg = format!(
+            "Failed to clean {}: {}",
+            project.cleanable_dir.display(),
+            error
+        );
+        if self.verbose {
+            eprintln!("✗ {}", error_msg);
+        }
+        self.inc();
+    }
+
+    fn on_finish(&mut self, result: &CleanResult) {
+        if let Some(progress) = self.progress_bar() {
+            progress.finish_with_message(format!(
+                "Completed: {} cleaned, {} skipped, {} failed, {} freed",
+                result.cleaned_count,
+                result.skipped_count,
+                result.failed_count,
+                format_size(result.bytes_freed)
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
 
     #[test]
     fn test_dry_run() {
         let cleaner = Cleaner::new().dry_run(true);
         assert!(cleaner.options.dry_run);
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: RefCell<Vec<String>>,
+    }
+
+    impl CleanObserver for RecordingObserver {
+        fn on_start(&mut self, total_projects: usize, total_size: u64) {
+            self.events
+                .borrow_mut()
+                .push(format!("start:{total_projects}:{total_size}"));
+        }
+
+        fn on_project(&mut self, project: &ProjectInfo) {
+            self.events
+                .borrow_mut()
+                .push(format!("project:{}", project.cleanable_dir.display()));
+        }
+
+        fn on_skipped_in_use(&mut self, project: &ProjectInfo) {
+            self.events
+                .borrow_mut()
+                .push(format!("skip:{}", project.cleanable_dir.display()));
+        }
+
+        fn on_dry_run(&mut self, project: &ProjectInfo, action: CleanAction) {
+            self.events.borrow_mut().push(format!(
+                "dry_run:{action:?}:{}",
+                project.cleanable_dir.display()
+            ));
+        }
+
+        fn on_cleaned(&mut self, project: &ProjectInfo, size: u64) {
+            self.events.borrow_mut().push(format!(
+                "cleaned:{}:{size}",
+                project.cleanable_dir.display()
+            ));
+        }
+
+        fn on_failed(&mut self, project: &ProjectInfo, error: &anyhow::Error) {
+            self.events.borrow_mut().push(format!(
+                "failed:{}:{error}",
+                project.cleanable_dir.display()
+            ));
+        }
+
+        fn on_finish(&mut self, result: &CleanResult) {
+            self.events.borrow_mut().push(format!(
+                "finish:{}:{}:{}",
+                result.cleaned_count, result.skipped_count, result.failed_count
+            ));
+        }
+    }
+
+    fn project(path: PathBuf, size: u64, in_use: bool) -> ProjectInfo {
+        ProjectInfo {
+            root: path.parent().unwrap_or(path.as_path()).to_path_buf(),
+            project_type: crate::scanner::ProjectType::Rust,
+            project_name: None,
+            category: crate::scanner::Category::Build,
+            risk_level: crate::scanner::RiskLevel::Medium,
+            confidence: crate::scanner::Confidence::High,
+            matched_rule: None,
+            cleanable_dir: path,
+            size,
+            size_calculated: true,
+            last_modified: chrono::Utc::now(),
+            in_use,
+            protected: false,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn test_clean_multiple_with_observer_records_events() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("target");
+        let second = temp.path().join("cache");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        let cleaner = Cleaner::new();
+        let mut observer = RecordingObserver::default();
+        let projects = vec![
+            project(first.clone(), 10, false),
+            project(second.clone(), 20, true),
+        ];
+
+        let result = cleaner
+            .clean_multiple_with_observer(&projects, &mut observer)
+            .unwrap();
+
+        assert_eq!(result.cleaned_count, 1);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.bytes_freed, 10);
+        assert_eq!(result.bytes_skipped, 20);
+        assert!(!first.exists());
+        assert!(second.exists());
+
+        let events = observer.events.borrow().clone();
+        assert_eq!(
+            events,
+            vec![
+                "start:2:30".to_string(),
+                format!("project:{}", first.display()),
+                format!("cleaned:{}:10", first.display()),
+                format!("project:{}", second.display()),
+                format!("skip:{}", second.display()),
+                "finish:1:1:0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_clean_single_with_observer_emits_dry_run() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        let cleaner = Cleaner::new().dry_run(true).trash(true);
+        let mut observer = RecordingObserver::default();
+        let size = cleaner
+            .clean_single_with_observer(&project(target.clone(), 42, false), &mut observer)
+            .unwrap();
+
+        assert_eq!(size, 42);
+        assert!(target.exists());
+        assert_eq!(
+            observer.events.borrow().clone(),
+            vec![
+                "start:1:42".to_string(),
+                format!("project:{}", target.display()),
+                format!("dry_run:{:?}:{}", CleanAction::Trash, target.display()),
+                "finish:1:0:0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_clean_single_with_observer_emits_cleaned_and_finish() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        let cleaner = Cleaner::new();
+        let mut observer = RecordingObserver::default();
+        let size = cleaner
+            .clean_single_with_observer(&project(target.clone(), 24, false), &mut observer)
+            .unwrap();
+
+        assert_eq!(size, 24);
+        assert!(!target.exists());
+        assert_eq!(
+            observer.events.borrow().clone(),
+            vec![
+                "start:1:24".to_string(),
+                format!("project:{}", target.display()),
+                format!("cleaned:{}:24", target.display()),
+                "finish:1:0:0".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_clean_single_with_observer_emits_failed_and_finish() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("not-a-dir");
+        fs::write(&target, "content").unwrap();
+
+        let cleaner = Cleaner::new();
+        let mut observer = RecordingObserver::default();
+        let result =
+            cleaner.clean_single_with_observer(&project(target.clone(), 11, false), &mut observer);
+
+        assert!(result.is_err());
+        let events = observer.events.borrow().clone();
+        assert_eq!(events[0], "start:1:11");
+        assert_eq!(events[1], format!("project:{}", target.display()));
+        assert!(events[2].starts_with(&format!("failed:{}:", target.display())));
+        assert_eq!(events[3], "finish:0:0:1");
     }
 }

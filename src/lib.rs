@@ -1,7 +1,9 @@
+pub mod app;
 pub mod audit;
 pub mod cleaner;
 pub mod cli;
 pub mod config;
+pub mod evaluation;
 pub mod interactive;
 pub mod metrics;
 pub mod plan;
@@ -16,6 +18,7 @@ pub mod utils;
 // Re-export commonly used types
 pub use cleaner::Cleaner;
 pub use config::Config;
+pub use evaluation::{EvaluatedProject, SafetyFlags, SelectionReason, SkipReason};
 pub use plan::CleanupPlan;
 pub use scanner::{ProjectInfo, ProjectType, Scanner};
 pub use stats::Statistics;

@@ -1,10 +1,21 @@
+use super::emit_perf_trace;
 use crate::ProjectInfo;
 use anyhow::Result;
 use crossbeam::channel::Sender;
 use rayon::prelude::*;
+use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Serialize)]
+struct SizeCalculationTrace {
+    mode: &'static str,
+    projects: usize,
+    completed: usize,
+    elapsed_ms: u128,
+    timeout_secs: u64,
+}
 
 /// Size calculator for parallel and streaming directory size computation
 pub struct SizeCalculator {
@@ -40,33 +51,60 @@ impl SizeCalculator {
         mut projects: Vec<ProjectInfo>,
         tx: Sender<ProjectInfo>,
     ) -> usize {
+        let total_projects = projects.len();
+        let started = Instant::now();
         let timeout = Duration::from_secs(self.timeout_secs);
         let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // Process in parallel using rayon
         projects.par_iter_mut().for_each(|project| {
-            // Calculate size with timeout protection
-            match calculate_dir_size_with_timeout(&project.cleanable_dir, timeout) {
-                Ok(size) => {
-                    project.size = size;
-                    project.size_calculated = true;
-                    completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let finished = calculate_project_size(project, timeout);
+            if finished {
+                completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
 
-                    // Send completed project through channel
-                    // Ignore errors if receiver is dropped
-                    let _ = tx.send(project.clone());
-                }
-                Err(_) => {
-                    // On timeout or error, mark as calculated with size 0
-                    // This prevents infinite waiting
-                    project.size = 0;
-                    project.size_calculated = true;
-                    let _ = tx.send(project.clone());
-                }
+            // Ignore errors if receiver is dropped.
+            let _ = tx.send(project.clone());
+        });
+
+        let completed = completed.load(std::sync::atomic::Ordering::Relaxed);
+        emit_perf_trace(
+            "size_calculation",
+            &SizeCalculationTrace {
+                mode: "streaming",
+                projects: total_projects,
+                completed,
+                elapsed_ms: started.elapsed().as_millis(),
+                timeout_secs: self.timeout_secs,
+            },
+        );
+        completed
+    }
+
+    /// Calculate sizes for projects in parallel and return the updated list.
+    pub fn calculate_batch(&self, mut projects: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
+        let total_projects = projects.len();
+        let started = Instant::now();
+        let timeout = Duration::from_secs(self.timeout_secs);
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        projects.par_iter_mut().for_each(|project| {
+            if calculate_project_size(project, timeout) {
+                completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
 
-        completed.load(std::sync::atomic::Ordering::Relaxed)
+        emit_perf_trace(
+            "size_calculation",
+            &SizeCalculationTrace {
+                mode: "batch",
+                projects: total_projects,
+                completed: completed.load(std::sync::atomic::Ordering::Relaxed),
+                elapsed_ms: started.elapsed().as_millis(),
+                timeout_secs: self.timeout_secs,
+            },
+        );
+
+        projects
     }
 
     /// Calculate size for a single project
@@ -85,6 +123,22 @@ impl SizeCalculator {
 impl Default for SizeCalculator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn calculate_project_size(project: &mut ProjectInfo, timeout: Duration) -> bool {
+    match calculate_dir_size_with_timeout(&project.cleanable_dir, timeout) {
+        Ok(size) => {
+            project.size = size;
+            project.size_calculated = true;
+            true
+        }
+        Err(_) => {
+            // Preserve the "unknown size" state so batch callers do not mistake failures for 0 B.
+            project.size = 0;
+            project.size_calculated = false;
+            false
+        }
     }
 }
 
@@ -200,19 +254,43 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_calculation() {
+        let temp = TempDir::new().unwrap();
+        let mut projects = vec![];
+
+        for i in 0..3 {
+            let dir = temp.path().join(format!("batch{}", i));
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("file.txt"), "content").unwrap();
+
+            projects.push(ProjectInfo::new_pending(
+                dir.clone(),
+                ProjectType::NodeJs,
+                dir,
+                Utc::now(),
+                false,
+            ));
+        }
+
+        let calculator = SizeCalculator::new();
+        let results = calculator.calculate_batch(projects);
+
+        assert_eq!(results.len(), 3);
+        for project in results {
+            assert!(project.size_calculated);
+            assert!(project.size > 0);
+        }
+    }
+
+    #[test]
     fn test_calculate_single_timeout_zero() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path().join("timeout-dir");
         fs::create_dir(&dir).unwrap();
         fs::write(dir.join("file.txt"), "content").unwrap();
 
-        let mut project = ProjectInfo::new_pending(
-            dir.clone(),
-            ProjectType::NodeJs,
-            dir,
-            Utc::now(),
-            false,
-        );
+        let mut project =
+            ProjectInfo::new_pending(dir.clone(), ProjectType::NodeJs, dir, Utc::now(), false);
 
         let calculator = SizeCalculator::with_timeout(0);
         let result = calculator.calculate_single(&mut project);
@@ -247,7 +325,7 @@ mod tests {
         assert_eq!(completed, 0);
         assert_eq!(results.len(), expected_len);
         for project in results {
-            assert!(project.size_calculated);
+            assert!(!project.size_calculated);
             assert_eq!(project.size, 0);
         }
     }

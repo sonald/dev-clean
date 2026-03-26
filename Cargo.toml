@@ -48,4 +48,9 @@ dirs = "5.0"
 fs2 = "0.4"
 
 [dev-dependencies]
+criterion = "0.5"
 tempfile = "3.9"
+
+[[bench]]
+name = "scan_baselines"
+harness = false

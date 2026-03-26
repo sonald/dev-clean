@@ -1,7 +1,11 @@
+use crate::app::{
+    ApplyPlanRequest, ApplyPlanService, BlockedSummary as AppBlockedSummary, CleanupRequest,
+    CleanupService, EvaluatedProject as AppEvaluatedProject, ScanRequest, ScanService,
+    VisibilityOptions,
+};
 use crate::audit::AuditLogger;
 use crate::cleaner::CleanOptions;
 use crate::interactive::{ProjectSelector, SelectorOptions};
-use crate::policy::KeepPolicy;
 use crate::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
 use crate::scanner::{Category, ProjectDetector, RiskLevel};
 use crate::trash::{
@@ -9,7 +13,7 @@ use crate::trash::{
     restore_batch, trash_entries_for_batch,
 };
 use crate::utils::{format_size, parse_size};
-use crate::{Cleaner, CleanupPlan, Config, ProjectInfo, Scanner};
+use crate::{Cleaner, CleanupPlan, Config, ProjectInfo};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
@@ -20,7 +24,7 @@ use crossterm::{
 use serde_json::json;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "dev-cleaner")]
@@ -849,162 +853,53 @@ impl Cli {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ResolvedScanInput {
-    roots: Vec<PathBuf>,
-    depth: Option<usize>,
-    min_size_mb: Option<u64>,
-    older_than: Option<i64>,
-    gitignore: Option<bool>,
-    category: Option<Category>,
-    max_risk: Option<RiskLevel>,
+#[cfg(test)]
+fn canonicalize_lossy(path: &std::path::Path) -> PathBuf {
+    crate::app::canonicalize_lossy(path)
 }
 
-impl ResolvedScanInput {
-    fn from_path(path: PathBuf) -> Self {
-        Self {
-            roots: vec![path],
-            depth: None,
-            min_size_mb: None,
-            older_than: None,
-            gitignore: None,
-            category: None,
-            max_risk: None,
-        }
-    }
-
-    fn from_profile(profile: &crate::config::ScanProfile) -> Self {
-        Self {
-            roots: profile.paths.clone(),
-            depth: profile.depth,
-            min_size_mb: profile.min_size_mb,
-            older_than: profile.max_age_days,
-            gitignore: profile.gitignore,
-            category: profile.category,
-            max_risk: profile.max_risk,
-        }
-    }
+#[cfg(test)]
+fn derive_scan_root(roots: &[PathBuf]) -> PathBuf {
+    crate::app::derive_scan_root(roots)
 }
 
-fn resolve_scan_inputs(
+fn build_scan_request(
     path: Option<PathBuf>,
     profile: Option<&str>,
-    config: &Config,
-) -> Result<ResolvedScanInput> {
-    match (path, profile) {
-        (Some(_), Some(_)) => anyhow::bail!("Use either [PATH] or --profile, not both"),
-        (None, Some(name)) => {
-            let p = config
-                .scan_profiles
-                .get(name)
-                .with_context(|| format!("Profile `{}` not found", name))?;
-            if p.paths.is_empty() {
-                anyhow::bail!("Profile `{}` has no paths", name);
-            }
-            Ok(ResolvedScanInput::from_profile(p))
-        }
-        (Some(path), None) => Ok(ResolvedScanInput::from_path(path)),
-        (None, None) => Ok(ResolvedScanInput::from_path(PathBuf::from("."))),
-    }
-}
-
-fn canonicalize_lossy(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
-    let first = paths.first()?;
-    let mut ancestor = canonicalize_lossy(first);
-
-    for path in &paths[1..] {
-        let candidate = canonicalize_lossy(path);
-        while !candidate.starts_with(&ancestor) {
-            if !ancestor.pop() {
-                return None;
-            }
-        }
-    }
-
-    Some(ancestor)
-}
-
-fn derive_scan_root(roots: &[PathBuf]) -> PathBuf {
-    match roots.len() {
-        0 => PathBuf::from("."),
-        1 => canonicalize_lossy(&roots[0]),
-        _ => common_ancestor(roots).unwrap_or_else(|| canonicalize_lossy(&roots[0])),
-    }
-}
-
-fn enrich_project_flags(projects: &mut [ProjectInfo], keep_policy: &KeepPolicy, recent_days: i64) {
-    for project in projects {
-        let decision = keep_policy.evaluate(project);
-        project.protected = decision.protected;
-        project.protected_by = decision.reason;
-        project.recent = project.days_since_modified() < recent_days;
-    }
-}
-
-fn filter_by_visibility(
-    projects: Vec<ProjectInfo>,
-    include_protected: bool,
-    include_recent: bool,
-) -> Vec<ProjectInfo> {
-    projects
-        .into_iter()
-        .filter(|p| (include_protected || !p.protected) && (include_recent || !p.recent))
-        .collect()
-}
-
-fn deduplicate_projects(projects: Vec<ProjectInfo>) -> Vec<ProjectInfo> {
-    use std::collections::HashSet;
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for project in projects {
-        if seen.insert(project.cleanable_dir.clone()) {
-            out.push(project);
-        }
-    }
-    out
-}
-
-fn scan_projects_for_roots(
-    roots: &[PathBuf],
     depth: Option<usize>,
     min_size_mb: Option<u64>,
     older_than: Option<i64>,
     gitignore: bool,
-    category: Option<Category>,
-    max_risk: RiskLevel,
-    config: &Config,
-) -> Result<Vec<ProjectInfo>> {
-    let mut all = Vec::new();
-    for root in roots {
-        let mut scanner = Scanner::new(root)
-            .exclude_dirs(&config.exclude_dirs)
-            .custom_patterns(&config.custom_patterns)
-            .max_risk(max_risk);
-
-        if let Some(category) = category {
-            scanner = scanner.category(category);
-        }
-        if let Some(depth) = depth {
-            scanner = scanner.max_depth(depth);
-        }
-        if let Some(min_size_mb) = min_size_mb {
-            scanner = scanner.min_size(min_size_mb * 1024 * 1024);
-        }
-        if let Some(older_than) = older_than {
-            scanner = scanner.max_age_days(older_than);
-        }
-        scanner = scanner.respect_gitignore(gitignore);
-        let mut projects = scanner.scan()?;
-        all.append(&mut projects);
+    category: CategoryFilterArg,
+    max_risk: RiskArg,
+    include_protected: bool,
+    include_recent: bool,
+    recent_days: i64,
+) -> ScanRequest {
+    ScanRequest {
+        path,
+        profile: profile.map(str::to_owned),
+        depth,
+        min_size_mb,
+        older_than_days: older_than,
+        gitignore: gitignore.then_some(true),
+        category: category.to_filter(),
+        max_risk: (!matches!(max_risk, RiskArg::Medium)).then_some(max_risk.to_max_risk()),
+        visibility: VisibilityOptions {
+            include_protected,
+            include_recent,
+            recent_days,
+        },
     }
+}
 
-    let mut deduped = deduplicate_projects(all);
-    deduped.sort_by(|a, b| b.size.cmp(&a.size));
-    Ok(deduped)
+fn project_infos_from_evaluated(projects: Vec<AppEvaluatedProject>) -> Vec<ProjectInfo> {
+    let mut projects = projects
+        .into_iter()
+        .map(ProjectInfo::from)
+        .collect::<Vec<_>>();
+    projects.sort_by(|a, b| b.size.cmp(&a.size));
+    projects
 }
 
 fn run_scan(
@@ -1025,58 +920,32 @@ fn run_scan(
 ) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
 
-    let resolved = resolve_scan_inputs(path, profile, config)?;
-    let depth = depth.or(resolved.depth).or(config.default_depth);
-    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
-    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
-    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
-    let category = category.to_filter().or(resolved.category);
-    let max_risk = if matches!(max_risk, RiskArg::Medium) {
-        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
-    } else {
-        max_risk.to_max_risk()
-    };
-    let keep_policy = KeepPolicy::from_config(config);
+    let scan_service = ScanService::new();
+    let request = build_scan_request(
+        path,
+        profile,
+        depth,
+        min_size_mb,
+        older_than,
+        gitignore,
+        category,
+        max_risk,
+        include_protected,
+        include_recent,
+        recent_days,
+    );
+    let resolved = scan_service.resolve_inputs(config, &request)?;
 
     if json_output || resolved.roots.len() > 1 {
-        let mut projects = scan_projects_for_roots(
-            &resolved.roots,
-            depth,
-            min_size_mb,
-            older_than,
-            gitignore,
-            category,
-            max_risk,
-            config,
-        )?;
-        enrich_project_flags(&mut projects, &keep_policy, recent_days);
-        projects = filter_by_visibility(projects, include_protected, include_recent);
+        let projects =
+            project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
         println!("{}", serde_json::to_string_pretty(&projects)?);
         return Ok(());
     }
 
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
     let root = resolved.roots[0].clone();
-
-    let mut scanner = Scanner::new(&root)
-        .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns)
-        .max_risk(max_risk);
-    if let Some(category) = category {
-        scanner = scanner.category(category);
-    }
-    if let Some(depth) = depth {
-        scanner = scanner.max_depth(depth);
-    }
-    if let Some(min_size_mb) = min_size_mb {
-        scanner = scanner.min_size(min_size_mb * 1024 * 1024);
-    }
-    if let Some(days) = older_than {
-        scanner = scanner.max_age_days(days);
-    }
-    scanner = scanner.respect_gitignore(gitignore);
-
-    let min_size_bytes = min_size_mb.map(|size_mb| size_mb * 1024 * 1024);
+    let scanner = scan_service.build_scanner(&root, config, &resolved);
     let (total_count, rx) = scanner.scan_with_streaming()?;
     if total_count == 0 {
         println!("{}", "No cleanable directories found.".yellow());
@@ -1098,19 +967,24 @@ fn run_scan(
 
     let mut projects = Vec::new();
     let mut total_size = 0u64;
-    for mut project in rx.iter() {
+    for project in rx.iter() {
         pb.inc(1);
-        if !min_size_bytes.map_or(true, |ms| project.size >= ms) {
+        if !resolved
+            .min_size_bytes
+            .map_or(true, |min_size_bytes| project.size >= min_size_bytes)
+        {
             continue;
         }
 
-        let decision = keep_policy.evaluate(&project);
-        project.protected = decision.protected;
-        project.protected_by = decision.reason;
-        project.recent = project.days_since_modified() < recent_days;
-        if (!include_protected && project.protected) || (!include_recent && project.recent) {
+        let evaluated = scan_service.evaluate_project_with_config(
+            config,
+            project,
+            resolved.visibility.recent_days,
+        );
+        if !resolved.visibility.is_visible(&evaluated) {
             continue;
         }
+        let project = evaluated.into_project_info();
 
         total_size += project.size;
         let dir_display = project.cleanable_dir.display().to_string();
@@ -1191,21 +1065,6 @@ struct BlockedSummary {
 }
 
 impl BlockedSummary {
-    fn note_in_use(&mut self, bytes: u64) {
-        self.in_use_count += 1;
-        self.in_use_bytes = self.in_use_bytes.saturating_add(bytes);
-    }
-
-    fn note_protected(&mut self, bytes: u64) {
-        self.protected_count += 1;
-        self.protected_bytes = self.protected_bytes.saturating_add(bytes);
-    }
-
-    fn note_recent(&mut self, bytes: u64) {
-        self.recent_count += 1;
-        self.recent_bytes = self.recent_bytes.saturating_add(bytes);
-    }
-
     fn total_count(&self) -> usize {
         self.in_use_count + self.protected_count + self.recent_count
     }
@@ -1214,6 +1073,19 @@ impl BlockedSummary {
         self.in_use_bytes
             .saturating_add(self.protected_bytes)
             .saturating_add(self.recent_bytes)
+    }
+}
+
+impl From<AppBlockedSummary> for BlockedSummary {
+    fn from(value: AppBlockedSummary) -> Self {
+        Self {
+            in_use_count: value.in_use_count,
+            in_use_bytes: value.in_use_bytes,
+            protected_count: value.protected_count,
+            protected_bytes: value.protected_bytes,
+            recent_count: value.recent_count,
+            recent_bytes: value.recent_bytes,
+        }
     }
 }
 
@@ -1229,36 +1101,22 @@ fn split_selected_projects_for_clean(
     force: bool,
     force_protected: bool,
 ) -> CleanSelectionSplit {
-    let mut selected = Vec::new();
-    let mut blocked = Vec::new();
-    let mut blocked_summary = BlockedSummary::default();
-
-    for mut project in projects {
-        if project.protected && !force_protected {
-            project.skip_reason = Some("blocked_protected".to_string());
-            blocked_summary.note_protected(project.size);
-            blocked.push(project);
-            continue;
-        }
-        if project.recent && !include_recent {
-            project.skip_reason = Some("blocked_recent".to_string());
-            blocked_summary.note_recent(project.size);
-            blocked.push(project);
-            continue;
-        }
-        if project.in_use && !force {
-            project.skip_reason = Some("blocked_in_use".to_string());
-            blocked_summary.note_in_use(project.size);
-            blocked.push(project);
-            continue;
-        }
-        selected.push(project);
-    }
+    let selection = CleanupService::new().split(
+        projects
+            .into_iter()
+            .map(AppEvaluatedProject::from)
+            .collect::<Vec<_>>(),
+        CleanupRequest {
+            include_recent,
+            force,
+            force_protected,
+        },
+    );
 
     CleanSelectionSplit {
-        selected,
-        blocked,
-        blocked_summary,
+        selected: project_infos_from_evaluated(selection.selected),
+        blocked: project_infos_from_evaluated(selection.blocked),
+        blocked_summary: selection.blocked_summary.into(),
     }
 }
 
@@ -1384,31 +1242,22 @@ fn run_clean(
     config: &Config,
 ) -> Result<()> {
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
-    let resolved = resolve_scan_inputs(path, profile, config)?;
-    let depth = depth.or(resolved.depth).or(config.default_depth);
-    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
-    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
-    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
-    let category = category.to_filter().or(resolved.category);
-    let max_risk = if matches!(max_risk, RiskArg::Medium) {
-        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
-    } else {
-        max_risk.to_max_risk()
-    };
-
-    let mut projects = scan_projects_for_roots(
-        &resolved.roots,
+    let scan_service = ScanService::new();
+    let request = build_scan_request(
+        path,
+        profile,
         depth,
         min_size_mb,
         older_than,
         gitignore,
         category,
         max_risk,
-        config,
-    )?;
-    let keep_policy = KeepPolicy::from_config(config);
-    enrich_project_flags(&mut projects, &keep_policy, recent_days);
-    projects = filter_by_visibility(projects, include_protected, include_recent);
+        include_protected,
+        include_recent,
+        recent_days,
+    );
+    let mut projects =
+        project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
 
     if projects.is_empty() {
         println!("{}", "No cleanable directories found.".yellow());
@@ -1733,31 +1582,22 @@ fn run_stats(
     use crate::Statistics;
 
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
-    let resolved = resolve_scan_inputs(path, profile, config)?;
-    let depth = depth.or(resolved.depth).or(config.default_depth);
-    let min_size_mb = resolved.min_size_mb.or(config.min_size_mb);
-    let older_than = resolved.older_than.or(config.max_age_days);
-    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
-    let category = category.to_filter().or(resolved.category);
-    let max_risk = if matches!(max_risk, RiskArg::Medium) {
-        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
-    } else {
-        max_risk.to_max_risk()
-    };
-    let keep_policy = KeepPolicy::from_config(config);
-
-    let mut projects = scan_projects_for_roots(
-        &resolved.roots,
+    let scan_service = ScanService::new();
+    let request = build_scan_request(
+        path,
+        profile,
         depth,
-        min_size_mb,
-        older_than,
+        None,
+        None,
         gitignore,
         category,
         max_risk,
-        config,
-    )?;
-    enrich_project_flags(&mut projects, &keep_policy, recent_days);
-    projects = filter_by_visibility(projects, include_protected, include_recent);
+        include_protected,
+        include_recent,
+        recent_days,
+    );
+    let projects =
+        project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
 
     if projects.is_empty() {
         println!("{}", "No cleanable directories found.".yellow());
@@ -1813,33 +1653,25 @@ fn run_plan(
     recent_days: i64,
     config: &Config,
 ) -> Result<()> {
-    let resolved = resolve_scan_inputs(path, profile, config)?;
-    let depth = depth.or(resolved.depth).or(config.default_depth);
-    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
-    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
-    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
-    let category_filter = category.to_filter().or(resolved.category);
-    let max_risk_level = if matches!(max_risk, RiskArg::Medium) {
-        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
-    } else {
-        max_risk.to_max_risk()
-    };
-
-    let scan_root = derive_scan_root(&resolved.roots);
-
-    let keep_policy = KeepPolicy::from_config(config);
-    let mut projects = scan_projects_for_roots(
-        &resolved.roots,
+    let scan_service = ScanService::new();
+    let request = build_scan_request(
+        path,
+        profile,
         depth,
         min_size_mb,
         older_than,
         gitignore,
-        category_filter,
-        max_risk_level,
-        config,
-    )?;
-    enrich_project_flags(&mut projects, &keep_policy, recent_days);
-    projects = filter_by_visibility(projects, include_protected, include_recent);
+        category,
+        max_risk,
+        include_protected,
+        include_recent,
+        recent_days,
+    );
+    let discovered = scan_service.discover_visible(config, &request)?;
+    let scan_root = discovered.resolved.scan_root.clone();
+    let category_filter = discovered.resolved.category;
+    let max_risk_level = discovered.resolved.max_risk;
+    let projects = project_infos_from_evaluated(discovered.projects);
 
     let mut params = crate::plan::PlanParams::default();
     params.max_risk = Some(max_risk_level);
@@ -1885,18 +1717,24 @@ fn run_recommend(
 ) -> Result<()> {
     use serde::Serialize;
 
-    let resolved = resolve_scan_inputs(path, profile, config)?;
-    let scan_root = derive_scan_root(&resolved.roots);
-    let depth = depth.or(resolved.depth).or(config.default_depth);
-    let min_size_mb = min_size_mb.or(resolved.min_size_mb).or(config.min_size_mb);
-    let older_than = older_than.or(resolved.older_than).or(config.max_age_days);
-    let gitignore = gitignore || resolved.gitignore.unwrap_or(false);
-    let category = category.to_filter().or(resolved.category);
-    let max_risk = if matches!(max_risk, RiskArg::Medium) {
-        resolved.max_risk.unwrap_or(max_risk.to_max_risk())
-    } else {
-        max_risk.to_max_risk()
-    };
+    let scan_service = ScanService::new();
+    let request = build_scan_request(
+        path,
+        profile,
+        depth,
+        min_size_mb,
+        older_than,
+        gitignore,
+        category,
+        max_risk,
+        false,
+        false,
+        recent_days,
+    );
+    let discovered = scan_service.discover(config, &request)?;
+    let scan_root = discovered.resolved.scan_root.clone();
+    let category = discovered.resolved.category;
+    let max_risk = discovered.resolved.max_risk;
 
     let cleanup_bytes = cleanup.as_deref().map(parse_size).transpose()?;
     let free_at_least_bytes = free_at_least.as_deref().map(parse_size).transpose()?;
@@ -1916,18 +1754,7 @@ fn run_recommend(
         }
     };
 
-    let keep_policy = KeepPolicy::from_config(config);
-    let mut projects = scan_projects_for_roots(
-        &resolved.roots,
-        depth,
-        min_size_mb,
-        older_than,
-        gitignore,
-        category,
-        max_risk,
-        config,
-    )?;
-    enrich_project_flags(&mut projects, &keep_policy, recent_days);
+    let projects = project_infos_from_evaluated(discovered.projects);
 
     let mut opts = RecommendOptions::new(target_bytes);
     opts.include_in_use = include_in_use;
@@ -2061,161 +1888,37 @@ fn run_apply(
     config: &Config,
 ) -> Result<()> {
     let plan = CleanupPlan::load_json(&plan_path)?;
-
-    if plan.schema_version != 1 && plan.schema_version != 2 && plan.schema_version != 3 {
-        anyhow::bail!("Unsupported plan schema_version: {}", plan.schema_version);
-    }
     let audit = AuditLogger::from_config(config);
     let run_id = audit.start_run("apply").ok();
+    let apply_result = ApplyPlanService::new().verify(
+        config,
+        ApplyPlanRequest {
+            plan,
+            no_verify,
+            include_recent,
+            force,
+            force_protected,
+            recent_days,
+        },
+    )?;
+    let verified_projects = project_infos_from_evaluated(apply_result.verified_projects.clone());
+    let skipped_pre = apply_result.skipped_pre_count;
+    let skipped_pre_bytes = apply_result.skipped_pre_bytes;
+    let verify_blocked: BlockedSummary = apply_result.verification_blocked.into();
 
-    let keep_policy = KeepPolicy::from_config(config);
-    let params_max_risk = plan.params.as_ref().and_then(|p| p.max_risk);
-    let params_category = plan.params.as_ref().and_then(|p| p.category);
-    let scan_root = plan.scan_root.clone();
-    let scan_root_is_absolute = scan_root.is_absolute();
-    let mut scanner_cache: std::collections::HashMap<PathBuf, Scanner> =
-        std::collections::HashMap::new();
-
-    let mut verified_projects = Vec::new();
-    let mut skipped_pre = 0usize;
-    let mut skipped_pre_bytes = 0u64;
-    let mut verify_blocked = BlockedSummary::default();
-    for project in &plan.projects {
-        let cleanable_dir = canonicalize_lossy(&project.cleanable_dir);
-        let project_root = canonicalize_lossy(&project.root);
-
-        if !cleanable_dir.starts_with(&project_root) {
-            skipped_pre += 1;
-            skipped_pre_bytes = skipped_pre_bytes.saturating_add(project.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "apply",
-                    &project.cleanable_dir,
-                    "verify",
-                    "skipped",
-                    project.size,
-                    Some("outside_project_root".to_string()),
-                );
-            }
-            continue;
+    if let Some(run_id) = &run_id {
+        for project in &apply_result.skipped_projects {
+            let skipped = project.to_project_info();
+            let _ = audit.log_item(
+                run_id,
+                "apply",
+                &skipped.cleanable_dir,
+                "verify",
+                "skipped",
+                skipped.size,
+                skipped.skip_reason.clone(),
+            );
         }
-
-        if scan_root_is_absolute && !cleanable_dir.starts_with(&scan_root) {
-            skipped_pre += 1;
-            skipped_pre_bytes = skipped_pre_bytes.saturating_add(project.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "apply",
-                    &project.cleanable_dir,
-                    "verify",
-                    "skipped",
-                    project.size,
-                    Some("outside_scan_root".to_string()),
-                );
-            }
-            continue;
-        }
-
-        let mut candidate = if no_verify {
-            let mut p = project.clone();
-            p.root = project_root.clone();
-            p.cleanable_dir = cleanable_dir.clone();
-            p
-        } else {
-            let scanner = scanner_cache
-                .entry(project_root.clone())
-                .or_insert_with(|| {
-                    let mut scanner = Scanner::new(&project_root)
-                        .exclude_dirs(&config.exclude_dirs)
-                        .custom_patterns(&config.custom_patterns);
-                    if let Some(max_risk) = params_max_risk {
-                        scanner = scanner.max_risk(max_risk);
-                    }
-                    if let Some(category) = params_category {
-                        scanner = scanner.category(category);
-                    }
-                    scanner
-                });
-            match scanner.revalidate_target(&cleanable_dir) {
-                Some(info) => info,
-                None => {
-                    skipped_pre += 1;
-                    skipped_pre_bytes = skipped_pre_bytes.saturating_add(project.size);
-                    if let Some(run_id) = &run_id {
-                        let _ = audit.log_item(
-                            run_id,
-                            "apply",
-                            &project.cleanable_dir,
-                            "verify",
-                            "skipped",
-                            project.size,
-                            Some("rule_mismatch_or_missing".to_string()),
-                        );
-                    }
-                    continue;
-                }
-            }
-        };
-
-        let decision = keep_policy.evaluate(&candidate);
-        candidate.protected = decision.protected;
-        candidate.protected_by = decision.reason;
-        candidate.recent = candidate.days_since_modified() < recent_days;
-
-        if candidate.protected && !force_protected {
-            skipped_pre += 1;
-            skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
-            verify_blocked.note_protected(candidate.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "apply",
-                    &candidate.cleanable_dir,
-                    "verify",
-                    "skipped",
-                    candidate.size,
-                    Some("blocked_protected".to_string()),
-                );
-            }
-            continue;
-        }
-        if candidate.recent && !include_recent {
-            skipped_pre += 1;
-            skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
-            verify_blocked.note_recent(candidate.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "apply",
-                    &candidate.cleanable_dir,
-                    "verify",
-                    "skipped",
-                    candidate.size,
-                    Some("blocked_recent".to_string()),
-                );
-            }
-            continue;
-        }
-        if candidate.in_use && !force {
-            skipped_pre += 1;
-            skipped_pre_bytes = skipped_pre_bytes.saturating_add(candidate.size);
-            verify_blocked.note_in_use(candidate.size);
-            if let Some(run_id) = &run_id {
-                let _ = audit.log_item(
-                    run_id,
-                    "apply",
-                    &candidate.cleanable_dir,
-                    "verify",
-                    "skipped",
-                    candidate.size,
-                    Some("blocked_in_use".to_string()),
-                );
-            }
-            continue;
-        }
-        verified_projects.push(candidate);
     }
 
     let total_size: u64 = verified_projects.iter().map(|p| p.size).sum();
@@ -2820,27 +2523,22 @@ fn run_tui(
     recent_days: i64,
     config: &Config,
 ) -> Result<()> {
-    let resolved = resolve_scan_inputs(path, profile, config)?;
-    let depth = resolved.depth.or(config.default_depth);
-    let min_size_mb = resolved.min_size_mb.or(config.min_size_mb);
-    let older_than = resolved.older_than.or(config.max_age_days);
-    let gitignore = resolved.gitignore.unwrap_or(false);
-    let category = resolved.category;
-    let max_risk = resolved.max_risk.unwrap_or(RiskLevel::Medium);
-    let keep_policy = KeepPolicy::from_config(config);
-
-    let mut projects = scan_projects_for_roots(
-        &resolved.roots,
-        depth,
-        min_size_mb,
-        older_than,
-        gitignore,
-        category,
-        max_risk,
-        config,
-    )?;
-    enrich_project_flags(&mut projects, &keep_policy, recent_days);
-    projects = filter_by_visibility(projects, include_protected, include_recent);
+    let scan_service = ScanService::new();
+    let request = build_scan_request(
+        path,
+        profile,
+        None,
+        None,
+        None,
+        false,
+        CategoryFilterArg::All,
+        RiskArg::Medium,
+        include_protected,
+        include_recent,
+        recent_days,
+    );
+    let projects =
+        project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
     crate::tui::run_tui_projects(projects, include_recent, include_protected, recent_days)
 }
 
@@ -3052,6 +2750,77 @@ mod tests {
 
         assert!(has_attempted);
         assert!(!has_outside_scan_root);
+    }
+
+    #[test]
+    fn run_apply_logs_verify_skips_before_early_return() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("app");
+        let cleanable_dir = temp.path().join("outside").join("target");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&cleanable_dir).unwrap();
+        fs::write(cleanable_dir.join("artifact.bin"), "x").unwrap();
+
+        let plan_path = temp.path().join("plan.json");
+        let plan = CleanupPlan {
+            schema_version: 3,
+            tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            created_at: Utc::now(),
+            scan_root: project_root.clone(),
+            params: Some(crate::plan::PlanParams::default()),
+            projects: vec![ProjectInfo {
+                root: project_root,
+                project_type: ProjectType::Rust,
+                project_name: None,
+                category: Category::Build,
+                risk_level: RiskLevel::Medium,
+                confidence: Confidence::High,
+                matched_rule: None,
+                cleanable_dir,
+                size: 1,
+                size_calculated: true,
+                last_modified: Utc::now(),
+                in_use: false,
+                protected: false,
+                protected_by: None,
+                recent: false,
+                selection_reason: None,
+                skip_reason: None,
+            }],
+        };
+        plan.save_json(&plan_path).unwrap();
+
+        let mut config = Config::default();
+        let audit_path = temp.path().join("operations.jsonl");
+        config.audit.enabled = true;
+        config.audit.path = Some(audit_path);
+
+        run_apply(
+            plan_path, false, true, false, true, false, false, 7, false, &config,
+        )
+        .unwrap();
+
+        let records = AuditLogger::from_config(&config).read_records().unwrap();
+        let mut has_verify_skip = false;
+
+        for record in records {
+            if let AuditRecord::ItemAction {
+                action,
+                result,
+                reason,
+                ..
+            } = record
+            {
+                if action == "verify"
+                    && result == "skipped"
+                    && reason.as_deref() == Some("outside_project_root")
+                {
+                    has_verify_skip = true;
+                }
+            }
+        }
+
+        assert!(has_verify_skip);
     }
 
     #[test]
