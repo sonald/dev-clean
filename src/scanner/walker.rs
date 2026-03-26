@@ -1104,6 +1104,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn snapshot(results: &[ProjectInfo]) -> Vec<(String, u64, String, String, String)> {
@@ -1121,6 +1122,13 @@ mod tests {
             .collect::<Vec<_>>();
         snapshot.sort();
         snapshot
+    }
+
+    fn make_node_project(root: &Path, name: &str) -> PathBuf {
+        let project_root = root.join(name);
+        fs::create_dir_all(project_root.join("node_modules")).unwrap();
+        fs::write(project_root.join("package.json"), "{}").unwrap();
+        project_root
     }
 
     #[test]
@@ -1389,6 +1397,88 @@ mod tests {
     }
 
     #[test]
+    fn test_scanner_respect_gitignore_skips_gitignored_dirs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let project_root = make_node_project(root, "project");
+        fs::write(project_root.join(".gitignore"), "node_modules/\n").unwrap();
+        let status = Command::new("git")
+            .args(["init", "-q", root.to_str().unwrap()])
+            .status()
+            .expect("failed to run git init");
+        assert!(status.success());
+
+        let scanner = Scanner::new(root);
+        assert_eq!(scanner.scan().unwrap().len(), 1);
+
+        let scanner = Scanner::new(root).respect_gitignore(true);
+        assert!(scanner.scan().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_scanner_max_depth_prunes_nested_targets() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let project_root = root.join("project");
+        let deep_target = project_root.join("nested").join("node_modules");
+        fs::create_dir_all(&deep_target).unwrap();
+        fs::write(project_root.join("package.json"), "{}").unwrap();
+
+        let scanner = Scanner::new(root);
+        assert_eq!(scanner.scan().unwrap().len(), 1);
+
+        let scanner = Scanner::new(root).max_depth(1);
+        assert!(scanner.scan().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_scanner_max_risk_and_category_filters() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let project_root = root.join("project");
+        let build_dir = project_root.join("build");
+        let deps_dir = project_root.join("node_modules");
+        let gitignore_dir = project_root.join("custom-cache");
+        fs::create_dir_all(&build_dir).unwrap();
+        fs::create_dir_all(&deps_dir).unwrap();
+        fs::create_dir_all(&gitignore_dir).unwrap();
+        fs::write(project_root.join("package.json"), "{}").unwrap();
+        fs::write(project_root.join(".gitignore"), "custom-cache/\n").unwrap();
+        fs::write(build_dir.join("artifact.txt"), "x").unwrap();
+        fs::write(deps_dir.join("artifact.txt"), "x").unwrap();
+        fs::write(gitignore_dir.join("artifact.txt"), "x").unwrap();
+
+        let medium = Scanner::new(root).max_risk(RiskLevel::Medium);
+        let medium_results = medium.scan().unwrap();
+        assert_eq!(medium_results.len(), 1);
+        assert_eq!(medium_results[0].category, Category::Build);
+        assert_eq!(medium_results[0].cleanable_dir, build_dir);
+
+        let high = Scanner::new(root).max_risk(RiskLevel::High);
+        let high_results = high.scan().unwrap();
+        assert_eq!(high_results.len(), 3);
+        assert!(high_results.iter().any(|p| p.cleanable_dir == build_dir));
+        assert!(high_results.iter().any(|p| p.cleanable_dir == deps_dir));
+        assert!(high_results
+            .iter()
+            .any(|p| p.cleanable_dir == gitignore_dir));
+
+        let build_only = Scanner::new(root)
+            .max_risk(RiskLevel::High)
+            .category(Category::Build);
+        let build_only_results = build_only.scan().unwrap();
+        assert_eq!(build_only_results.len(), 1);
+        assert_eq!(build_only_results[0].cleanable_dir, build_dir);
+
+        let deps_only = Scanner::new(root)
+            .max_risk(RiskLevel::High)
+            .category(Category::Deps);
+        let deps_only_results = deps_only.scan().unwrap();
+        assert_eq!(deps_only_results.len(), 1);
+        assert_eq!(deps_only_results[0].cleanable_dir, deps_dir);
+    }
+
+    #[test]
     fn test_deduplicate_nested_dirs_keeps_topmost_path() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().to_path_buf();
@@ -1414,6 +1504,24 @@ mod tests {
         assert!(deduped_paths.contains(&parent));
         assert!(deduped_paths.contains(&sibling));
         assert!(!deduped_paths.contains(&child));
+    }
+
+    #[test]
+    fn test_revalidate_target_returns_only_current_matches() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let project_root = make_node_project(root, "project");
+        let target = project_root.join("node_modules");
+        let scanner = Scanner::new(root).max_risk(RiskLevel::High);
+
+        assert!(scanner.revalidate_target(&target).is_some());
+        assert!(scanner
+            .revalidate_target(project_root.join("package.json"))
+            .is_none());
+
+        fs::remove_file(project_root.join("package.json")).unwrap();
+        let fresh_scanner = Scanner::new(root).max_risk(RiskLevel::High);
+        assert!(fresh_scanner.revalidate_target(&target).is_none());
     }
 
     #[test]

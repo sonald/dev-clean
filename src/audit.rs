@@ -363,6 +363,7 @@ fn csv_escape(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use tempfile::TempDir;
 
     #[test]
@@ -387,5 +388,123 @@ mod tests {
         let runs = logger.list_runs().unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, run);
+    }
+
+    #[test]
+    fn disabled_logger_is_a_noop() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("operations.jsonl");
+        let logger = AuditLogger::new(path.clone(), false, 1024 * 1024);
+
+        let run = logger.start_run("clean").unwrap();
+        logger
+            .log_item(
+                &run,
+                "clean",
+                Path::new("/tmp/test"),
+                "remove",
+                "ok",
+                42,
+                None,
+            )
+            .unwrap();
+        logger.finish_run(&run, "clean", 1, 0, 0, 42).unwrap();
+
+        assert!(!path.exists());
+        assert!(logger.read_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_records_ignores_blank_and_invalid_lines() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("operations.jsonl");
+        let content = format!(
+            "\nnot-json\n{}\n\n{}\n",
+            serde_json::to_string(&AuditRecord::RunStarted {
+                run_id: "run-1".to_string(),
+                command: "clean".to_string(),
+                ts: Utc::now().to_rfc3339(),
+            })
+            .unwrap(),
+            serde_json::to_string(&AuditRecord::RunFinished {
+                run_id: "run-1".to_string(),
+                command: "clean".to_string(),
+                ts: Utc::now().to_rfc3339(),
+                cleaned: 1,
+                skipped: 0,
+                failed: 0,
+                freed_bytes: 42,
+            })
+            .unwrap()
+        );
+        fs::write(&path, content).unwrap();
+
+        let logger = AuditLogger::new(path, true, 1024 * 1024);
+        let records = logger.read_records().unwrap();
+        assert_eq!(records.len(), 2);
+
+        let runs = logger.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].run_id, "run-1");
+        assert_eq!(runs[0].cleaned, 1);
+        assert_eq!(runs[0].freed_bytes, 42);
+    }
+
+    #[test]
+    fn export_csv_escapes_special_characters() {
+        let records = vec![
+            AuditRecord::RunStarted {
+                run_id: "run,1".to_string(),
+                command: "cle\"an".to_string(),
+                ts: "2026-01-01T00:00:00Z".to_string(),
+            },
+            AuditRecord::ItemAction {
+                run_id: "run,1".to_string(),
+                command: "cle\"an".to_string(),
+                path: "/tmp/path,with,comma".to_string(),
+                action: "remove".to_string(),
+                result: "ok".to_string(),
+                bytes: 7,
+                reason: Some("needs,\"quote\"".to_string()),
+                ts: "2026-01-01T00:00:01Z".to_string(),
+            },
+            AuditRecord::RunFinished {
+                run_id: "run,1".to_string(),
+                command: "cle\"an".to_string(),
+                ts: "2026-01-01T00:00:02Z".to_string(),
+                cleaned: 1,
+                skipped: 0,
+                failed: 0,
+                freed_bytes: 7,
+            },
+        ];
+
+        let csv = AuditLogger::export_csv(&records);
+        assert!(csv.contains("\"run,1\""));
+        assert!(csv.contains("\"cle\"\"an\""));
+        assert!(csv.contains("\"/tmp/path,with,comma\""));
+        assert!(csv.contains("\"needs,\"\"quote\"\"\""));
+    }
+
+    #[test]
+    fn append_rotates_existing_log_when_too_large() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("operations.jsonl");
+        fs::write(&path, "too-big").unwrap();
+        let logger = AuditLogger::new(path.clone(), true, 1);
+
+        logger
+            .append(&AuditRecord::RunStarted {
+                run_id: "run-rotate".to_string(),
+                command: "clean".to_string(),
+                ts: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+
+        let rotated = path.with_extension("jsonl.old");
+        assert!(rotated.exists());
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(), 1);
     }
 }

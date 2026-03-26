@@ -736,7 +736,50 @@ fn copy_symlink(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
+    use std::io::Write;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    fn make_entry(
+        batch_id: &str,
+        created_at: chrono::DateTime<Utc>,
+        original_path: PathBuf,
+        trashed_path: PathBuf,
+        size: u64,
+    ) -> TrashEntry {
+        TrashEntry {
+            batch_id: batch_id.to_string(),
+            created_at,
+            original_path,
+            trashed_path,
+            size,
+            tool_version: Some("test".to_string()),
+        }
+    }
+
+    fn write_log_lines(log_path: &Path, lines: &[String]) {
+        if let Some(parent) = log_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut file = fs::File::create(log_path).unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    fn write_entries(log_path: &Path, entries: &[TrashEntry]) {
+        let lines = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>();
+        write_log_lines(log_path, &lines);
+    }
+
+    fn create_dir_with_file(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("payload.txt"), "payload").unwrap();
+    }
 
     #[test]
     fn test_trash_and_restore_roundtrip() {
@@ -797,37 +840,605 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_by_keep_bytes() {
+    fn test_load_trash_log_skips_invalid_lines() {
+        let temp = TempDir::new().unwrap();
+        let log_path = temp.path().join(TRASH_LOG_FILENAME);
+        let valid_one = make_entry(
+            "batch-a",
+            Utc::now() - Duration::minutes(10),
+            PathBuf::from("/tmp/a"),
+            PathBuf::from("/trash/a"),
+            5,
+        );
+        let valid_two = make_entry(
+            "batch-b",
+            Utc::now(),
+            PathBuf::from("/tmp/b"),
+            PathBuf::from("/trash/b"),
+            6,
+        );
+        write_log_lines(
+            &log_path,
+            &[
+                serde_json::to_string(&valid_one).unwrap(),
+                String::new(),
+                "{not-json".to_string(),
+                serde_json::to_string(&valid_two).unwrap(),
+            ],
+        );
+
+        let entries = load_trash_log(&log_path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].batch_id, "batch-a");
+        assert_eq!(entries[1].batch_id, "batch-b");
+    }
+
+    #[test]
+    fn test_latest_batch_id_picks_newest_entry() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("trash");
+        let log_path = root.join(TRASH_LOG_FILENAME);
+        let entries = vec![
+            make_entry(
+                "batch-old",
+                Utc::now() - Duration::minutes(5),
+                PathBuf::from("/tmp/a"),
+                PathBuf::from("/trash/a"),
+                5,
+            ),
+            make_entry(
+                "batch-new",
+                Utc::now(),
+                PathBuf::from("/tmp/b"),
+                PathBuf::from("/trash/b"),
+                6,
+            ),
+        ];
+        write_entries(&log_path, &entries);
+
+        let latest = latest_batch_id(&root).unwrap();
+        assert_eq!(latest.as_deref(), Some("batch-new"));
+    }
+
+    #[test]
+    fn test_path_to_trash_relpath_strips_root_separator() {
+        let rel = path_to_trash_relpath(Path::new("/var/tmp/project/target"));
+        assert_eq!(rel, PathBuf::from("var/tmp/project/target"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_move_path_with_exdev_fallback_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        symlink(&src, temp.path().join("src-link")).unwrap();
+
+        let err = move_path_with_exdev_fallback(&temp.path().join("src-link"), &dst)
+            .expect_err("symlink sources must be rejected");
+        assert!(err.to_string().contains("Refusing to move symlink path"));
+    }
+
+    #[test]
+    fn test_restore_batch_reports_missing_batch() {
         let temp = TempDir::new().unwrap();
         let trash_root = temp.path().join("trash");
 
-        // Create two fake batches (dirs + log entries).
-        fs::create_dir_all(trash_root.join("batch1")).unwrap();
-        fs::create_dir_all(trash_root.join("batch2")).unwrap();
+        let result = restore_batch(&trash_root, "missing", false, false, false).unwrap();
+        assert_eq!(result.restored_count, 0);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.errors.len(), 1);
+    }
+
+    #[test]
+    fn test_restore_batch_skips_missing_trashed_path() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let entry = make_entry(
+            "batch-1",
+            Utc::now(),
+            temp.path().join("restore").join("target"),
+            trash_root.join("batch-1").join("restore").join("target"),
+            1,
+        );
+        write_entries(&log_path, &[entry]);
+
+        let result = restore_batch(&trash_root, "batch-1", false, false, false).unwrap();
+        assert_eq!(result.restored_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.failed_count, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_restore_batch_skips_existing_destination_without_force() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let original = temp.path().join("restore").join("target");
+        let trashed = trash_root.join("batch-1").join("restore").join("target");
+        create_dir_with_file(&trashed);
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        fs::write(&original, "existing").unwrap();
+
+        write_entries(
+            &log_path,
+            &[make_entry(
+                "batch-1",
+                Utc::now(),
+                original.clone(),
+                trashed.clone(),
+                1,
+            )],
+        );
+
+        let result = restore_batch(&trash_root, "batch-1", false, false, false).unwrap();
+        assert_eq!(result.restored_count, 0);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.failed_count, 0);
+        assert!(result.errors[0].contains("Restore target already exists"));
+        assert!(original.exists());
+        assert!(trashed.exists());
+    }
+
+    #[test]
+    fn test_restore_batch_force_overwrites_directory_and_file_targets() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let dir_original = temp.path().join("restore").join("dir-target");
+        let file_original = temp.path().join("restore").join("file-target");
+        let dir_trashed = trash_root.join("batch-1").join("dir-target");
+        let file_trashed = trash_root.join("batch-1").join("file-target");
+
+        create_dir_with_file(&dir_trashed);
+        create_dir_with_file(&file_trashed);
+        fs::create_dir_all(&dir_original).unwrap();
+        fs::write(dir_original.join("old.txt"), "old").unwrap();
+        fs::create_dir_all(file_original.parent().unwrap()).unwrap();
+        fs::write(&file_original, "old").unwrap();
+
+        write_entries(
+            &log_path,
+            &[
+                make_entry(
+                    "batch-1",
+                    Utc::now(),
+                    dir_original.clone(),
+                    dir_trashed.clone(),
+                    1,
+                ),
+                make_entry(
+                    "batch-1",
+                    Utc::now(),
+                    file_original.clone(),
+                    file_trashed.clone(),
+                    1,
+                ),
+            ],
+        );
+
+        let result = restore_batch(&trash_root, "batch-1", false, true, false).unwrap();
+        assert_eq!(result.restored_count, 2);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.failed_count, 0);
+        assert!(!dir_trashed.exists());
+        assert!(!file_trashed.exists());
+        assert!(dir_original.join("payload.txt").exists());
+        assert!(file_original.join("payload.txt").exists());
+    }
+
+    #[test]
+    fn test_restore_batch_dry_run_counts_restores_without_mutating() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let original = temp.path().join("restore").join("target");
+        let trashed = trash_root.join("batch-1").join("restore").join("target");
+        create_dir_with_file(&trashed);
+
+        write_entries(
+            &log_path,
+            &[make_entry(
+                "batch-1",
+                Utc::now(),
+                original.clone(),
+                trashed.clone(),
+                1,
+            )],
+        );
+
+        let result = restore_batch(&trash_root, "batch-1", true, false, true).unwrap();
+        assert_eq!(result.restored_count, 1);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.failed_count, 0);
+        assert!(!original.exists());
+        assert!(trashed.exists());
+    }
+
+    #[test]
+    fn test_restore_batch_restores_deeper_paths_first() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let parent_original = temp.path().join("restore").join("project");
+        let child_original = parent_original.join("cache");
+        let parent_trashed = trash_root.join("batch-1").join("project");
+        let child_trashed = trash_root.join("batch-1").join("project").join("cache");
+
+        create_dir_with_file(&parent_trashed);
+        create_dir_with_file(&child_trashed);
+
+        write_entries(
+            &log_path,
+            &[
+                make_entry(
+                    "batch-1",
+                    Utc::now(),
+                    parent_original.clone(),
+                    parent_trashed.clone(),
+                    1,
+                ),
+                make_entry(
+                    "batch-1",
+                    Utc::now(),
+                    child_original.clone(),
+                    child_trashed.clone(),
+                    1,
+                ),
+            ],
+        );
+
+        let result = restore_batch(&trash_root, "batch-1", false, false, false).unwrap();
+        assert_eq!(result.restored_count, 1);
+        assert_eq!(result.skipped_count, 1);
+        assert!(child_original.exists());
+        assert!(parent_trashed.exists());
+        assert!(!child_trashed.exists());
+    }
+
+    #[test]
+    fn test_purge_trash_batch_dry_run_keeps_log_and_files() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let batch_dir = trash_root.join("batch-1");
+        let other_dir = trash_root.join("batch-2");
+        fs::create_dir_all(&batch_dir).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+
+        let entries = vec![
+            make_entry(
+                "batch-1",
+                Utc::now(),
+                PathBuf::from("/tmp/a"),
+                batch_dir.join("a"),
+                5,
+            ),
+            make_entry(
+                "batch-2",
+                Utc::now(),
+                PathBuf::from("/tmp/b"),
+                other_dir.join("b"),
+                6,
+            ),
+        ];
+        write_entries(&log_path, &entries);
+
+        let result = purge_trash_batch(&trash_root, "batch-1", true).unwrap();
+        assert_eq!(result.removed_batches, 1);
+        assert_eq!(result.removed_entries, 1);
+        assert_eq!(result.removed_bytes, 5);
+        assert!(batch_dir.exists());
+        assert_eq!(load_trash_log(&log_path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_purge_trash_batch_unknown_batch_is_a_noop() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let batch_dir = trash_root.join("batch-1");
+        fs::create_dir_all(&batch_dir).unwrap();
+
+        let entries = vec![make_entry(
+            "batch-1",
+            Utc::now(),
+            PathBuf::from("/tmp/a"),
+            batch_dir.join("a"),
+            5,
+        )];
+        write_entries(&log_path, &entries);
+
+        let result = purge_trash_batch(&trash_root, "missing", false).unwrap();
+        assert_eq!(result.removed_batches, 0);
+        assert_eq!(result.removed_entries, 0);
+        assert_eq!(result.removed_bytes, 0);
+        assert_eq!(result.failed_batches, 0);
+        assert!(batch_dir.exists());
+        assert_eq!(load_trash_log(&log_path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_purge_trash_batch_records_removal_failure() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        fs::create_dir_all(&trash_root).unwrap();
+        let batch_path = trash_root.join("batch-1");
+        fs::write(&batch_path, "not a directory").unwrap();
+
+        let entries = vec![make_entry(
+            "batch-1",
+            Utc::now(),
+            PathBuf::from("/tmp/a"),
+            batch_path.join("a"),
+            5,
+        )];
+        write_entries(&log_path, &entries);
+
+        let result = purge_trash_batch(&trash_root, "batch-1", false).unwrap();
+        assert_eq!(result.failed_batches, 1);
+        assert!(result.errors[0].contains("Failed to remove batch dir"));
+        assert_eq!(load_trash_log(&log_path).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_purge_trash_batch_rejects_symlink_paths() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let batch_dir = trash_root.join("batch-1");
+        let target_dir = temp.path().join("real-batch");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::create_dir_all(&trash_root).unwrap();
+        symlink(&target_dir, &batch_dir).unwrap();
+
+        let entries = vec![
+            make_entry(
+                "batch-1",
+                Utc::now(),
+                PathBuf::from("/tmp/a"),
+                batch_dir.join("a"),
+                5,
+            ),
+            make_entry(
+                "batch-2",
+                Utc::now(),
+                PathBuf::from("/tmp/b"),
+                trash_root.join("batch-2").join("b"),
+                6,
+            ),
+        ];
+        write_entries(&log_path, &entries);
+
+        let result = purge_trash_batch(&trash_root, "batch-1", false).unwrap();
+        assert_eq!(result.failed_batches, 1);
+        assert!(result.errors[0].contains("Refusing to purge symlink path"));
+        assert!(batch_dir.exists());
+        assert_eq!(load_trash_log(&log_path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_gc_trash_removes_old_batches_by_keep_days() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let old_dir = trash_root.join("old-batch");
+        let recent_dir = trash_root.join("recent-batch");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&recent_dir).unwrap();
 
         let log_path = trash_root.join(TRASH_LOG_FILENAME);
         let entries = vec![
-            TrashEntry {
-                batch_id: "batch1".to_string(),
-                created_at: Utc::now(),
-                original_path: PathBuf::from("/tmp/a"),
-                trashed_path: trash_root.join("batch1").join("a"),
-                size: 5,
-                tool_version: None,
-            },
-            TrashEntry {
-                batch_id: "batch2".to_string(),
-                created_at: Utc::now(),
-                original_path: PathBuf::from("/tmp/b"),
-                trashed_path: trash_root.join("batch2").join("b"),
-                size: 6,
-                tool_version: None,
-            },
+            make_entry(
+                "old-batch",
+                Utc::now() - Duration::days(10),
+                PathBuf::from("/tmp/a"),
+                old_dir.join("a"),
+                5,
+            ),
+            make_entry(
+                "recent-batch",
+                Utc::now() - Duration::hours(1),
+                PathBuf::from("/tmp/b"),
+                recent_dir.join("b"),
+                6,
+            ),
         ];
-        save_trash_log(&log_path, &entries).unwrap();
+        write_entries(&log_path, &entries);
 
-        let result = gc_trash(&trash_root, None, Some(0), true).unwrap();
+        let result = gc_trash(&trash_root, Some(3), None, false).unwrap();
+        assert_eq!(result.removed_batches, 1);
+        assert_eq!(result.removed_entries, 1);
+        assert_eq!(result.removed_bytes, 5);
+        assert!(!old_dir.exists());
+        assert!(recent_dir.exists());
+        let remaining = load_trash_log(&log_path).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].batch_id, "recent-batch");
+    }
+
+    #[test]
+    fn test_gc_trash_removes_oldest_batches_until_limit() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let batch_old = trash_root.join("batch-old");
+        let batch_mid = trash_root.join("batch-mid");
+        let batch_new = trash_root.join("batch-new");
+        fs::create_dir_all(&batch_old).unwrap();
+        fs::create_dir_all(&batch_mid).unwrap();
+        fs::create_dir_all(&batch_new).unwrap();
+
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let entries = vec![
+            make_entry(
+                "batch-old",
+                Utc::now() - Duration::days(3),
+                PathBuf::from("/tmp/a"),
+                batch_old.join("a"),
+                7,
+            ),
+            make_entry(
+                "batch-mid",
+                Utc::now() - Duration::days(2),
+                PathBuf::from("/tmp/b"),
+                batch_mid.join("b"),
+                6,
+            ),
+            make_entry(
+                "batch-new",
+                Utc::now() - Duration::days(1),
+                PathBuf::from("/tmp/c"),
+                batch_new.join("c"),
+                4,
+            ),
+        ];
+        write_entries(&log_path, &entries);
+
+        let result = gc_trash(&trash_root, None, Some(9), false).unwrap();
         assert_eq!(result.removed_batches, 2);
-        assert_eq!(result.removed_bytes, 11);
+        assert_eq!(result.removed_entries, 2);
+        assert_eq!(result.removed_bytes, 13);
+        assert!(!batch_old.exists());
+        assert!(!batch_mid.exists());
+        assert!(batch_new.exists());
+        let remaining = load_trash_log(&log_path).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].batch_id, "batch-new");
+    }
+
+    #[test]
+    fn test_gc_trash_blocks_keep_bytes_when_keep_days_is_set() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let old_dir = trash_root.join("old-batch");
+        let recent_dir = trash_root.join("recent-batch");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&recent_dir).unwrap();
+
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let entries = vec![
+            make_entry(
+                "old-batch",
+                Utc::now() - Duration::days(10),
+                PathBuf::from("/tmp/a"),
+                old_dir.join("a"),
+                5,
+            ),
+            make_entry(
+                "recent-batch",
+                Utc::now(),
+                PathBuf::from("/tmp/b"),
+                recent_dir.join("b"),
+                100,
+            ),
+        ];
+        write_entries(&log_path, &entries);
+
+        let result = gc_trash(&trash_root, Some(3), Some(1), true).unwrap();
+        assert_eq!(result.removed_batches, 1);
+        assert!(result.blocked_by_keep_days);
+        assert_eq!(result.remaining_bytes, 100);
+        assert!(old_dir.exists());
+        assert!(recent_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_gc_trash_rejects_symlink_batch_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let real_dir = temp.path().join("real-batch");
+        let batch_dir = trash_root.join("batch-old");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::create_dir_all(&trash_root).unwrap();
+        symlink(&real_dir, &batch_dir).unwrap();
+
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let entries = vec![make_entry(
+            "batch-old",
+            Utc::now() - Duration::days(10),
+            PathBuf::from("/tmp/a"),
+            batch_dir.join("a"),
+            5,
+        )];
+        write_entries(&log_path, &entries);
+
+        let result = gc_trash(&trash_root, Some(3), None, false).unwrap();
+        assert_eq!(result.failed_batches, 1);
+        assert!(result.errors[0].contains("Refusing to purge symlink path"));
+        assert!(batch_dir.exists());
+        assert_eq!(load_trash_log(&log_path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_gc_trash_preserves_log_when_batch_removal_fails() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        fs::create_dir_all(&trash_root).unwrap();
+        let batch_path = trash_root.join("batch-old");
+        fs::write(&batch_path, "not a directory").unwrap();
+
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let entries = vec![make_entry(
+            "batch-old",
+            Utc::now() - Duration::days(10),
+            PathBuf::from("/tmp/a"),
+            batch_path.join("a"),
+            5,
+        )];
+        write_entries(&log_path, &entries);
+
+        let result = gc_trash(&trash_root, Some(3), None, false).unwrap();
+        assert_eq!(result.failed_batches, 1);
+        assert_eq!(result.removed_batches, 0);
+        assert!(result.errors[0].contains("Failed to remove batch dir"));
+        assert_eq!(load_trash_log(&log_path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_gc_trash_dry_run_reports_keep_days_and_keep_bytes() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let old_dir = trash_root.join("old-batch");
+        let recent_dir = trash_root.join("recent-batch");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::create_dir_all(&recent_dir).unwrap();
+
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        let entries = vec![
+            make_entry(
+                "old-batch",
+                Utc::now() - Duration::days(10),
+                PathBuf::from("/tmp/a"),
+                old_dir.join("a"),
+                5,
+            ),
+            make_entry(
+                "recent-batch",
+                Utc::now(),
+                PathBuf::from("/tmp/b"),
+                recent_dir.join("b"),
+                100,
+            ),
+        ];
+        write_entries(&log_path, &entries);
+
+        let result = gc_trash(&trash_root, Some(3), Some(1), true).unwrap();
+        assert_eq!(result.removed_batches, 1);
+        assert!(result.blocked_by_keep_days);
+        assert_eq!(result.remaining_bytes, 100);
+        assert!(old_dir.exists());
+        assert!(recent_dir.exists());
     }
 }

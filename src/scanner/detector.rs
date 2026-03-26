@@ -514,7 +514,16 @@ fn dir_contains_extension(dir: &Path, extensions: &[&str]) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
+
+    fn touch_with_timestamp(path: &Path, timestamp: &str) {
+        let status = Command::new("touch")
+            .args(["-t", timestamp, path.to_str().unwrap()])
+            .status()
+            .expect("failed to run touch");
+        assert!(status.success());
+    }
 
     #[test]
     fn test_detect_dotnet_project() {
@@ -566,7 +575,6 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let project_dir = temp.path();
 
-        // Create a .gitignore file
         let gitignore_content = r#"
 # Node dependencies
 node_modules/
@@ -575,14 +583,17 @@ dist/
 # Cache directories
 .cache/
 .temp
+.custom-cache/
 
 # Files (should be skipped)
 *.log
 .env
+README.md
 
 # Protected dirs (should be skipped)
 .git/
 src/
+lib/
 
 # Complex patterns (should be skipped)
 **/temp/*
@@ -591,19 +602,126 @@ src/
 
         let patterns = ProjectDetector::parse_gitignore(project_dir);
 
-        // Should include directory patterns
         assert!(patterns.contains(&"node_modules".to_string()));
         assert!(patterns.contains(&"dist".to_string()));
         assert!(patterns.contains(&".cache".to_string()));
         assert!(patterns.contains(&".temp".to_string()));
-
-        // Should NOT include file patterns
+        assert!(patterns.contains(&".custom-cache".to_string()));
         assert!(!patterns.iter().any(|p| p.contains(".log")));
         assert!(!patterns.iter().any(|p| p.contains(".env")));
-
-        // Should NOT include protected directories
+        assert!(!patterns.iter().any(|p| p.contains("README")));
         assert!(!patterns.contains(&".git".to_string()));
         assert!(!patterns.contains(&"src".to_string()));
+        assert!(!patterns.contains(&"lib".to_string()));
+    }
+
+    #[test]
+    fn test_gitignore_discovery_pattern_edge_cases() {
+        assert_eq!(ProjectDetector::gitignore_discovery_pattern("!dist/"), None);
+        assert_eq!(
+            ProjectDetector::gitignore_discovery_pattern("/dist/"),
+            Some("dist".to_string())
+        );
+        assert_eq!(
+            ProjectDetector::gitignore_discovery_pattern(".cache/"),
+            Some(".cache".to_string())
+        );
+        assert_eq!(ProjectDetector::gitignore_discovery_pattern("src/"), None);
+        assert_eq!(ProjectDetector::gitignore_discovery_pattern(".git/"), None);
+        assert_eq!(
+            ProjectDetector::gitignore_discovery_pattern("**/temp/*"),
+            Some("**/temp/*".to_string())
+        );
+        assert_eq!(ProjectDetector::gitignore_discovery_pattern("*.log"), None);
+    }
+
+    #[test]
+    fn test_is_in_use_recent_and_stale_lock_files() {
+        let temp = TempDir::new().unwrap();
+        let node_dir = temp.path().join("node");
+        let rust_dir = temp.path().join("rust");
+        let python_dir = temp.path().join("python");
+        let generic_dir = temp.path().join("generic");
+        fs::create_dir_all(&node_dir).unwrap();
+        fs::create_dir_all(&rust_dir).unwrap();
+        fs::create_dir_all(&python_dir).unwrap();
+        fs::create_dir_all(&generic_dir).unwrap();
+
+        let recent_stamp = "202603250101";
+        let stale_stamp = "202603010101";
+
+        fs::write(node_dir.join("package-lock.json"), "{}").unwrap();
+        fs::write(node_dir.join("yarn.lock"), "{}").unwrap();
+        touch_with_timestamp(&node_dir.join("package-lock.json"), stale_stamp);
+        touch_with_timestamp(&node_dir.join("yarn.lock"), recent_stamp);
+
+        fs::write(rust_dir.join("Cargo.lock"), "# lock").unwrap();
+        touch_with_timestamp(&rust_dir.join("Cargo.lock"), stale_stamp);
+
+        fs::write(python_dir.join("Pipfile.lock"), "{}").unwrap();
+        fs::write(python_dir.join("poetry.lock"), "{}").unwrap();
+        touch_with_timestamp(&python_dir.join("Pipfile.lock"), stale_stamp);
+        touch_with_timestamp(&python_dir.join("poetry.lock"), recent_stamp);
+
+        assert!(ProjectDetector::is_in_use(&node_dir, ProjectType::NodeJs));
+        assert!(!ProjectDetector::is_in_use(&rust_dir, ProjectType::Rust));
+        assert!(ProjectDetector::is_in_use(&python_dir, ProjectType::Python));
+        assert!(!ProjectDetector::is_in_use(
+            &generic_dir,
+            ProjectType::Generic
+        ));
+    }
+
+    #[test]
+    fn test_explain_cleanable_dir_priority() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        fs::write(root.join("package.json"), "{}").unwrap();
+        fs::write(root.join("Assets"), "").unwrap();
+        fs::write(root.join("ProjectSettings"), "").unwrap();
+        fs::write(root.join(".gitignore"), "mybuild/\n").unwrap();
+
+        let custom_patterns = vec![CustomPattern {
+            name: "Unity".to_string(),
+            directory: "build".to_string(),
+            marker_files: vec!["Assets".to_string(), "ProjectSettings".to_string()],
+            marker_mode: MarkerMode::AllOf,
+        }];
+
+        let custom_dir = root.join("build");
+        fs::create_dir(&custom_dir).unwrap();
+        let builtin_dir = root.join("dist");
+        fs::create_dir(&builtin_dir).unwrap();
+        let gitignore_dir = root.join("mybuild");
+        fs::create_dir(&gitignore_dir).unwrap();
+        fs::write(gitignore_dir.join("CMakeCache.txt"), "# cache").unwrap();
+        let heuristic_dir = root.join("heuristicbuild");
+        fs::create_dir(&heuristic_dir).unwrap();
+        fs::write(heuristic_dir.join("CMakeCache.txt"), "# cache").unwrap();
+
+        let custom = ProjectDetector::explain_cleanable_dir(
+            ProjectType::Python,
+            root,
+            &custom_dir,
+            &custom_patterns,
+        );
+        assert!(custom.contains("matched config custom pattern `Unity`"));
+
+        let builtin =
+            ProjectDetector::explain_cleanable_dir(ProjectType::NodeJs, root, &builtin_dir, &[]);
+        assert_eq!(builtin, "matched builtin pattern `dist`");
+
+        let gitignore =
+            ProjectDetector::explain_cleanable_dir(ProjectType::Generic, root, &gitignore_dir, &[]);
+        assert_eq!(gitignore, "matched .gitignore pattern `mybuild`");
+
+        let heuristic =
+            ProjectDetector::explain_cleanable_dir(ProjectType::Generic, root, &heuristic_dir, &[]);
+        assert_eq!(
+            heuristic,
+            "matched CMake out-of-source build heuristic (CMakeCache.txt present, no CMakeLists.txt)"
+        );
     }
 
     #[test]

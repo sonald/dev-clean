@@ -59,6 +59,13 @@ struct AppState {
     show_help: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppOutcome {
+    Continue,
+    Quit,
+    CleanSelected,
+}
+
 impl AppState {
     fn new(
         projects: Vec<ProjectInfo>,
@@ -286,6 +293,84 @@ impl AppState {
     }
 }
 
+fn handle_key(app: &mut AppState, key: KeyCode) -> AppOutcome {
+    if app.show_help {
+        app.show_help = false;
+        return AppOutcome::Continue;
+    }
+
+    match key {
+        KeyCode::Char('q') | KeyCode::Esc => AppOutcome::Quit,
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.next();
+            AppOutcome::Continue
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.previous();
+            AppOutcome::Continue
+        }
+        KeyCode::Char(' ') => {
+            app.toggle_current_selection();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('a') => {
+            app.select_all_visible();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('d') => {
+            app.deselect_all_visible();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('c') => {
+            app.cycle_category();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('r') => {
+            app.cycle_risk();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('s') => {
+            app.sort_key = app.sort_key.next();
+            app.recompute_visible();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('R') => {
+            app.include_recent = !app.include_recent;
+            app.recompute_visible();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('P') => {
+            app.include_protected = !app.include_protected;
+            app.recompute_visible();
+            AppOutcome::Continue
+        }
+        KeyCode::Backspace => {
+            app.query.pop();
+            app.recompute_visible();
+            AppOutcome::Continue
+        }
+        KeyCode::Char('?') | KeyCode::Char('h') => {
+            app.show_help = true;
+            AppOutcome::Continue
+        }
+        KeyCode::Enter => {
+            if app.get_selected_projects().is_empty() {
+                AppOutcome::Continue
+            } else {
+                AppOutcome::CleanSelected
+            }
+        }
+        KeyCode::Char(ch)
+            if ch.is_ascii_alphanumeric() || ch == '/' || ch == '.' || ch == '-' || ch == '_' =>
+        {
+            app.query.push(ch);
+            app.recompute_visible();
+            AppOutcome::Continue
+        }
+        _ => AppOutcome::Continue,
+    }
+}
+
 fn default_selectable(project: &EvaluatedProject, recent_days: i64) -> bool {
     !project.project.in_use
         && !project.safety.protected
@@ -355,43 +440,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: AppSt
         terminal.draw(|f| render_ui(f, &mut app))?;
 
         if let Event::Key(key) = event::read()? {
-            if app.show_help {
-                app.show_help = false;
-                continue;
-            }
-
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Down | KeyCode::Char('j') => app.next(),
-                KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                KeyCode::Char(' ') => app.toggle_current_selection(),
-                KeyCode::Char('a') => app.select_all_visible(),
-                KeyCode::Char('d') => app.deselect_all_visible(),
-                KeyCode::Char('c') => app.cycle_category(),
-                KeyCode::Char('r') => app.cycle_risk(),
-                KeyCode::Char('s') => {
-                    app.sort_key = app.sort_key.next();
-                    app.recompute_visible();
-                }
-                KeyCode::Char('R') => {
-                    app.include_recent = !app.include_recent;
-                    app.recompute_visible();
-                }
-                KeyCode::Char('P') => {
-                    app.include_protected = !app.include_protected;
-                    app.recompute_visible();
-                }
-                KeyCode::Backspace => {
-                    app.query.pop();
-                    app.recompute_visible();
-                }
-                KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,
-                KeyCode::Enter => {
-                    let selected = app.get_selected_projects();
-                    if selected.is_empty() {
-                        continue;
-                    }
+            match handle_key(&mut app, key.code) {
+                AppOutcome::Continue => {}
+                AppOutcome::Quit => return Ok(()),
+                AppOutcome::CleanSelected => {
                     disable_raw_mode()?;
+                    let selected = app.get_selected_projects();
                     let cleaner = Cleaner::new().verbose(true);
                     let result = cleaner.clean_multiple(&selected)?;
                     println!("\nCleaning completed!");
@@ -405,17 +459,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: AppSt
                     println!("  Space freed: {}", result.size_freed_human());
                     return Ok(());
                 }
-                KeyCode::Char(ch)
-                    if ch.is_ascii_alphanumeric()
-                        || ch == '/'
-                        || ch == '.'
-                        || ch == '-'
-                        || ch == '_' =>
-                {
-                    app.query.push(ch);
-                    app.recompute_visible();
-                }
-                _ => {}
             }
         }
     }
@@ -611,4 +654,330 @@ fn draw_help(f: &mut Frame) {
     let paragraph =
         Paragraph::new(help_text).block(Block::default().borders(Borders::ALL).title("Help"));
     f.render_widget(paragraph, f.size());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use std::path::PathBuf;
+
+    fn project(
+        name: &str,
+        size: u64,
+        days_since_modified: i64,
+        category: Category,
+        risk_level: RiskLevel,
+        in_use: bool,
+        protected: bool,
+    ) -> ProjectInfo {
+        ProjectInfo {
+            root: PathBuf::from("/repo"),
+            project_type: crate::scanner::ProjectType::Rust,
+            project_name: Some(name.to_string()),
+            category,
+            risk_level,
+            confidence: crate::scanner::Confidence::High,
+            matched_rule: None,
+            cleanable_dir: PathBuf::from(format!("/repo/{name}")),
+            size,
+            size_calculated: true,
+            last_modified: chrono::Utc::now() - Duration::days(days_since_modified),
+            in_use,
+            protected,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn app_state_handles_filters_selection_and_navigation() {
+        let mut app = AppState::new(
+            vec![
+                project(
+                    "cache",
+                    10,
+                    20,
+                    Category::Cache,
+                    RiskLevel::Low,
+                    false,
+                    false,
+                ),
+                project(
+                    "build",
+                    30,
+                    2,
+                    Category::Build,
+                    RiskLevel::Medium,
+                    false,
+                    false,
+                ),
+                project("deps", 20, 40, Category::Deps, RiskLevel::High, true, true),
+            ],
+            true,
+            true,
+            7,
+        );
+
+        assert_eq!(app.visible_indices.len(), 3);
+        assert_eq!(app.selected_count(), 1);
+        assert_eq!(
+            app.selected_project()
+                .unwrap()
+                .project
+                .project_name
+                .as_deref(),
+            Some("build")
+        );
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('h')),
+            AppOutcome::Continue
+        );
+        assert!(app.show_help);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('x')),
+            AppOutcome::Continue
+        );
+        assert!(!app.show_help);
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('b')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.visible_indices.len(), 1);
+        assert_eq!(
+            app.selected_project()
+                .unwrap()
+                .project
+                .project_name
+                .as_deref(),
+            Some("build")
+        );
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Backspace),
+            AppOutcome::Continue
+        );
+        assert!(app.query.is_empty());
+
+        app.recompute_visible();
+        app.list_state.select(Some(0));
+        assert_eq!(handle_key(&mut app, KeyCode::Down), AppOutcome::Continue);
+        assert_eq!(
+            app.selected_project()
+                .unwrap()
+                .project
+                .project_name
+                .as_deref(),
+            Some("deps")
+        );
+        assert_eq!(handle_key(&mut app, KeyCode::Up), AppOutcome::Continue);
+        assert_eq!(
+            app.selected_project()
+                .unwrap()
+                .project
+                .project_name
+                .as_deref(),
+            Some("build")
+        );
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.visible_indices.len(), 1);
+        assert_eq!(
+            app.selected_project().unwrap().project.category,
+            Category::Cache
+        );
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.visible_indices.len(), 1);
+        assert_eq!(
+            app.selected_project().unwrap().project.category,
+            Category::Build
+        );
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.visible_indices.len(), 1);
+        assert_eq!(
+            app.selected_project().unwrap().project.category,
+            Category::Deps
+        );
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('c')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.visible_indices.len(), 3);
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('r')),
+            AppOutcome::Continue
+        );
+        assert!(app
+            .visible_indices
+            .iter()
+            .all(|idx| app.projects[*idx].project.risk_level == RiskLevel::Low));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('r')),
+            AppOutcome::Continue
+        );
+        assert!(app
+            .visible_indices
+            .iter()
+            .all(|idx| app.projects[*idx].project.risk_level == RiskLevel::Medium));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('r')),
+            AppOutcome::Continue
+        );
+        assert!(app
+            .visible_indices
+            .iter()
+            .all(|idx| app.projects[*idx].project.risk_level == RiskLevel::High));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('r')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.visible_indices.len(), 3);
+
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('R')),
+            AppOutcome::Continue
+        );
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('P')),
+            AppOutcome::Continue
+        );
+        assert!(!app.include_recent);
+        assert!(!app.include_protected);
+
+        app.include_recent = true;
+        app.include_protected = true;
+        app.recompute_visible();
+        app.list_state.select(Some(0));
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char(' ')),
+            AppOutcome::Continue
+        );
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('a')),
+            AppOutcome::Continue
+        );
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('d')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.selected_count(), 0);
+
+        let mut app = AppState::new(
+            vec![
+                project(
+                    "cache",
+                    10,
+                    20,
+                    Category::Cache,
+                    RiskLevel::Low,
+                    false,
+                    false,
+                ),
+                project(
+                    "build",
+                    30,
+                    2,
+                    Category::Build,
+                    RiskLevel::Medium,
+                    false,
+                    false,
+                ),
+                project("deps", 20, 40, Category::Deps, RiskLevel::High, true, true),
+            ],
+            true,
+            true,
+            7,
+        );
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Char('a')),
+            AppOutcome::Continue
+        );
+        assert_eq!(app.selected_count(), 1);
+        assert_eq!(
+            handle_key(&mut app, KeyCode::Enter),
+            AppOutcome::CleanSelected
+        );
+    }
+
+    #[test]
+    fn app_state_handles_empty_and_wraparound_cases() {
+        let mut app = AppState::new(Vec::new(), false, false, 7);
+        assert!(app.selected_project().is_none());
+        assert_eq!(handle_key(&mut app, KeyCode::Esc), AppOutcome::Quit);
+        assert_eq!(handle_key(&mut app, KeyCode::Down), AppOutcome::Continue);
+        assert_eq!(handle_key(&mut app, KeyCode::Up), AppOutcome::Continue);
+        assert_eq!(handle_key(&mut app, KeyCode::Enter), AppOutcome::Continue);
+
+        let projects = vec![
+            project(
+                "one",
+                10,
+                10,
+                Category::Build,
+                RiskLevel::Medium,
+                false,
+                false,
+            ),
+            project(
+                "two",
+                20,
+                12,
+                Category::Build,
+                RiskLevel::Medium,
+                false,
+                false,
+            ),
+        ];
+        let mut app = AppState::new(projects, true, true, 7);
+        app.list_state.select(Some(0));
+        assert_eq!(handle_key(&mut app, KeyCode::Up), AppOutcome::Continue);
+        assert_eq!(
+            app.selected_project()
+                .unwrap()
+                .project
+                .project_name
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(handle_key(&mut app, KeyCode::Down), AppOutcome::Continue);
+        assert_eq!(
+            app.selected_project()
+                .unwrap()
+                .project
+                .project_name
+                .as_deref(),
+            Some("two")
+        );
+        assert_eq!(handle_key(&mut app, KeyCode::Down), AppOutcome::Continue);
+        assert_eq!(
+            app.selected_project()
+                .unwrap()
+                .project
+                .project_name
+                .as_deref(),
+            Some("one")
+        );
+    }
+
+    #[test]
+    fn run_tui_projects_returns_early_for_empty_input() {
+        assert!(run_tui_projects(Vec::new(), false, false, 7).is_ok());
+    }
 }

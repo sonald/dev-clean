@@ -207,25 +207,20 @@ mod tests {
     use super::*;
     use crate::scanner::{Category, Confidence, ProjectType, RiskLevel};
     use chrono::Utc;
+    use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
-    #[test]
-    fn project_keep_marker_protects_target() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().join("app");
-        let target = root.join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(root.join(".dev-cleaner-keep"), "").unwrap();
-
-        let info = ProjectInfo {
-            root: root.clone(),
+    fn project_info(root: &Path, cleanable_dir: &Path) -> ProjectInfo {
+        ProjectInfo {
+            root: root.to_path_buf(),
             project_type: ProjectType::Rust,
             project_name: None,
             category: Category::Build,
             risk_level: RiskLevel::Medium,
             confidence: Confidence::High,
             matched_rule: None,
-            cleanable_dir: target,
+            cleanable_dir: cleanable_dir.to_path_buf(),
             size: 10,
             size_calculated: true,
             last_modified: Utc::now(),
@@ -235,10 +230,180 @@ mod tests {
             recent: false,
             selection_reason: None,
             skip_reason: None,
-        };
+        }
+    }
 
-        let policy = KeepPolicy::from_config(&Config::default());
-        let decision = policy.evaluate(&info);
+    fn policy_from_config(config: Config) -> KeepPolicy {
+        KeepPolicy::from_config(&config)
+    }
+
+    fn write_keep_patterns(root: &Path, content: &str) {
+        fs::write(root.join(".dev-cleaner-keep-patterns"), content).unwrap();
+    }
+
+    #[test]
+    fn project_keep_marker_protects_target() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("app");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(root.join(".dev-cleaner-keep"), "").unwrap();
+
+        let policy = policy_from_config(Config::default());
+        let decision = policy.evaluate(&project_info(&root, &target));
         assert!(decision.protected);
+    }
+
+    #[test]
+    fn keep_paths_match_exact_and_parent_child_pairs() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        let target = root.join("app").join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        let mut config = Config::default();
+        config.keep_paths = vec![target.display().to_string()];
+        let policy = policy_from_config(config.clone());
+        assert!(
+            policy
+                .evaluate(&project_info(&root.join("app"), &target))
+                .protected
+        );
+
+        config.keep_paths = vec![root.display().to_string()];
+        let policy = policy_from_config(config.clone());
+        assert!(
+            policy
+                .evaluate(&project_info(&root.join("app"), &target))
+                .protected
+        );
+
+        config.keep_paths = vec![target.display().to_string()];
+        let policy = policy_from_config(config);
+        assert!(
+            policy
+                .evaluate(&project_info(&root, &root.join("app")))
+                .protected
+        );
+    }
+
+    #[test]
+    fn keep_globs_match_cleanable_dir_and_root() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        let project = root.join("app");
+        let target = project.join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        let mut config = Config::default();
+        config.keep_globs = vec![format!("{}/*/target", root.display())];
+        let policy = policy_from_config(config.clone());
+        assert!(policy.evaluate(&project_info(&root, &target)).protected);
+
+        config.keep_globs = vec![project.display().to_string()];
+        let policy = policy_from_config(config);
+        assert!(policy.evaluate(&project_info(&project, &target)).protected);
+    }
+
+    #[test]
+    fn keep_project_roots_protects_project_root() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        let target = root.join("app").join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        let mut config = Config::default();
+        config.keep_project_roots = vec![root.join("app").display().to_string()];
+        let policy = policy_from_config(config);
+
+        let decision = policy.evaluate(&project_info(&root.join("app"), &target));
+        assert!(decision.protected);
+        assert_eq!(
+            decision.reason.as_deref(),
+            Some("config_keep_project_roots")
+        );
+    }
+
+    #[test]
+    fn keep_patterns_match_supported_forms_and_skip_comments() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        let target = root.join("app").join("target");
+        let nested = target.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        write_keep_patterns(
+            &root.join("app"),
+            r#"
+# keep the build target
+target
+
+# and one nested directory
+target/*
+"#,
+        );
+
+        let policy = policy_from_config(Config::default());
+        let info = project_info(&root.join("app"), &target);
+        assert!(policy.evaluate(&info).protected);
+
+        let nested_info = project_info(&root.join("app"), &nested);
+        assert!(policy.evaluate(&nested_info).protected);
+    }
+
+    #[test]
+    fn keep_patterns_support_absolute_paths_and_non_matching_entries() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        let project = root.join("app");
+        let target = project.join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        write_keep_patterns(
+            &project,
+            &format!(
+                r#"
+#
+{}
+"#,
+                target.display()
+            ),
+        );
+
+        let policy = policy_from_config(Config::default());
+        let info = project_info(&project, &target);
+        assert!(policy.evaluate(&info).protected);
+
+        let other_target = project.join("other-target");
+        fs::create_dir_all(&other_target).unwrap();
+        let other_info = project_info(&project, &other_target);
+        assert!(!policy.evaluate(&other_info).protected);
+    }
+
+    #[test]
+    fn keep_patterns_fail_closed_on_parse_error() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("workspace");
+        let project = root.join("app");
+        let target = project.join("target");
+        fs::create_dir_all(&target).unwrap();
+
+        write_keep_patterns(&project, "[");
+
+        let policy = policy_from_config(Config::default());
+        let decision = policy.evaluate(&project_info(&project, &target));
+        assert!(decision.protected);
+        assert!(decision
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("parse_error"));
+    }
+
+    #[test]
+    fn expand_tilde_uses_home_directory() {
+        let home = dirs::home_dir().expect("home directory should exist in tests");
+        let expanded = expand_tilde("~/dev-cleaner-keep");
+        assert_eq!(expanded, home.join("dev-cleaner-keep"));
     }
 }

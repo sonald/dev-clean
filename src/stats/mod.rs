@@ -376,6 +376,34 @@ mod tests {
     use chrono::Utc;
     use std::path::PathBuf;
 
+    fn project(
+        project_type: ProjectType,
+        size: u64,
+        days_since_modified: i64,
+        category: Category,
+        risk_level: RiskLevel,
+    ) -> ProjectInfo {
+        ProjectInfo {
+            root: PathBuf::from("/repo"),
+            project_type,
+            project_name: None,
+            category,
+            risk_level,
+            confidence: Confidence::High,
+            matched_rule: None,
+            cleanable_dir: PathBuf::from(format!("/repo/{project_type:?}-{size}")),
+            size,
+            size_calculated: true,
+            last_modified: Utc::now() - chrono::Duration::days(days_since_modified),
+            in_use: false,
+            protected: false,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
+        }
+    }
+
     #[test]
     fn test_statistics_from_projects() {
         let projects = vec![
@@ -425,5 +453,75 @@ mod tests {
         assert_eq!(stats.total_size, 3000000);
         assert_eq!(stats.by_type.len(), 2);
         assert_eq!(stats.top_largest.len(), 2);
+    }
+
+    #[test]
+    fn test_statistics_age_boundaries_and_render_bar() {
+        let stats = Statistics::from_projects(vec![
+            project(ProjectType::NodeJs, 10, 29, Category::Deps, RiskLevel::High),
+            project(
+                ProjectType::Rust,
+                20,
+                30,
+                Category::Build,
+                RiskLevel::Medium,
+            ),
+            project(ProjectType::Python, 30, 89, Category::Cache, RiskLevel::Low),
+            project(
+                ProjectType::Java,
+                40,
+                90,
+                Category::Build,
+                RiskLevel::Medium,
+            ),
+        ]);
+
+        assert_eq!(stats.total_projects, 4);
+        assert_eq!(stats.total_size, 100);
+        assert_eq!(stats.by_age_group.recent, (1, 10));
+        assert_eq!(stats.by_age_group.medium, (2, 50));
+        assert_eq!(stats.by_age_group.old, (1, 40));
+        assert_eq!(stats.top_largest[0].size, 40);
+        assert_eq!(stats.top_largest[1].size, 30);
+        assert_eq!(stats.top_largest[2].size, 20);
+        assert_eq!(stats.top_largest[3].size, 10);
+        assert_eq!(stats.by_type["Rust"].avg_size, 20);
+        assert_eq!(render_bar(0, 0, 0), "");
+        assert_eq!(render_bar(3, 0, 5), "-----");
+        assert_eq!(render_bar(5, 10, 5), "##---");
+
+        let json = stats.to_json().unwrap();
+        assert!(json.contains("\"total_projects\": 4"));
+    }
+
+    #[test]
+    fn test_display_terminal_smoke_covers_recommendations() {
+        let stats = Statistics::from_projects(vec![
+            project(
+                ProjectType::NodeJs,
+                50,
+                120,
+                Category::Deps,
+                RiskLevel::High,
+            ),
+            project(
+                ProjectType::Rust,
+                40,
+                15,
+                Category::Build,
+                RiskLevel::Medium,
+            ),
+            project(ProjectType::Python, 30, 5, Category::Cache, RiskLevel::Low),
+            project(
+                ProjectType::Java,
+                20,
+                200,
+                Category::Build,
+                RiskLevel::Medium,
+            ),
+            project(ProjectType::Go, 10, 90, Category::Build, RiskLevel::Medium),
+        ]);
+
+        stats.display_terminal(3);
     }
 }

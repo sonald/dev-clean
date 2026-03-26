@@ -369,21 +369,46 @@ mod tests {
     use crate::scanner::{Category, Confidence, ProjectType, RiskLevel};
     use crate::ProjectInfo;
     use chrono::Utc;
+    use std::fs;
+    use tempfile::TempDir;
+
     fn sample_project() -> ProjectInfo {
+        project_info(
+            PathBuf::from("/repo/app"),
+            PathBuf::from("/repo/app/target"),
+            ProjectType::Rust,
+            Category::Build,
+            RiskLevel::Medium,
+            false,
+            false,
+            Utc::now(),
+        )
+    }
+
+    fn project_info(
+        root: PathBuf,
+        cleanable_dir: PathBuf,
+        project_type: ProjectType,
+        category: Category,
+        risk_level: RiskLevel,
+        in_use: bool,
+        protected: bool,
+        last_modified: chrono::DateTime<Utc>,
+    ) -> ProjectInfo {
         ProjectInfo {
-            root: PathBuf::from("/repo/app"),
-            project_type: ProjectType::Rust,
+            root,
+            project_type,
             project_name: None,
-            category: Category::Build,
-            risk_level: RiskLevel::Medium,
+            category,
+            risk_level,
             confidence: Confidence::High,
             matched_rule: None,
-            cleanable_dir: PathBuf::from("/repo/app/target"),
+            cleanable_dir,
             size: 123,
             size_calculated: true,
-            last_modified: Utc::now(),
-            in_use: false,
-            protected: false,
+            last_modified,
+            in_use,
+            protected,
             protected_by: None,
             recent: false,
             selection_reason: None,
@@ -431,6 +456,94 @@ mod tests {
     }
 
     #[test]
+    fn resolve_profile_missing_errors() {
+        let config = Config::default();
+        let request = ScanRequest {
+            profile: Some("missing".to_string()),
+            ..Default::default()
+        };
+
+        let err = ScanService::new()
+            .resolve_inputs(&config, &request)
+            .unwrap_err();
+        assert!(err.to_string().contains("Profile `missing` not found"));
+    }
+
+    #[test]
+    fn resolve_roots_handles_boundaries() {
+        let service = ScanService::new();
+        let config = Config::default();
+
+        let request = ScanRequest::default();
+        let resolved = service.resolve_inputs(&config, &request).unwrap();
+        assert_eq!(resolved.roots, vec![PathBuf::from(".")]);
+        assert_eq!(resolved.scan_root, canonicalize_lossy(Path::new(".")));
+
+        let mut config = Config::default();
+        config.scan_profiles.insert(
+            "empty".to_string(),
+            ScanProfile {
+                paths: Vec::new(),
+                depth: None,
+                min_size_mb: None,
+                max_age_days: None,
+                gitignore: None,
+                category: None,
+                max_risk: None,
+            },
+        );
+        let request = ScanRequest {
+            profile: Some("empty".to_string()),
+            ..Default::default()
+        };
+        let err = service.resolve_inputs(&config, &request).unwrap_err();
+        assert!(err.to_string().contains("Profile has no paths"));
+
+        let mut config = Config::default();
+        config.scan_profiles.insert(
+            "demo".to_string(),
+            ScanProfile {
+                paths: vec![PathBuf::from("/one")],
+                depth: None,
+                min_size_mb: None,
+                max_age_days: None,
+                gitignore: None,
+                category: None,
+                max_risk: None,
+            },
+        );
+        let request = ScanRequest {
+            path: Some(PathBuf::from("/two")),
+            profile: Some("demo".to_string()),
+            ..Default::default()
+        };
+        let err = service.resolve_inputs(&config, &request).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Use either [PATH] or --profile, not both"));
+    }
+
+    #[test]
+    fn derive_scan_root_handles_zero_one_and_fallback() {
+        let temp = TempDir::new().unwrap();
+        let a = temp.path().join("workspace").join("a");
+        let b = temp.path().join("workspace").join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+
+        assert_eq!(derive_scan_root(&[]), PathBuf::from("."));
+        assert_eq!(derive_scan_root(&[a.clone()]), canonicalize_lossy(&a));
+        assert_eq!(
+            derive_scan_root(&[a.clone(), PathBuf::from("relative-root")]),
+            canonicalize_lossy(&a)
+        );
+        assert_eq!(
+            derive_scan_root(&[a.clone(), b.clone()]),
+            canonicalize_lossy(&temp.path().join("workspace"))
+        );
+    }
+
+    #[test]
     fn visibility_filter_respects_flags() {
         let service = ScanService::new();
         let mut project = EvaluatedProject::new(sample_project());
@@ -456,6 +569,85 @@ mod tests {
             },
         );
         assert_eq!(visible.len(), 1);
+    }
+
+    #[test]
+    fn evaluate_projects_with_config_applies_keep_policy() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("app");
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(root.join(".dev-cleaner-keep"), "").unwrap();
+
+        let config = Config::default();
+        let service = ScanService::new();
+        let evaluated = service.evaluate_projects_with_config(
+            &config,
+            vec![project_info(
+                root.clone(),
+                target.clone(),
+                ProjectType::Rust,
+                Category::Build,
+                RiskLevel::Medium,
+                false,
+                false,
+                Utc::now(),
+            )],
+            7,
+        );
+
+        assert_eq!(evaluated.len(), 1);
+        assert!(evaluated[0].is_protected());
+        assert_eq!(
+            evaluated[0].safety.protected_by.as_deref(),
+            Some("project_marker:.dev-cleaner-keep")
+        );
+    }
+
+    #[test]
+    fn discover_visible_filters_protected_and_recent_targets() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let project_root = root.join("node-project");
+        let target = project_root.join("node_modules");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(project_root.join("package.json"), "{}").unwrap();
+        fs::write(project_root.join(".dev-cleaner-keep"), "").unwrap();
+
+        let config = Config::default();
+        let service = ScanService::new();
+        let request = ScanRequest {
+            path: Some(root.to_path_buf()),
+            profile: None,
+            depth: None,
+            min_size_mb: None,
+            older_than_days: None,
+            gitignore: Some(false),
+            category: None,
+            max_risk: Some(RiskLevel::High),
+            visibility: VisibilityOptions {
+                include_protected: false,
+                include_recent: false,
+                recent_days: 7,
+            },
+        };
+
+        let discovered = service.discover_visible(&config, &request).unwrap();
+        assert_eq!(discovered.resolved.roots, vec![root.to_path_buf()]);
+        assert!(discovered.projects.is_empty());
+
+        let request = ScanRequest {
+            visibility: VisibilityOptions {
+                include_protected: true,
+                include_recent: true,
+                recent_days: 7,
+            },
+            ..request
+        };
+        let discovered = service.discover_visible(&config, &request).unwrap();
+        assert_eq!(discovered.projects.len(), 1);
+        assert!(discovered.projects[0].safety.protected);
+        assert!(discovered.projects[0].safety.recent);
     }
 
     #[test]

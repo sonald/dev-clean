@@ -2667,6 +2667,89 @@ mod tests {
     }
 
     #[test]
+    fn build_scan_request_maps_flags_and_default_risk_filter() {
+        let request = build_scan_request(
+            Some(PathBuf::from("/scan")),
+            Some("profile"),
+            Some(4),
+            Some(8),
+            Some(9),
+            true,
+            CategoryFilterArg::Deps,
+            RiskArg::All,
+            true,
+            false,
+            11,
+        );
+
+        assert_eq!(request.path, Some(PathBuf::from("/scan")));
+        assert_eq!(request.profile.as_deref(), Some("profile"));
+        assert_eq!(request.depth, Some(4));
+        assert_eq!(request.min_size_mb, Some(8));
+        assert_eq!(request.older_than_days, Some(9));
+        assert_eq!(request.gitignore, Some(true));
+        assert_eq!(request.category, Some(Category::Deps));
+        assert_eq!(request.max_risk, Some(RiskLevel::High));
+        assert!(request.visibility.include_protected);
+        assert!(!request.visibility.include_recent);
+        assert_eq!(request.visibility.recent_days, 11);
+    }
+
+    #[test]
+    fn build_scan_request_keeps_medium_as_default_filter() {
+        let request = build_scan_request(
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            CategoryFilterArg::All,
+            RiskArg::Medium,
+            false,
+            true,
+            7,
+        );
+
+        assert_eq!(request.max_risk, None);
+        assert_eq!(request.visibility.include_recent, true);
+    }
+
+    #[test]
+    fn project_infos_from_evaluated_sorts_largest_first() {
+        let small = ProjectInfo {
+            root: PathBuf::from("/workspace"),
+            project_type: ProjectType::Rust,
+            project_name: None,
+            category: Category::Build,
+            risk_level: RiskLevel::Medium,
+            confidence: Confidence::High,
+            matched_rule: None,
+            cleanable_dir: PathBuf::from("/workspace/small"),
+            size: 1,
+            size_calculated: true,
+            last_modified: Utc::now(),
+            in_use: false,
+            protected: false,
+            protected_by: None,
+            recent: false,
+            selection_reason: None,
+            skip_reason: None,
+        };
+        let mut large = small.clone();
+        large.cleanable_dir = PathBuf::from("/workspace/large");
+        large.size = 10;
+
+        let sorted = project_infos_from_evaluated(vec![
+            AppEvaluatedProject::new(small),
+            AppEvaluatedProject::new(large),
+        ]);
+
+        assert_eq!(sorted[0].size, 10);
+        assert_eq!(sorted[1].size, 1);
+    }
+
+    #[test]
     fn derive_scan_root_uses_common_ancestor_for_multi_roots() {
         let temp = TempDir::new().unwrap();
         let root_a = temp.path().join("workspace").join("a");
