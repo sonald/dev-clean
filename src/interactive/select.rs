@@ -1,4 +1,4 @@
-use crate::scanner::{ProjectInfo, RiskLevel};
+use crate::scanner::{ProjectInfo, RuleSource};
 use crate::utils::format_size;
 use anyhow::Result;
 use crossterm::{
@@ -23,15 +23,15 @@ pub struct SelectorOptions {
 enum SortKey {
     Size,
     Age,
-    Risk,
+    Source,
 }
 
 impl SortKey {
     fn next(self) -> Self {
         match self {
             Self::Size => Self::Age,
-            Self::Age => Self::Risk,
-            Self::Risk => Self::Size,
+            Self::Age => Self::Source,
+            Self::Source => Self::Size,
         }
     }
 
@@ -39,7 +39,7 @@ impl SortKey {
         match self {
             Self::Size => "size",
             Self::Age => "age",
-            Self::Risk => "risk",
+            Self::Source => "source",
         }
     }
 }
@@ -84,22 +84,22 @@ impl ProjectSelector {
         let selected_size = self.state.selected_size();
         let sort_order = if self.state.reverse { "asc" } else { "desc" };
 
-        writeln!(out, "Dev Cleaner - Select Targets")?;
-        writeln!(
+        write!(out, "Dev Cleaner - Select Targets\r\n")?;
+        write!(
             out,
-            "Visible: {} | Selected: {} ({})",
+            "Visible: {} | Selected: {} ({})\r\n",
             self.state.visible_indices.len(),
             selected_count,
             format_size(selected_size)
         )?;
-        writeln!(
+        write!(
             out,
-            "Sort: {} {} | Search: {}",
+            "Sort: {} {} | Search: {}\r\n",
             self.state.sort_key.as_str(),
             sort_order,
             self.state.search_status()
         )?;
-        writeln!(out)?;
+        write!(out, "\r\n")?;
 
         let footer = footer_lines(cols, self.state.search_mode);
         let page_rows = self.state.page_rows(rows);
@@ -107,7 +107,7 @@ impl ProjectSelector {
         let end = (start + page_rows).min(self.state.visible_indices.len());
 
         if self.state.visible_indices.is_empty() {
-            writeln!(out, "No targets match the current filter.")?;
+            write!(out, "No targets match the current filter.\r\n")?;
         } else {
             for row in start..end {
                 let project_idx = self.state.visible_indices[row];
@@ -138,28 +138,27 @@ impl ProjectSelector {
                 };
 
                 let left = format!(
-                    "{} {} {:>8} [{}/{}] ",
+                    "{} {} {:>8} source:{:<9} ",
                     marker,
                     checked,
                     format_size(project.size),
-                    project.category,
-                    project.risk_level
+                    detection_source(project),
                 );
                 let path = truncate_middle(
                     &project.cleanable_dir.display().to_string(),
                     cols.saturating_sub(left.len() + tags_suffix.len()),
                 );
 
-                writeln!(out, "{}{}{}", left, path, tags_suffix)?;
+                write!(out, "{}{}{}\r\n", left, path, tags_suffix)?;
             }
         }
 
         let printed_rows = end.saturating_sub(start);
         for _ in printed_rows..page_rows {
-            writeln!(out)?;
+            write!(out, "\r\n")?;
         }
 
-        writeln!(out)?;
+        write!(out, "\r\n")?;
 
         if let Some(current) = self.state.current_project() {
             let blocked = self
@@ -168,19 +167,20 @@ impl ProjectSelector {
                 .map(|r| format!(" | blocked: {}", r))
                 .unwrap_or_default();
             let details = format!(
-                "Current: {} ({}, {} days old{})",
+                "Current: {} ({}, source: {}, {} days old{})",
                 current.cleanable_dir.display(),
                 current.project_type_display_name(),
+                detection_source(current),
                 current.days_since_modified(),
                 blocked
             );
-            writeln!(out, "{}", truncate_middle(&details, cols))?;
+            write!(out, "{}\r\n", truncate_middle(&details, cols))?;
         } else {
-            writeln!(out, "Current: -")?;
+            write!(out, "Current: -\r\n")?;
         }
 
         for line in footer {
-            writeln!(out, "{}", truncate_middle(&line, cols))?;
+            write!(out, "{}\r\n", truncate_middle(&line, cols))?;
         }
 
         out.flush()?;
@@ -249,7 +249,7 @@ fn footer_lines(width: usize, search_mode: bool) -> Vec<String> {
     } else if width >= 130 {
         vec![
             "Up/Down/j/k move | Space toggle | a all | d none | / search".to_string(),
-            "s sort(size/age/risk) | o order | Enter confirm | q/Esc cancel".to_string(),
+            "s sort(size/age/source) | o order | Enter confirm | q/Esc cancel".to_string(),
         ]
     } else if width >= 90 {
         vec![
@@ -571,8 +571,8 @@ fn compare_projects_for_sort(
             .days_since_modified()
             .cmp(&pa.days_since_modified())
             .then_with(|| pb.size.cmp(&pa.size)),
-        SortKey::Risk => risk_rank(pb.risk_level)
-            .cmp(&risk_rank(pa.risk_level))
+        SortKey::Source => source_rank(pa)
+            .cmp(&source_rank(pb))
             .then_with(|| pb.size.cmp(&pa.size)),
     };
 
@@ -583,11 +583,23 @@ fn compare_projects_for_sort(
     }
 }
 
-fn risk_rank(risk: RiskLevel) -> u8 {
-    match risk {
-        RiskLevel::Low => 1,
-        RiskLevel::Medium => 2,
-        RiskLevel::High => 3,
+fn detection_source(project: &ProjectInfo) -> &'static str {
+    match project.matched_rule.as_ref().map(|rule| rule.source) {
+        Some(RuleSource::Custom) => "custom",
+        Some(RuleSource::Builtin) => "builtin",
+        Some(RuleSource::Gitignore) => "gitignore",
+        Some(RuleSource::Heuristic) => "heuristic",
+        None => "unknown",
+    }
+}
+
+fn source_rank(project: &ProjectInfo) -> u8 {
+    match project.matched_rule.as_ref().map(|rule| rule.source) {
+        Some(RuleSource::Custom) => 0,
+        Some(RuleSource::Builtin) => 1,
+        Some(RuleSource::Heuristic) => 2,
+        Some(RuleSource::Gitignore) => 3,
+        None => 4,
     }
 }
 
@@ -625,7 +637,7 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::{Category, Confidence, ProjectType};
+    use crate::scanner::{Category, Confidence, ProjectType, RiskLevel};
     use chrono::{Duration, Utc};
     use std::path::PathBuf;
 

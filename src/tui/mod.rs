@@ -1,5 +1,4 @@
 use crate::evaluation::EvaluatedProject;
-use crate::scanner::{Category, RiskLevel};
 use crate::utils::format_size;
 use crate::{Cleaner, Config, ProjectInfo, Scanner};
 use anyhow::Result;
@@ -13,7 +12,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use std::io;
@@ -23,15 +22,15 @@ use std::path::PathBuf;
 enum SortKey {
     Size,
     Age,
-    Risk,
+    Source,
 }
 
 impl SortKey {
     fn next(self) -> Self {
         match self {
             Self::Size => Self::Age,
-            Self::Age => Self::Risk,
-            Self::Risk => Self::Size,
+            Self::Age => Self::Source,
+            Self::Source => Self::Size,
         }
     }
 
@@ -39,7 +38,7 @@ impl SortKey {
         match self {
             Self::Size => "size",
             Self::Age => "age",
-            Self::Risk => "risk",
+            Self::Source => "source",
         }
     }
 }
@@ -53,10 +52,10 @@ struct AppState {
     include_protected: bool,
     recent_days: i64,
     query: String,
-    category_filter: Option<Category>,
-    risk_filter: Option<RiskLevel>,
     sort_key: SortKey,
     show_help: bool,
+    input_mode: InputMode,
+    filter_cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +63,13 @@ enum AppOutcome {
     Continue,
     Quit,
     CleanSelected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputMode {
+    Normal,
+    Search,
+    FilterPanel,
 }
 
 impl AppState {
@@ -89,10 +95,10 @@ impl AppState {
             include_protected,
             recent_days,
             query: String::new(),
-            category_filter: None,
-            risk_filter: None,
             sort_key: SortKey::Size,
             show_help: false,
+            input_mode: InputMode::Normal,
+            filter_cursor: 0,
         };
         app.recompute_visible();
         for &idx in &app.visible_indices {
@@ -112,16 +118,6 @@ impl AppState {
             }
             if !self.include_recent && p.safety.recent {
                 continue;
-            }
-            if let Some(category) = self.category_filter {
-                if p.project.category != category {
-                    continue;
-                }
-            }
-            if let Some(risk) = self.risk_filter {
-                if p.project.risk_level != risk {
-                    continue;
-                }
             }
             if !self.query.is_empty() {
                 let q = self.query.to_ascii_lowercase();
@@ -160,10 +156,8 @@ impl AppState {
                         .size
                         .cmp(&self.projects[*a].project.size)
                 }),
-            SortKey::Risk => self.projects[*a]
-                .project
-                .risk_level
-                .cmp(&self.projects[*b].project.risk_level)
+            SortKey::Source => source_sort_rank(&self.projects[*a])
+                .cmp(&source_sort_rank(&self.projects[*b]))
                 .then_with(|| {
                     self.projects[*b]
                         .project
@@ -271,25 +265,47 @@ impl AppState {
         }
     }
 
-    fn cycle_category(&mut self) {
-        self.category_filter = match self.category_filter {
-            None => Some(Category::Cache),
-            Some(Category::Cache) => Some(Category::Build),
-            Some(Category::Build) => Some(Category::Deps),
-            Some(Category::Deps) => None,
-            Some(Category::Unknown) => None,
+    fn cycle_sort_back(&mut self) {
+        self.sort_key = match self.sort_key {
+            SortKey::Size => SortKey::Source,
+            SortKey::Age => SortKey::Size,
+            SortKey::Source => SortKey::Age,
         };
         self.recompute_visible();
     }
 
-    fn cycle_risk(&mut self) {
-        self.risk_filter = match self.risk_filter {
-            None => Some(RiskLevel::Low),
-            Some(RiskLevel::Low) => Some(RiskLevel::Medium),
-            Some(RiskLevel::Medium) => Some(RiskLevel::High),
-            Some(RiskLevel::High) => None,
+    fn filter_cursor_next(&mut self) {
+        self.filter_cursor = (self.filter_cursor + 1) % 3;
+    }
+
+    fn filter_cursor_prev(&mut self) {
+        self.filter_cursor = if self.filter_cursor == 0 {
+            2
+        } else {
+            self.filter_cursor - 1
         };
-        self.recompute_visible();
+    }
+
+    fn update_filter_value(&mut self, forward: bool) {
+        match self.filter_cursor {
+            0 => {
+                if forward {
+                    self.sort_key = self.sort_key.next();
+                    self.recompute_visible();
+                } else {
+                    self.cycle_sort_back();
+                }
+            }
+            1 => {
+                self.include_recent = !self.include_recent;
+                self.recompute_visible();
+            }
+            2 => {
+                self.include_protected = !self.include_protected;
+                self.recompute_visible();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -299,75 +315,129 @@ fn handle_key(app: &mut AppState, key: KeyCode) -> AppOutcome {
         return AppOutcome::Continue;
     }
 
-    match key {
-        KeyCode::Char('q') | KeyCode::Esc => AppOutcome::Quit,
-        KeyCode::Down | KeyCode::Char('j') => {
-            app.next();
-            AppOutcome::Continue
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            app.previous();
-            AppOutcome::Continue
-        }
-        KeyCode::Char(' ') => {
-            app.toggle_current_selection();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('a') => {
-            app.select_all_visible();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('d') => {
-            app.deselect_all_visible();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('c') => {
-            app.cycle_category();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('r') => {
-            app.cycle_risk();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('s') => {
-            app.sort_key = app.sort_key.next();
-            app.recompute_visible();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('R') => {
-            app.include_recent = !app.include_recent;
-            app.recompute_visible();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('P') => {
-            app.include_protected = !app.include_protected;
-            app.recompute_visible();
-            AppOutcome::Continue
-        }
-        KeyCode::Backspace => {
-            app.query.pop();
-            app.recompute_visible();
-            AppOutcome::Continue
-        }
-        KeyCode::Char('?') | KeyCode::Char('h') => {
-            app.show_help = true;
-            AppOutcome::Continue
-        }
-        KeyCode::Enter => {
-            if app.get_selected_projects().is_empty() {
+    if app.input_mode == InputMode::Search {
+        match key {
+            KeyCode::Esc | KeyCode::Enter => {
+                app.input_mode = InputMode::Normal;
                 AppOutcome::Continue
-            } else {
-                AppOutcome::CleanSelected
             }
+            KeyCode::Backspace => {
+                app.query.pop();
+                app.recompute_visible();
+                AppOutcome::Continue
+            }
+            KeyCode::Char(ch)
+                if ch.is_ascii_alphanumeric()
+                    || ch == '/'
+                    || ch == '.'
+                    || ch == '-'
+                    || ch == '_' =>
+            {
+                app.query.push(ch);
+                app.recompute_visible();
+                AppOutcome::Continue
+            }
+            _ => AppOutcome::Continue,
         }
-        KeyCode::Char(ch)
-            if ch.is_ascii_alphanumeric() || ch == '/' || ch == '.' || ch == '-' || ch == '_' =>
-        {
-            app.query.push(ch);
-            app.recompute_visible();
-            AppOutcome::Continue
+    } else if app.input_mode == InputMode::FilterPanel {
+        match key {
+            KeyCode::Esc | KeyCode::Char('f') => {
+                app.input_mode = InputMode::Normal;
+                AppOutcome::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.filter_cursor_next();
+                AppOutcome::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.filter_cursor_prev();
+                AppOutcome::Continue
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter | KeyCode::Char(' ') => {
+                app.update_filter_value(true);
+                AppOutcome::Continue
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                app.update_filter_value(false);
+                AppOutcome::Continue
+            }
+            _ => AppOutcome::Continue,
         }
-        _ => AppOutcome::Continue,
+    } else {
+        match key {
+            KeyCode::Char('q') | KeyCode::Esc => AppOutcome::Quit,
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.next();
+                AppOutcome::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.previous();
+                AppOutcome::Continue
+            }
+            KeyCode::Char(' ') => {
+                app.toggle_current_selection();
+                AppOutcome::Continue
+            }
+            KeyCode::Char('a') => {
+                app.select_all_visible();
+                AppOutcome::Continue
+            }
+            KeyCode::Char('d') => {
+                app.deselect_all_visible();
+                AppOutcome::Continue
+            }
+            KeyCode::Char('s') => {
+                app.sort_key = app.sort_key.next();
+                app.recompute_visible();
+                AppOutcome::Continue
+            }
+            KeyCode::Char('R') => {
+                app.include_recent = !app.include_recent;
+                app.recompute_visible();
+                AppOutcome::Continue
+            }
+            KeyCode::Char('P') => {
+                app.include_protected = !app.include_protected;
+                app.recompute_visible();
+                AppOutcome::Continue
+            }
+            KeyCode::Backspace => {
+                app.query.pop();
+                app.recompute_visible();
+                AppOutcome::Continue
+            }
+            KeyCode::Char('/') => {
+                app.input_mode = InputMode::Search;
+                AppOutcome::Continue
+            }
+            KeyCode::Char('f') => {
+                app.input_mode = InputMode::FilterPanel;
+                AppOutcome::Continue
+            }
+            KeyCode::Char('?') | KeyCode::Char('h') => {
+                app.show_help = true;
+                AppOutcome::Continue
+            }
+            KeyCode::Enter => {
+                if app.get_selected_projects().is_empty() {
+                    AppOutcome::Continue
+                } else {
+                    AppOutcome::CleanSelected
+                }
+            }
+            KeyCode::Char(ch)
+                if ch.is_ascii_alphanumeric()
+                    || ch == '/'
+                    || ch == '.'
+                    || ch == '-'
+                    || ch == '_' =>
+            {
+                app.query.push(ch);
+                app.recompute_visible();
+                AppOutcome::Continue
+            }
+            _ => AppOutcome::Continue,
+        }
     }
 }
 
@@ -375,6 +445,72 @@ fn default_selectable(project: &EvaluatedProject, recent_days: i64) -> bool {
     !project.project.in_use
         && !project.safety.protected
         && project.project.days_since_modified() >= recent_days
+}
+
+fn selection_status(project: &EvaluatedProject) -> &'static str {
+    if project.project.in_use {
+        "in-use"
+    } else if project.safety.protected {
+        "protected"
+    } else if project.safety.recent {
+        "recent"
+    } else {
+        "ready"
+    }
+}
+
+fn detection_source(project: &EvaluatedProject) -> &'static str {
+    let Some(rule) = &project.project.matched_rule else {
+        return "unknown";
+    };
+
+    match rule.source {
+        crate::scanner::RuleSource::Builtin => "builtin",
+        crate::scanner::RuleSource::Custom => "custom",
+        crate::scanner::RuleSource::Gitignore => "gitignore",
+        crate::scanner::RuleSource::Heuristic => "heuristic",
+    }
+}
+
+fn source_sort_rank(project: &EvaluatedProject) -> u8 {
+    match project.project.matched_rule.as_ref().map(|r| r.source) {
+        Some(crate::scanner::RuleSource::Custom) => 0,
+        Some(crate::scanner::RuleSource::Builtin) => 1,
+        Some(crate::scanner::RuleSource::Heuristic) => 2,
+        Some(crate::scanner::RuleSource::Gitignore) => 3,
+        None => 4,
+    }
+}
+
+fn decision_summary(project: &EvaluatedProject, recent_days: i64) -> &'static str {
+    if default_selectable(project, recent_days) {
+        "Eligible to clean now"
+    } else {
+        "Will be skipped by default"
+    }
+}
+
+fn block_reason(project: &EvaluatedProject, recent_days: i64) -> String {
+    if project.project.in_use {
+        return "Project appears active (lock file modified recently).".to_string();
+    }
+    if project.safety.protected {
+        return format!(
+            "Target is protected by policy {}.",
+            project
+                .safety
+                .protected_by
+                .clone()
+                .unwrap_or_else(|| "(rule)".to_string())
+        );
+    }
+    if project.safety.recent {
+        return format!(
+            "Target was modified within the recent window ({} days).",
+            recent_days
+        );
+    }
+    "No blocker. Safe to include in cleanup selection.".to_string()
 }
 
 pub fn run_tui(path: PathBuf) -> Result<()> {
@@ -473,48 +609,57 @@ fn render_ui(f: &mut Frame, app: &mut AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(7),
             Constraint::Min(10),
-            Constraint::Length(5),
+            Constraint::Length(6),
         ])
         .split(f.size());
 
     draw_header(f, chunks[0], app);
     draw_body(f, chunks[1], app);
     draw_footer(f, chunks[2], app);
+
+    if app.input_mode == InputMode::FilterPanel {
+        draw_filter_panel(f, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
-    let category = app
-        .category_filter
-        .map(|c| c.as_str().to_string())
-        .unwrap_or_else(|| "all".to_string());
-    let risk = app
-        .risk_filter
-        .map(|r| r.as_str().to_string())
-        .unwrap_or_else(|| "all".to_string());
+    let mode = match app.input_mode {
+        InputMode::Normal => "browse",
+        InputMode::Search => "search",
+        InputMode::FilterPanel => "filters",
+    };
+
     let text = vec![
         Line::from(Span::styled(
-            "Dev Cleaner - TUI v2",
+            "Dev Cleaner - Select, Review, Confirm",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
+        Line::from("1) Select targets  2) Review right-side explanation  3) Press Enter to clean"),
         Line::from(format!(
-            "Visible: {} | Total visible size: {} | Selected: {} ({})",
+            "Visible: {} ({}) | Selected: {} ({})",
             app.visible_indices.len(),
             format_size(app.visible_total_size()),
             app.selected_count(),
             format_size(app.selected_size())
         )),
         Line::from(format!(
-            "query=`{}` category={} risk={} sort={} include_recent={} include_protected={}",
-            app.query,
-            category,
-            risk,
+            "Controls: sort={} include_recent={} include_protected={}",
             app.sort_key.as_str(),
             app.include_recent,
             app.include_protected
+        )),
+        Line::from(format!(
+            "Search: `{}` | Mode: {}",
+            if app.query.is_empty() {
+                "<empty>"
+            } else {
+                &app.query
+            },
+            mode
         )),
     ];
 
@@ -539,42 +684,31 @@ fn draw_project_list(f: &mut Frame, area: Rect, app: &mut AppState) {
         .map(|idx| {
             let p = &app.projects[*idx];
             let selected_marker = if app.selected[*idx] { "[✓]" } else { "[ ]" };
-            let mut tags = Vec::new();
-            if p.project.in_use {
-                tags.push("IN_USE");
-            }
-            if p.safety.protected {
-                tags.push("PROTECTED");
-            }
-            if p.safety.recent {
-                tags.push("RECENT");
-            }
-            let tags = if tags.is_empty() {
-                String::new()
-            } else {
-                format!(" [{}]", tags.join(","))
-            };
             let line = format!(
-                "{} {:<10} {:>9} {:<12} {}{}",
+                "{} {:>8} {:<10} {:<10} {:<8} {}",
                 selected_marker,
-                p.project.project_type_display_name(),
                 format_size(p.project.size),
-                format!("[{}/{}]", p.project.category, p.project.risk_level),
+                detection_source(p),
+                selection_status(p),
+                p.project.project_type_display_name(),
                 p.project.cleanable_dir.display(),
-                tags
             );
             ListItem::new(line)
         })
         .collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Targets"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Targets  [x] size source state type path"),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol(">> ");
+        .highlight_symbol("› ");
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
@@ -586,25 +720,15 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &AppState) {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
-                "Project: {}",
-                p.project.project_type_display_name()
+                "Decision: {}",
+                decision_summary(p, app.recent_days),
             )),
+            Line::from(format!("Reason: {}", block_reason(p, app.recent_days),)),
+            Line::from(""),
+            Line::from(format!("Type: {}", p.project.project_type_display_name())),
             Line::from(format!("Size: {}", format_size(p.project.size))),
             Line::from(format!("Age: {} days", p.project.days_since_modified())),
-            Line::from(format!("Category: {}", p.project.category)),
-            Line::from(format!("Risk: {}", p.project.risk_level)),
-            Line::from(format!("Confidence: {}", p.project.confidence)),
-            Line::from(format!("In use: {}", p.project.in_use)),
-            Line::from(format!("Protected: {}", p.safety.protected)),
-            Line::from(format!("Recent: {}", p.safety.recent)),
-            Line::from(format!(
-                "Rule: {}",
-                p.project
-                    .matched_rule
-                    .as_ref()
-                    .map(|r| format!("{:?}:{}", r.source, r.pattern))
-                    .unwrap_or_else(|| "-".to_string())
-            )),
+            Line::from(format!("Source: {}", detection_source(p))),
             Line::from(format!(
                 "Protected by: {}",
                 p.safety
@@ -622,30 +746,102 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &AppState) {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
+    let shortcut_line = match app.input_mode {
+        InputMode::Normal => {
+            "j/k move | space toggle | enter clean | / search | f filters | ? help | q quit"
+        }
+        InputMode::Search => {
+            "Search mode: type to filter list, Backspace delete, Enter/Esc to exit"
+        }
+        InputMode::FilterPanel => {
+            "Filter mode: j/k choose field, h/l change value, Enter apply, Esc close"
+        }
+    };
+
     let help = vec![
-        Line::from("↑/↓/j/k move | space toggle | enter clean | q quit | ? help"),
-        Line::from("c category | r risk | s sort | R recent toggle | P protected toggle"),
-        Line::from("type to search | backspace clear"),
+        Line::from(shortcut_line),
         Line::from(format!(
             "Selected: {} ({})",
             app.selected_count(),
             format_size(app.selected_size())
         )),
+        Line::from("Tip: review source + status before cleaning."),
     ];
     let footer =
         Paragraph::new(help).block(Block::default().borders(Borders::ALL).title("Controls"));
     f.render_widget(footer, area);
 }
 
+fn draw_filter_panel(f: &mut Frame, app: &AppState) {
+    let area = centered_rect(62, 13, f.size());
+    f.render_widget(Clear, area);
+
+    let fields = vec![
+        format!("Sort: {}", app.sort_key.as_str()),
+        format!("Include recent: {}", app.include_recent),
+        format!("Include protected: {}", app.include_protected),
+    ];
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Filter Panel",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for (i, field) in fields.iter().enumerate() {
+        if i == app.filter_cursor {
+            lines.push(Line::from(Span::styled(
+                format!("> {}", field),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(format!("  {}", field)));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "Use j/k to move, h/l or Enter to change, Esc to close.",
+    ));
+
+    let panel =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Filters"));
+    f.render_widget(panel, area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
 fn draw_help(f: &mut Frame) {
     let help_text = vec![
-        Line::from("Help - TUI v2"),
+        Line::from("Help - Dev Cleaner TUI"),
         Line::from(""),
         Line::from("Navigation: ↑/↓/j/k"),
         Line::from("Selection: space toggle, a select all visible, d deselect visible"),
-        Line::from("Filters: c category, r risk, R include recent, P include protected"),
-        Line::from("Sort: s cycle size/age/risk"),
-        Line::from("Search: type to append query, Backspace to delete"),
+        Line::from("Search: / enters search mode, type to filter, Enter/Esc exits search"),
+        Line::from("Filters: f opens panel (j/k choose, h/l change), or s/R/P quick keys"),
+        Line::from("Sort: size, age, source"),
         Line::from("Actions: Enter clean selected, q/Esc quit"),
         Line::from(""),
         Line::from("Press any key to close"),
@@ -659,6 +855,7 @@ fn draw_help(f: &mut Frame) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::{Category, RiskLevel};
     use chrono::Duration;
     use std::path::PathBuf;
 
@@ -785,70 +982,20 @@ mod tests {
         );
 
         assert_eq!(
-            handle_key(&mut app, KeyCode::Char('c')),
+            handle_key(&mut app, KeyCode::Char('s')),
             AppOutcome::Continue
         );
-        assert_eq!(app.visible_indices.len(), 1);
+        assert_eq!(app.sort_key.as_str(), "age");
         assert_eq!(
-            app.selected_project().unwrap().project.category,
-            Category::Cache
-        );
-
-        assert_eq!(
-            handle_key(&mut app, KeyCode::Char('c')),
+            handle_key(&mut app, KeyCode::Char('s')),
             AppOutcome::Continue
         );
-        assert_eq!(app.visible_indices.len(), 1);
+        assert_eq!(app.sort_key.as_str(), "source");
         assert_eq!(
-            app.selected_project().unwrap().project.category,
-            Category::Build
-        );
-
-        assert_eq!(
-            handle_key(&mut app, KeyCode::Char('c')),
+            handle_key(&mut app, KeyCode::Char('s')),
             AppOutcome::Continue
         );
-        assert_eq!(app.visible_indices.len(), 1);
-        assert_eq!(
-            app.selected_project().unwrap().project.category,
-            Category::Deps
-        );
-
-        assert_eq!(
-            handle_key(&mut app, KeyCode::Char('c')),
-            AppOutcome::Continue
-        );
-        assert_eq!(app.visible_indices.len(), 3);
-
-        assert_eq!(
-            handle_key(&mut app, KeyCode::Char('r')),
-            AppOutcome::Continue
-        );
-        assert!(app
-            .visible_indices
-            .iter()
-            .all(|idx| app.projects[*idx].project.risk_level == RiskLevel::Low));
-        assert_eq!(
-            handle_key(&mut app, KeyCode::Char('r')),
-            AppOutcome::Continue
-        );
-        assert!(app
-            .visible_indices
-            .iter()
-            .all(|idx| app.projects[*idx].project.risk_level == RiskLevel::Medium));
-        assert_eq!(
-            handle_key(&mut app, KeyCode::Char('r')),
-            AppOutcome::Continue
-        );
-        assert!(app
-            .visible_indices
-            .iter()
-            .all(|idx| app.projects[*idx].project.risk_level == RiskLevel::High));
-        assert_eq!(
-            handle_key(&mut app, KeyCode::Char('r')),
-            AppOutcome::Continue
-        );
-        assert_eq!(app.visible_indices.len(), 3);
+        assert_eq!(app.sort_key.as_str(), "size");
 
         assert_eq!(
             handle_key(&mut app, KeyCode::Char('R')),

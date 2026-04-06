@@ -7,7 +7,7 @@ use crate::audit::AuditLogger;
 use crate::cleaner::CleanOptions;
 use crate::interactive::{ProjectSelector, SelectorOptions};
 use crate::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
-use crate::scanner::{Category, ProjectDetector, RiskLevel};
+use crate::scanner::{Category, ProjectDetector, RiskLevel, RuleSource};
 use crate::trash::{
     default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
     restore_batch, trash_entries_for_batch,
@@ -994,15 +994,12 @@ fn run_scan(
             dir_display.clone()
         };
         pb.set_message(format!("{}: {}", short_path, project.size_human()));
+        let rule_meta = detection_meta(&project);
         pb.println(format!(
             "  {} {} {} {} ({}){}{}",
             "✓".green(),
             project.project_type_display_name().bright_cyan(),
-            format!(
-                "[{}/{}/{}]",
-                project.category, project.risk_level, project.confidence
-            )
-            .bright_black(),
+            rule_meta.bright_black(),
             dir_display.bright_white(),
             project.size_human().yellow(),
             if project.protected {
@@ -1511,16 +1508,13 @@ fn display_projects(projects: &[ProjectInfo]) {
         } else {
             "".white()
         };
+        let rule_meta = detection_meta(project);
 
         println!(
             "{}. [{}] {} {} - {}{}{}{} ({})",
             (idx + 1).to_string().dimmed(),
             colored_type,
-            format!(
-                "[{}/{}/{}]",
-                project.category, project.risk_level, project.confidence
-            )
-            .bright_black(),
+            rule_meta.bright_black(),
             project.cleanable_dir.display().to_string().bold(),
             project.size_human().green(),
             in_use,
@@ -1529,6 +1523,24 @@ fn display_projects(projects: &[ProjectInfo]) {
             format!("{} days old", project.days_since_modified()).dimmed()
         );
     }
+}
+
+fn rule_source_label(source: RuleSource) -> &'static str {
+    match source {
+        RuleSource::Custom => "custom",
+        RuleSource::Builtin => "builtin",
+        RuleSource::Gitignore => "gitignore",
+        RuleSource::Heuristic => "heuristic",
+    }
+}
+
+fn detection_meta(project: &ProjectInfo) -> String {
+    let source = project
+        .matched_rule
+        .as_ref()
+        .map(|rule| rule_source_label(rule.source))
+        .unwrap_or("unknown");
+    format!("source: {}", source)
 }
 
 fn select_projects_interactive(projects: &[ProjectInfo]) -> Result<Vec<ProjectInfo>> {
