@@ -66,19 +66,22 @@ cargo run -- undo
 
 ### Module Map
 
-- `src/scanner/`
+- `crates/dev-cleaner-core/src/scanner/`
   - `walker.rs`: core scan engine (parallel traversal, dedup, filters, rule attribution)
   - `detector.rs`: project-type detection, built-in cleanable patterns, `.gitignore` discovery helpers
   - `size_calculator.rs`: parallel + streaming directory size calculation (timeout protected)
-- `src/cleaner/mod.rs`: applies deletion/trash operations with progress + safety checks
-- `src/trash.rs`: undoable trash store (batches + JSONL log) and maintenance ops (list/show/purge/gc/restore)
-- `src/plan.rs`: `CleanupPlan` schema (JSON) used by `plan`, `recommend --output-plan`, and `apply`
-- `src/recommend.rs`: goal-based selection logic (space target / free-space target)
-- `src/stats/mod.rs`: aggregates scan results; terminal tables/charts and JSON export
-- `src/cli/mod.rs`: clap CLI wiring for all commands/subcommands
+- `crates/dev-cleaner-core/src/cleaner/mod.rs`: applies deletion/trash operations with observer-based progress + safety checks
+- `crates/dev-cleaner-core/src/trash.rs`: undoable trash store (batches + JSONL log) and maintenance ops (list/show/purge/gc/restore)
+- `crates/dev-cleaner-core/src/plan.rs`: `CleanupPlan` schema (JSON) used by `plan`, `recommend --output-plan`, and `apply`
+- `crates/dev-cleaner-core/src/recommend.rs`: goal-based selection logic (space target / free-space target)
+- `crates/dev-cleaner-core/src/stats/mod.rs`: aggregates scan results and JSON export data
+- `crates/dev-cleaner-core/src/app/`: reusable Rust service layer for scan, cleanup selection, and plan application
+- `src/cli/mod.rs`: clap CLI wiring and terminal rendering for all commands/subcommands
 - `src/tui/`: ratatui interactive UI
-- `src/utils.rs`: formatting and parsing utilities (e.g., human sizes like `10GB`)
-- `src/config/mod.rs`: TOML config (`exclude_dirs`, `custom_patterns`, defaults)
+- `src/stats/mod.rs`: terminal table/chart rendering for statistics
+- `src/clean_progress.rs`: terminal observers for cleanup/restore progress
+- `crates/dev-cleaner-core/src/utils.rs`: formatting and parsing utilities (e.g., human sizes like `10GB`)
+- `crates/dev-cleaner-core/src/config/mod.rs`: TOML config (`exclude_dirs`, `custom_patterns`, defaults)
 
 ### Scan Pipeline (Regular vs Streaming)
 
@@ -107,7 +110,7 @@ cargo run -- undo
 
 ### Matching, Rule Attribution, Category, Risk, Confidence
 
-Each result is a `ProjectInfo` (`src/scanner/mod.rs`) with metadata:
+Each result is a `ProjectInfo` (`crates/dev-cleaner-core/src/scanner/mod.rs`) with metadata:
 - `matched_rule`: where the match came from (`builtin`, `custom`, `gitignore`, `heuristic`) + pattern
 - `category`: `cache` / `build` / `deps` (heuristic classification from directory names)
 - `risk_level`:
@@ -137,16 +140,16 @@ When `--trash` is enabled (and not `--dry-run`), clean/apply moves directories i
 
 ### Add a New Built-in Project Type
 
-1. Add a variant to `ProjectType` in `src/scanner/detector.rs`.
+1. Add a variant to `ProjectType` in `crates/dev-cleaner-core/src/scanner/detector.rs`.
 2. Update `ProjectDetector::detect()` with marker-file checks.
 3. Add built-in cleanable patterns in `ProjectDetector::cleanable_dirs()`.
-4. If new patterns don’t classify correctly, extend `classify_category()` in `src/scanner/walker.rs`.
+4. If new patterns don’t classify correctly, extend `classify_category()` in `crates/dev-cleaner-core/src/scanner/walker.rs`.
 5. If applicable, add lock-file checks in `ProjectDetector::is_in_use()`.
-6. Add/adjust unit tests in `src/scanner/detector.rs` and/or `src/scanner/walker.rs`.
+6. Add/adjust unit tests in `crates/dev-cleaner-core/src/scanner/detector.rs` and/or `crates/dev-cleaner-core/src/scanner/walker.rs`.
 
 ### Custom Patterns (User Config)
 
-Config lives in `src/config/mod.rs` and is loaded via `--config` or the default path (`Config::default_path()`).
+Config lives in `crates/dev-cleaner-core/src/config/mod.rs` and is loaded via `--config` or the default path (`Config::default_path()`).
 Custom patterns allow naming a rule and scoping it via marker files (see `CustomPattern`).
 
 ## Common Gotchas
@@ -154,4 +157,4 @@ Custom patterns allow naming a rule and scoping it via marker files (see `Custom
 - `--gitignore` is **off by default**; many cleanable dirs are gitignored, so enabling it can hide real targets.
 - `.gitignore`-discovered candidates are intentionally `high` risk + `low` confidence; they won’t show up with the default `--max-risk medium`.
 - Deduplication must run before reporting results; without it you’ll get noisy nested matches (e.g., `.venv/.../__pycache__`).
-- `apply` is plan-driven: updating the plan schema requires bumping `CleanupPlan.schema_version` (`src/plan.rs`).
+- `apply` is plan-driven: updating the plan schema requires bumping `CleanupPlan.schema_version` (`crates/dev-cleaner-core/src/plan.rs`).

@@ -1,25 +1,17 @@
-pub mod app;
-pub mod audit;
-pub mod cleaner;
+mod clean_progress;
 pub mod cli;
-pub mod config;
-pub mod evaluation;
 pub mod interactive;
-pub mod metrics;
-pub mod plan;
-pub mod policy;
-pub mod recommend;
-pub mod scanner;
+mod metrics;
 pub mod stats;
-pub mod trash;
 pub mod tui;
-pub mod utils;
 
-// Re-export commonly used types
-pub use cleaner::Cleaner;
-pub use config::Config;
-pub use evaluation::{EvaluatedProject, SafetyFlags, SelectionReason, SkipReason};
-pub use plan::CleanupPlan;
-pub use scanner::{ProjectInfo, ProjectType, Scanner};
-pub use stats::Statistics;
-pub use trash::{TrashEntry, TrashManager};
+pub use dev_cleaner_core as core;
+pub use dev_cleaner_core::{
+    recommend_projects, ApplyPlanRequest, ApplyPlanResult, ApplyPlanService, Category, CleanAction,
+    CleanObserver, CleanOptions, CleanResult, Cleaner, CleanupPlan, CleanupRequest,
+    CleanupSelection, CleanupService, Confidence, Config, CustomPattern, DiscoveredProjects,
+    EvaluatedProject, PlanParams, ProjectDetector, ProjectInfo, ProjectType, RecommendOptions,
+    RecommendResult, RecommendStrategy, RiskLevel, RuleRef, RuleSource, SafetyFlags, ScanRequest,
+    ScanResult, ScanService, Scanner, SelectionReason, SizeCalculator, SkipReason, Statistics,
+    TrashEntry, TrashManager, VisibilityOptions,
+};

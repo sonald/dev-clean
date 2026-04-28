@@ -213,12 +213,32 @@ pub struct RestoreResult {
     pub errors: Vec<String>,
 }
 
+pub trait RestoreObserver {
+    fn on_dry_run(&mut self, _entry: &TrashEntry) {}
+    fn on_restored(&mut self, _entry: &TrashEntry) {}
+}
+
+#[derive(Debug, Default)]
+pub struct NoopRestoreObserver;
+
+impl RestoreObserver for NoopRestoreObserver {}
+
 pub fn restore_batch(
     root: &Path,
     batch_id: &str,
     dry_run: bool,
     force: bool,
-    verbose: bool,
+) -> Result<RestoreResult> {
+    let mut observer = NoopRestoreObserver;
+    restore_batch_with_observer(root, batch_id, dry_run, force, &mut observer)
+}
+
+pub fn restore_batch_with_observer<O: RestoreObserver>(
+    root: &Path,
+    batch_id: &str,
+    dry_run: bool,
+    force: bool,
+    observer: &mut O,
 ) -> Result<RestoreResult> {
     let log_path = root.join(TRASH_LOG_FILENAME);
     let mut entries: Vec<TrashEntry> = load_trash_log(&log_path)?
@@ -260,13 +280,7 @@ pub fn restore_batch(
 
         if dry_run {
             restored_count += 1;
-            if verbose {
-                println!(
-                    "[DRY RUN] Would restore: {} -> {}",
-                    entry.trashed_path.display(),
-                    entry.original_path.display()
-                );
-            }
+            observer.on_dry_run(&entry);
             continue;
         }
 
@@ -301,9 +315,7 @@ pub fn restore_batch(
         match move_path_with_exdev_fallback(&entry.trashed_path, &entry.original_path) {
             Ok(_) => {
                 restored_count += 1;
-                if verbose {
-                    println!("✓ Restored {}", entry.original_path.display());
-                }
+                observer.on_restored(&entry);
             }
             Err(err) => {
                 failed_count += 1;
@@ -797,7 +809,7 @@ mod tests {
         manager.trash_dir(&original, 1).unwrap();
         assert!(!original.exists());
 
-        let result = restore_batch(&trash_root, &manager.batch_id, false, false, false).unwrap();
+        let result = restore_batch(&trash_root, &manager.batch_id, false, false).unwrap();
         assert_eq!(result.restored_count, 1);
         assert!(original.exists());
     }
@@ -927,7 +939,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let trash_root = temp.path().join("trash");
 
-        let result = restore_batch(&trash_root, "missing", false, false, false).unwrap();
+        let result = restore_batch(&trash_root, "missing", false, false).unwrap();
         assert_eq!(result.restored_count, 0);
         assert_eq!(result.skipped_count, 0);
         assert_eq!(result.failed_count, 0);
@@ -948,7 +960,7 @@ mod tests {
         );
         write_entries(&log_path, &[entry]);
 
-        let result = restore_batch(&trash_root, "batch-1", false, false, false).unwrap();
+        let result = restore_batch(&trash_root, "batch-1", false, false).unwrap();
         assert_eq!(result.restored_count, 0);
         assert_eq!(result.skipped_count, 1);
         assert_eq!(result.failed_count, 0);
@@ -977,7 +989,7 @@ mod tests {
             )],
         );
 
-        let result = restore_batch(&trash_root, "batch-1", false, false, false).unwrap();
+        let result = restore_batch(&trash_root, "batch-1", false, false).unwrap();
         assert_eq!(result.restored_count, 0);
         assert_eq!(result.skipped_count, 1);
         assert_eq!(result.failed_count, 0);
@@ -1023,7 +1035,7 @@ mod tests {
             ],
         );
 
-        let result = restore_batch(&trash_root, "batch-1", false, true, false).unwrap();
+        let result = restore_batch(&trash_root, "batch-1", false, true).unwrap();
         assert_eq!(result.restored_count, 2);
         assert_eq!(result.skipped_count, 0);
         assert_eq!(result.failed_count, 0);
@@ -1053,7 +1065,7 @@ mod tests {
             )],
         );
 
-        let result = restore_batch(&trash_root, "batch-1", true, false, true).unwrap();
+        let result = restore_batch(&trash_root, "batch-1", true, false).unwrap();
         assert_eq!(result.restored_count, 1);
         assert_eq!(result.skipped_count, 0);
         assert_eq!(result.failed_count, 0);
@@ -1094,7 +1106,7 @@ mod tests {
             ],
         );
 
-        let result = restore_batch(&trash_root, "batch-1", false, false, false).unwrap();
+        let result = restore_batch(&trash_root, "batch-1", false, false).unwrap();
         assert_eq!(result.restored_count, 1);
         assert_eq!(result.skipped_count, 1);
         assert!(child_original.exists());

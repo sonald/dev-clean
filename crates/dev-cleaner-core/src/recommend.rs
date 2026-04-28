@@ -69,7 +69,8 @@ impl BlockedSummary {
 pub struct RecommendResult {
     pub target_bytes: u64,
     pub selected_bytes: u64,
-    pub selected: Vec<ProjectInfo>,
+    pub selected: Vec<EvaluatedProject>,
+    pub blocked_projects: Vec<EvaluatedProject>,
     pub blocked: BlockedSummary,
 }
 
@@ -78,41 +79,40 @@ pub fn recommend_projects(
     options: &RecommendOptions,
 ) -> RecommendResult {
     let mut blocked = BlockedSummary::default();
+    let mut blocked_projects = Vec::new();
     let mut eligible = Vec::new();
 
     for project in candidates {
         let mut evaluated = EvaluatedProject::from(project);
-        evaluated.safety.recent = evaluated.project.days_since_modified() < options.recent_days;
+        evaluated.safety.recent = evaluated.info.days_since_modified() < options.recent_days;
 
         if let Some(max_risk) = options.max_risk {
-            if evaluated.project.risk_level > max_risk {
+            if evaluated.info.risk_level > max_risk {
                 blocked.risk_count += 1;
-                blocked.risk_bytes = blocked.risk_bytes.saturating_add(evaluated.project.size);
-                let _ = evaluated.mark_skip_reason(SkipReason::Risk);
+                blocked.risk_bytes = blocked.risk_bytes.saturating_add(evaluated.info.size);
+                blocked_projects.push(evaluated.with_skip_reason(SkipReason::Risk));
                 continue;
             }
         }
 
-        if !options.include_in_use && evaluated.project.in_use {
+        if !options.include_in_use && evaluated.info.in_use {
             blocked.in_use_count += 1;
-            blocked.in_use_bytes = blocked.in_use_bytes.saturating_add(evaluated.project.size);
-            let _ = evaluated.mark_skip_reason(SkipReason::InUse);
+            blocked.in_use_bytes = blocked.in_use_bytes.saturating_add(evaluated.info.size);
+            blocked_projects.push(evaluated.with_skip_reason(SkipReason::InUse));
             continue;
         }
 
         if !options.include_protected && evaluated.safety.protected {
             blocked.protected_count += 1;
-            blocked.protected_bytes = blocked
-                .protected_bytes
-                .saturating_add(evaluated.project.size);
-            let _ = evaluated.mark_skip_reason(SkipReason::Protected);
+            blocked.protected_bytes = blocked.protected_bytes.saturating_add(evaluated.info.size);
+            blocked_projects.push(evaluated.with_skip_reason(SkipReason::Protected));
             continue;
         }
 
         if !options.include_recent && evaluated.safety.recent {
             blocked.recent_count += 1;
-            blocked.recent_bytes = blocked.recent_bytes.saturating_add(evaluated.project.size);
-            let _ = evaluated.mark_skip_reason(SkipReason::Recent);
+            blocked.recent_bytes = blocked.recent_bytes.saturating_add(evaluated.info.size);
+            blocked_projects.push(evaluated.with_skip_reason(SkipReason::Recent));
             continue;
         }
 
@@ -122,11 +122,11 @@ pub fn recommend_projects(
     eligible.sort_by(|a, b| {
         score_project(b, options.strategy)
             .cmp(&score_project(a, options.strategy))
-            .then_with(|| b.project.size.cmp(&a.project.size))
+            .then_with(|| b.info.size.cmp(&a.info.size))
             .then_with(|| {
-                b.project
+                b.info
                     .days_since_modified()
-                    .cmp(&a.project.days_since_modified())
+                    .cmp(&a.info.days_since_modified())
             })
     });
 
@@ -137,31 +137,32 @@ pub fn recommend_projects(
         if selected_bytes >= options.target_bytes {
             break;
         }
-        selected_bytes = selected_bytes.saturating_add(project.project.size);
-        project = project.mark_selection_reason(match options.strategy {
+        selected_bytes = selected_bytes.saturating_add(project.info.size);
+        project = project.with_selection_reason(match options.strategy {
             RecommendStrategy::SafeFirst => SelectionReason::StrategySafeFirst,
             RecommendStrategy::Balanced => SelectionReason::StrategyBalanced,
             RecommendStrategy::MaxSpace => SelectionReason::StrategyMaxSpace,
         });
-        selected.push(project.into_project_info());
+        selected.push(project);
     }
 
     RecommendResult {
         target_bytes: options.target_bytes,
         selected_bytes,
         selected,
+        blocked_projects,
         blocked,
     }
 }
 
 fn score_project(p: &EvaluatedProject, strategy: RecommendStrategy) -> i64 {
-    let risk_penalty = match p.project.risk_level {
+    let risk_penalty = match p.info.risk_level {
         RiskLevel::Low => 0,
         RiskLevel::Medium => 30,
         RiskLevel::High => 80,
     };
-    let age_bonus = p.project.days_since_modified().clamp(0, 365);
-    let size_mb = (p.project.size / (1024 * 1024)) as i64;
+    let age_bonus = p.info.days_since_modified().clamp(0, 365);
+    let size_mb = (p.info.size / (1024 * 1024)) as i64;
 
     match strategy {
         RecommendStrategy::SafeFirst => age_bonus * 2 + size_mb - risk_penalty * 3,
@@ -214,10 +215,10 @@ mod tests {
 
         let result = recommend_projects(projects, &opts);
         assert_eq!(result.selected.len(), 1);
-        assert_eq!(result.selected[0].size, 500 * 1024 * 1024);
+        assert_eq!(result.selected[0].info.size, 500 * 1024 * 1024);
         assert_eq!(
-            result.selected[0].selection_reason.as_deref(),
-            Some("strategy_max_space")
+            result.selected[0].selection_reason,
+            Some(SelectionReason::StrategyMaxSpace)
         );
     }
 
@@ -227,6 +228,11 @@ mod tests {
         let opts = RecommendOptions::new(100);
         let result = recommend_projects(projects, &opts);
         assert!(result.selected.is_empty());
+        assert_eq!(result.blocked_projects.len(), 1);
+        assert_eq!(
+            result.blocked_projects[0].skip_reason,
+            Some(SkipReason::Recent)
+        );
         assert_eq!(result.blocked.recent_count, 1);
     }
 

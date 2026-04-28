@@ -50,6 +50,12 @@ fn parse_json_value(stdout: &[u8]) -> Value {
     serde_json::from_slice(stdout).unwrap()
 }
 
+#[test]
+fn public_stats_module_reexports_statistics() {
+    let stats = dev_cleaner::stats::Statistics::from_projects(Vec::new());
+    assert_eq!(stats.total_projects, 0);
+}
+
 fn audit_log_path(workspace: &TempDir) -> PathBuf {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let _guard = LOCK
@@ -206,4 +212,77 @@ fn clean_trash_undo_roundtrip_updates_files_and_audit_log() {
     let undo_stdout = String::from_utf8_lossy(&undo_output.stdout);
     assert!(undo_stdout.contains("Restore completed!"));
     assert!(project_root.join("target").join("artifact.bin").exists());
+}
+
+#[test]
+fn plan_apply_dry_run_keeps_target() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "apply-dry-run-app", 1024);
+    let plan_path = workspace.path().join("apply-plan.json");
+
+    run(
+        &workspace,
+        &[
+            "plan",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+            "-o",
+            plan_path.to_str().unwrap(),
+        ],
+    );
+
+    let output = run(
+        &workspace,
+        &[
+            "apply",
+            plan_path.to_str().unwrap(),
+            "--dry-run",
+            "--include-recent",
+            "--force",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("Applying cleanup plan"));
+    assert!(stdout.contains("Cleaning completed!"));
+    assert!(project_root.join("target").join("artifact.bin").exists());
+}
+
+#[test]
+fn plan_apply_trash_moves_target_and_logs_apply() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "apply-trash-app", 2048);
+    let plan_path = workspace.path().join("apply-trash-plan.json");
+
+    run(
+        &workspace,
+        &[
+            "plan",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+            "-o",
+            plan_path.to_str().unwrap(),
+        ],
+    );
+
+    let output = run(
+        &workspace,
+        &[
+            "apply",
+            plan_path.to_str().unwrap(),
+            "--trash",
+            "--include-recent",
+            "--force",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("Cleaning completed!"));
+    assert!(stdout.contains("Trash batch:"));
+    assert!(!project_root.join("target").exists());
+
+    let audit_path = audit_log_path(&workspace);
+    let audit_content = fs::read_to_string(&audit_path).unwrap();
+    assert!(audit_content.contains("\"command\":\"apply\""));
+    assert!(audit_content.contains("\"type\":\"run_finished\""));
 }

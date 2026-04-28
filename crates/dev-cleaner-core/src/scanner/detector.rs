@@ -513,6 +513,7 @@ fn dir_contains_extension(dir: &Path, extensions: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
@@ -523,6 +524,13 @@ mod tests {
             .status()
             .expect("failed to run touch");
         assert!(status.success());
+    }
+
+    fn touch_days_ago(path: &Path, days: i64) {
+        let timestamp = (Utc::now() - Duration::days(days))
+            .format("%Y%m%d%H%M")
+            .to_string();
+        touch_with_timestamp(path, &timestamp);
     }
 
     #[test]
@@ -647,21 +655,18 @@ lib/
         fs::create_dir_all(&python_dir).unwrap();
         fs::create_dir_all(&generic_dir).unwrap();
 
-        let recent_stamp = "202603250101";
-        let stale_stamp = "202603010101";
-
         fs::write(node_dir.join("package-lock.json"), "{}").unwrap();
         fs::write(node_dir.join("yarn.lock"), "{}").unwrap();
-        touch_with_timestamp(&node_dir.join("package-lock.json"), stale_stamp);
-        touch_with_timestamp(&node_dir.join("yarn.lock"), recent_stamp);
+        touch_days_ago(&node_dir.join("package-lock.json"), 30);
+        touch_days_ago(&node_dir.join("yarn.lock"), 1);
 
         fs::write(rust_dir.join("Cargo.lock"), "# lock").unwrap();
-        touch_with_timestamp(&rust_dir.join("Cargo.lock"), stale_stamp);
+        touch_days_ago(&rust_dir.join("Cargo.lock"), 30);
 
         fs::write(python_dir.join("Pipfile.lock"), "{}").unwrap();
         fs::write(python_dir.join("poetry.lock"), "{}").unwrap();
-        touch_with_timestamp(&python_dir.join("Pipfile.lock"), stale_stamp);
-        touch_with_timestamp(&python_dir.join("poetry.lock"), recent_stamp);
+        touch_days_ago(&python_dir.join("Pipfile.lock"), 30);
+        touch_days_ago(&python_dir.join("poetry.lock"), 1);
 
         assert!(ProjectDetector::is_in_use(&node_dir, ProjectType::NodeJs));
         assert!(!ProjectDetector::is_in_use(&rust_dir, ProjectType::Rust));
@@ -670,6 +675,17 @@ lib/
             &generic_dir,
             ProjectType::Generic
         ));
+    }
+
+    #[test]
+    fn test_is_in_use_seven_day_boundary_is_not_recent() {
+        let temp = TempDir::new().unwrap();
+        let node_dir = temp.path().join("node");
+        fs::create_dir_all(&node_dir).unwrap();
+        fs::write(node_dir.join("package-lock.json"), "{}").unwrap();
+        touch_days_ago(&node_dir.join("package-lock.json"), 7);
+
+        assert!(!ProjectDetector::is_in_use(&node_dir, ProjectType::NodeJs));
     }
 
     #[test]

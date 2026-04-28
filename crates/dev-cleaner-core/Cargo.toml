@@ -1,0 +1,26 @@
+[package]
+name = "dev-cleaner-core"
+version = "0.2.0"
+edition = "2021"
+authors = ["Sian Cao"]
+description = "Core library for scanning and cleaning developer build artifacts"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/sonald/dev-clean"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam = "0.8"
+dirs = "5.0"
+fs2 = "0.4"
+globset = "0.4"
+ignore = "0.4"
+num_cpus = "1.16"
+rayon = "1.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+walkdir = "2.4"
+
+[dev-dependencies]
+tempfile = "3.9"

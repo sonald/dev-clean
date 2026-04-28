@@ -1,355 +1,198 @@
-use crate::utils::format_size;
-use crate::ProjectInfo;
 use colored::Colorize;
+use dev_cleaner_core::utils::format_size;
 use prettytable::{format, Cell, Row, Table};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-/// Statistics about cleanable directories
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Statistics {
-    /// Total size of all cleanable directories
-    pub total_size: u64,
+pub use dev_cleaner_core::Statistics;
 
-    /// Total number of projects
-    pub total_projects: usize,
+pub fn display_terminal(stats: &Statistics, top_n: usize) {
+    println!("\n{}", "📊 Dev Cleaner Statistics".bright_cyan().bold());
+    println!("{}", "=".repeat(80).bright_black());
 
-    /// Statistics grouped by project type
-    pub by_type: HashMap<String, TypeStats>,
+    display_overview(stats);
+    display_by_type(stats);
+    display_charts(stats);
+    display_top_largest(stats, top_n);
+    display_by_age(stats);
+    display_recommendations(stats);
 
-    /// Top N largest directories
-    pub top_largest: Vec<ProjectStats>,
-
-    /// Statistics grouped by age
-    pub by_age_group: AgeGroupStats,
+    println!();
 }
 
-/// Statistics for a specific project type
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TypeStats {
-    /// Total size for this type
-    pub total_size: u64,
-
-    /// Number of projects of this type
-    pub count: usize,
-
-    /// Average size per project
-    pub avg_size: u64,
+fn display_overview(stats: &Statistics) {
+    println!("\n{}", "📁 Overview".bright_green().bold());
+    println!(
+        "  Total projects: {}",
+        stats.total_projects.to_string().bright_white()
+    );
+    println!(
+        "  Cleanable space: {}",
+        format_size(stats.total_size).bright_yellow()
+    );
 }
 
-/// Simplified project info for statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProjectStats {
-    /// Path to cleanable directory
-    pub path: String,
+fn display_by_type(stats: &Statistics) {
+    println!("\n{}", "📦 By Project Type".bright_green().bold());
 
-    /// Size in bytes
-    pub size: u64,
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+    table.set_titles(Row::new(vec![
+        Cell::new("Type"),
+        Cell::new("Count"),
+        Cell::new("Total Size"),
+        Cell::new("Avg Size"),
+    ]));
 
-    /// Project type
-    pub project_type: String,
+    let mut types: Vec<_> = stats.by_type.iter().collect();
+    types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
 
-    /// Days since last modification
-    pub age_days: i64,
+    for (type_name, type_stats) in types {
+        table.add_row(Row::new(vec![
+            Cell::new(type_name),
+            Cell::new(&type_stats.count.to_string()),
+            Cell::new(&format_size(type_stats.total_size)),
+            Cell::new(&format_size(type_stats.avg_size)),
+        ]));
+    }
+
+    table.printstd();
 }
 
-/// Age-based grouping of statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgeGroupStats {
-    /// Recent projects (<30 days): (count, total_size)
-    pub recent: (usize, u64),
-
-    /// Medium age projects (30-90 days): (count, total_size)
-    pub medium: (usize, u64),
-
-    /// Old projects (>90 days): (count, total_size)
-    pub old: (usize, u64),
+fn display_charts(stats: &Statistics) {
+    println!("\n{}", "Charts".bright_green().bold());
+    display_chart_by_type(stats, 8);
+    display_chart_by_age(stats);
 }
 
-impl Statistics {
-    /// Create statistics from a list of projects
-    pub fn from_projects(projects: Vec<ProjectInfo>) -> Self {
-        let total_projects = projects.len();
-        let total_size: u64 = projects.iter().map(|p| p.size).sum();
+fn display_chart_by_type(stats: &Statistics, top_n: usize) {
+    println!("  Size by project type");
 
-        // Group by type
-        let mut by_type: HashMap<String, TypeStats> = HashMap::new();
-        for project in &projects {
-            let type_name = project.project_type_display_name();
-            let entry = by_type.entry(type_name.clone()).or_insert(TypeStats {
-                total_size: 0,
-                count: 0,
-                avg_size: 0,
-            });
-            entry.total_size += project.size;
-            entry.count += 1;
-        }
+    let mut types: Vec<_> = stats.by_type.iter().collect();
+    if types.is_empty() {
+        println!("  (no data)");
+        return;
+    }
 
-        // Calculate average sizes
-        for stats in by_type.values_mut() {
-            stats.avg_size = if stats.count > 0 {
-                stats.total_size / stats.count as u64
-            } else {
-                0
-            };
-        }
+    types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
+    let max_size = types
+        .first()
+        .map(|(_, type_stats)| type_stats.total_size)
+        .unwrap_or(0);
 
-        // Create top largest list
-        let mut sorted_projects = projects.clone();
-        sorted_projects.sort_by(|a, b| b.size.cmp(&a.size));
-        let top_largest: Vec<ProjectStats> = sorted_projects
-            .iter()
-            .map(|p| ProjectStats {
-                path: p.cleanable_dir.display().to_string(),
-                size: p.size,
-                project_type: p.project_type_display_name(),
-                age_days: p.days_since_modified(),
-            })
-            .collect();
+    for (type_name, type_stats) in types.into_iter().take(top_n) {
+        let bar = render_bar(type_stats.total_size, max_size, 24);
+        let size_label = format_size(type_stats.total_size);
+        println!("  {:<18} {:>10} {}", type_name, size_label, bar);
+    }
+}
 
-        // Group by age
-        let mut recent = (0, 0u64);
-        let mut medium = (0, 0u64);
-        let mut old = (0, 0u64);
+fn display_chart_by_age(stats: &Statistics) {
+    println!("\n  Size by age group");
 
-        for project in &projects {
-            let age = project.days_since_modified();
-            if age < 30 {
-                recent.0 += 1;
-                recent.1 += project.size;
-            } else if age < 90 {
-                medium.0 += 1;
-                medium.1 += project.size;
-            } else {
-                old.0 += 1;
-                old.1 += project.size;
-            }
-        }
+    let groups = vec![
+        ("Recent (<30d)", stats.by_age_group.recent),
+        ("Medium (30-90d)", stats.by_age_group.medium),
+        ("Old (>90d)", stats.by_age_group.old),
+    ];
 
-        let by_age_group = AgeGroupStats {
-            recent,
-            medium,
-            old,
+    let max_size = groups.iter().map(|(_, (_, size))| *size).max().unwrap_or(0);
+
+    for (label, (_, size)) in groups {
+        let bar = render_bar(size, max_size, 24);
+        println!("  {:<18} {:>10} {}", label, format_size(size), bar);
+    }
+}
+
+fn display_top_largest(stats: &Statistics, top_n: usize) {
+    println!(
+        "\n{}",
+        format!("🏆 Top {} Largest Directories", top_n)
+            .bright_green()
+            .bold()
+    );
+
+    let mut table = Table::new();
+    table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
+    table.set_titles(Row::new(vec![
+        Cell::new("#"),
+        Cell::new("Path"),
+        Cell::new("Size"),
+        Cell::new("Type"),
+        Cell::new("Age"),
+    ]));
+
+    for (i, project) in stats.top_largest.iter().take(top_n).enumerate() {
+        let path = if project.path.len() > 60 {
+            format!("...{}", &project.path[project.path.len() - 57..])
+        } else {
+            project.path.clone()
         };
 
-        Self {
-            total_size,
-            total_projects,
-            by_type,
-            top_largest,
-            by_age_group,
-        }
-    }
-
-    /// Display statistics to terminal with formatted tables
-    pub fn display_terminal(&self, top_n: usize) {
-        println!("\n{}", "📊 Dev Cleaner Statistics".bright_cyan().bold());
-        println!("{}", "=".repeat(80).bright_black());
-
-        // Overview
-        self.display_overview();
-
-        // By Type
-        self.display_by_type();
-
-        // Charts
-        self.display_charts();
-
-        // Top N Largest
-        self.display_top_largest(top_n);
-
-        // By Age
-        self.display_by_age();
-
-        // Recommendations
-        self.display_recommendations();
-
-        println!();
-    }
-
-    fn display_overview(&self) {
-        println!("\n{}", "📁 Overview".bright_green().bold());
-        println!(
-            "  Total projects: {}",
-            self.total_projects.to_string().bright_white()
-        );
-        println!(
-            "  Cleanable space: {}",
-            format_size(self.total_size).bright_yellow()
-        );
-    }
-
-    fn display_by_type(&self) {
-        println!("\n{}", "📦 By Project Type".bright_green().bold());
-
-        let mut table = Table::new();
-        table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
-        table.set_titles(Row::new(vec![
-            Cell::new("Type"),
-            Cell::new("Count"),
-            Cell::new("Total Size"),
-            Cell::new("Avg Size"),
+        table.add_row(Row::new(vec![
+            Cell::new(&(i + 1).to_string()),
+            Cell::new(&path),
+            Cell::new(&format_size(project.size)),
+            Cell::new(&project.project_type),
+            Cell::new(&format!("{}d", project.age_days)),
         ]));
-
-        // Sort by total size
-        let mut types: Vec<_> = self.by_type.iter().collect();
-        types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
-
-        for (type_name, stats) in types {
-            table.add_row(Row::new(vec![
-                Cell::new(type_name),
-                Cell::new(&stats.count.to_string()),
-                Cell::new(&format_size(stats.total_size)),
-                Cell::new(&format_size(stats.avg_size)),
-            ]));
-        }
-
-        table.printstd();
     }
 
-    fn display_charts(&self) {
-        println!("\n{}", "Charts".bright_green().bold());
-        self.display_chart_by_type(8);
-        self.display_chart_by_age();
-    }
+    table.printstd();
+}
 
-    fn display_chart_by_type(&self, top_n: usize) {
-        println!("  Size by project type");
+fn display_by_age(stats: &Statistics) {
+    println!("\n{}", "⏰ By Age Group".bright_green().bold());
 
-        let mut types: Vec<_> = self.by_type.iter().collect();
-        if types.is_empty() {
-            println!("  (no data)");
-            return;
-        }
+    let (recent_count, recent_size) = stats.by_age_group.recent;
+    let (medium_count, medium_size) = stats.by_age_group.medium;
+    let (old_count, old_size) = stats.by_age_group.old;
 
-        types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
-        let max_size = types
-            .first()
-            .map(|(_, stats)| stats.total_size)
-            .unwrap_or(0);
+    println!(
+        "  {} Recent (<30 days):   {} projects, {}",
+        "📗".green(),
+        recent_count,
+        format_size(recent_size).bright_white()
+    );
+    println!(
+        "  {} Medium (30-90 days): {} projects, {}",
+        "📙".yellow(),
+        medium_count,
+        format_size(medium_size).bright_white()
+    );
+    println!(
+        "  {} Old (>90 days):      {} projects, {}",
+        "📕".red(),
+        old_count,
+        format_size(old_size).bright_white()
+    );
+}
 
-        for (type_name, stats) in types.into_iter().take(top_n) {
-            let bar = render_bar(stats.total_size, max_size, 24);
-            let size_label = format_size(stats.total_size);
-            println!("  {:<18} {:>10} {}", type_name, size_label, bar);
-        }
-    }
+fn display_recommendations(stats: &Statistics) {
+    println!("\n{}", "💡 Recommendations".bright_green().bold());
 
-    fn display_chart_by_age(&self) {
-        println!("\n  Size by age group");
-
-        let groups = vec![
-            ("Recent (<30d)", self.by_age_group.recent),
-            ("Medium (30-90d)", self.by_age_group.medium),
-            ("Old (>90d)", self.by_age_group.old),
-        ];
-
-        let max_size = groups.iter().map(|(_, (_, size))| *size).max().unwrap_or(0);
-
-        for (label, (_, size)) in groups {
-            let bar = render_bar(size, max_size, 24);
-            println!("  {:<18} {:>10} {}", label, format_size(size), bar);
-        }
-    }
-
-    fn display_top_largest(&self, top_n: usize) {
+    let (old_count, old_size) = stats.by_age_group.old;
+    if old_count > 0 {
         println!(
-            "\n{}",
-            format!("🏆 Top {} Largest Directories", top_n)
-                .bright_green()
-                .bold()
-        );
-
-        let mut table = Table::new();
-        table.set_format(*format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
-        table.set_titles(Row::new(vec![
-            Cell::new("#"),
-            Cell::new("Path"),
-            Cell::new("Size"),
-            Cell::new("Type"),
-            Cell::new("Age"),
-        ]));
-
-        for (i, project) in self.top_largest.iter().take(top_n).enumerate() {
-            // Shorten path if too long
-            let path = if project.path.len() > 60 {
-                format!("...{}", &project.path[project.path.len() - 57..])
-            } else {
-                project.path.clone()
-            };
-
-            table.add_row(Row::new(vec![
-                Cell::new(&(i + 1).to_string()),
-                Cell::new(&path),
-                Cell::new(&format_size(project.size)),
-                Cell::new(&project.project_type),
-                Cell::new(&format!("{}d", project.age_days)),
-            ]));
-        }
-
-        table.printstd();
-    }
-
-    fn display_by_age(&self) {
-        println!("\n{}", "⏰ By Age Group".bright_green().bold());
-
-        let (recent_count, recent_size) = self.by_age_group.recent;
-        let (medium_count, medium_size) = self.by_age_group.medium;
-        let (old_count, old_size) = self.by_age_group.old;
-
-        println!(
-            "  {} Recent (<30 days):   {} projects, {}",
-            "📗".green(),
-            recent_count,
-            format_size(recent_size).bright_white()
-        );
-        println!(
-            "  {} Medium (30-90 days): {} projects, {}",
-            "📙".yellow(),
-            medium_count,
-            format_size(medium_size).bright_white()
-        );
-        println!(
-            "  {} Old (>90 days):      {} projects, {}",
-            "📕".red(),
+            "  • {} old projects (>90 days) can likely be safely cleaned, freeing up {}",
             old_count,
-            format_size(old_size).bright_white()
+            format_size(old_size).bright_yellow()
         );
     }
 
-    fn display_recommendations(&self) {
-        println!("\n{}", "💡 Recommendations".bright_green().bold());
-
-        let (old_count, old_size) = self.by_age_group.old;
-        if old_count > 0 {
-            println!(
-                "  • {} old projects (>90 days) can likely be safely cleaned, freeing up {}",
-                old_count,
-                format_size(old_size).bright_yellow()
-            );
-        }
-
-        if self.top_largest.len() >= 5 {
-            let top5_size: u64 = self.top_largest.iter().take(5).map(|p| p.size).sum();
-            let percentage = (top5_size as f64 / self.total_size as f64 * 100.0) as u32;
-            println!(
-                "  • Top 5 largest directories account for {}% of total space",
-                percentage.to_string().bright_yellow()
-            );
-        }
-
-        let (recent_count, _) = self.by_age_group.recent;
-        if recent_count > 0 {
-            println!(
-                "  • {} recent projects (<30 days) are likely still in use, consider keeping them",
-                recent_count
-            );
-        }
+    if stats.top_largest.len() >= 5 && stats.total_size > 0 {
+        let top5_size: u64 = stats.top_largest.iter().take(5).map(|p| p.size).sum();
+        let percentage = (top5_size as f64 / stats.total_size as f64 * 100.0) as u32;
+        println!(
+            "  • Top 5 largest directories account for {}% of total space",
+            percentage.to_string().bright_yellow()
+        );
     }
 
-    /// Export statistics as JSON string
-    pub fn to_json(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string_pretty(self)
+    let (recent_count, _) = stats.by_age_group.recent;
+    if recent_count > 0 {
+        println!(
+            "  • {} recent projects (<30 days) are likely still in use, consider keeping them",
+            recent_count
+        );
     }
 }
 
@@ -371,30 +214,23 @@ fn render_bar(value: u64, max: u64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::{Category, Confidence, RiskLevel};
-    use crate::ProjectType;
-    use chrono::Utc;
+    use dev_cleaner_core::scanner::{Category, Confidence, ProjectType, RiskLevel};
+    use dev_cleaner_core::ProjectInfo;
     use std::path::PathBuf;
 
-    fn project(
-        project_type: ProjectType,
-        size: u64,
-        days_since_modified: i64,
-        category: Category,
-        risk_level: RiskLevel,
-    ) -> ProjectInfo {
+    fn project(project_type: ProjectType, size: u64, days_since_modified: i64) -> ProjectInfo {
         ProjectInfo {
             root: PathBuf::from("/repo"),
             project_type,
             project_name: None,
-            category,
-            risk_level,
+            category: Category::Build,
+            risk_level: RiskLevel::Medium,
             confidence: Confidence::High,
             matched_rule: None,
             cleanable_dir: PathBuf::from(format!("/repo/{project_type:?}-{size}")),
             size,
             size_calculated: true,
-            last_modified: Utc::now() - chrono::Duration::days(days_since_modified),
+            last_modified: chrono::Utc::now() - chrono::Duration::days(days_since_modified),
             in_use: false,
             protected: false,
             protected_by: None,
@@ -405,123 +241,22 @@ mod tests {
     }
 
     #[test]
-    fn test_statistics_from_projects() {
-        let projects = vec![
-            ProjectInfo {
-                root: PathBuf::from("/test1"),
-                project_type: ProjectType::NodeJs,
-                project_name: None,
-                category: Category::Deps,
-                risk_level: RiskLevel::High,
-                confidence: Confidence::High,
-                matched_rule: None,
-                cleanable_dir: PathBuf::from("/test1/node_modules"),
-                size: 1000000,
-                size_calculated: true,
-                last_modified: Utc::now(),
-                in_use: false,
-                protected: false,
-                protected_by: None,
-                recent: false,
-                selection_reason: None,
-                skip_reason: None,
-            },
-            ProjectInfo {
-                root: PathBuf::from("/test2"),
-                project_type: ProjectType::Rust,
-                project_name: None,
-                category: Category::Build,
-                risk_level: RiskLevel::Medium,
-                confidence: Confidence::High,
-                matched_rule: None,
-                cleanable_dir: PathBuf::from("/test2/target"),
-                size: 2000000,
-                size_calculated: true,
-                last_modified: Utc::now(),
-                in_use: false,
-                protected: false,
-                protected_by: None,
-                recent: false,
-                selection_reason: None,
-                skip_reason: None,
-            },
-        ];
-
-        let stats = Statistics::from_projects(projects);
-
-        assert_eq!(stats.total_projects, 2);
-        assert_eq!(stats.total_size, 3000000);
-        assert_eq!(stats.by_type.len(), 2);
-        assert_eq!(stats.top_largest.len(), 2);
-    }
-
-    #[test]
-    fn test_statistics_age_boundaries_and_render_bar() {
-        let stats = Statistics::from_projects(vec![
-            project(ProjectType::NodeJs, 10, 29, Category::Deps, RiskLevel::High),
-            project(
-                ProjectType::Rust,
-                20,
-                30,
-                Category::Build,
-                RiskLevel::Medium,
-            ),
-            project(ProjectType::Python, 30, 89, Category::Cache, RiskLevel::Low),
-            project(
-                ProjectType::Java,
-                40,
-                90,
-                Category::Build,
-                RiskLevel::Medium,
-            ),
-        ]);
-
-        assert_eq!(stats.total_projects, 4);
-        assert_eq!(stats.total_size, 100);
-        assert_eq!(stats.by_age_group.recent, (1, 10));
-        assert_eq!(stats.by_age_group.medium, (2, 50));
-        assert_eq!(stats.by_age_group.old, (1, 40));
-        assert_eq!(stats.top_largest[0].size, 40);
-        assert_eq!(stats.top_largest[1].size, 30);
-        assert_eq!(stats.top_largest[2].size, 20);
-        assert_eq!(stats.top_largest[3].size, 10);
-        assert_eq!(stats.by_type["Rust"].avg_size, 20);
+    fn render_bar_handles_empty_and_scaled_values() {
         assert_eq!(render_bar(0, 0, 0), "");
         assert_eq!(render_bar(3, 0, 5), "-----");
         assert_eq!(render_bar(5, 10, 5), "##---");
-
-        let json = stats.to_json().unwrap();
-        assert!(json.contains("\"total_projects\": 4"));
     }
 
     #[test]
-    fn test_display_terminal_smoke_covers_recommendations() {
+    fn display_terminal_smoke_covers_recommendations() {
         let stats = Statistics::from_projects(vec![
-            project(
-                ProjectType::NodeJs,
-                50,
-                120,
-                Category::Deps,
-                RiskLevel::High,
-            ),
-            project(
-                ProjectType::Rust,
-                40,
-                15,
-                Category::Build,
-                RiskLevel::Medium,
-            ),
-            project(ProjectType::Python, 30, 5, Category::Cache, RiskLevel::Low),
-            project(
-                ProjectType::Java,
-                20,
-                200,
-                Category::Build,
-                RiskLevel::Medium,
-            ),
-            project(ProjectType::Go, 10, 90, Category::Build, RiskLevel::Medium),
+            project(ProjectType::NodeJs, 50, 120),
+            project(ProjectType::Rust, 40, 15),
+            project(ProjectType::Python, 30, 5),
+            project(ProjectType::Java, 20, 200),
+            project(ProjectType::Go, 10, 90),
         ]);
 
-        stats.display_terminal(3);
+        display_terminal(&stats, 3);
     }
 }

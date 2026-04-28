@@ -1,5 +1,3 @@
-use crate::scanner::{ProjectInfo, RuleSource};
-use crate::utils::format_size;
 use anyhow::Result;
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
@@ -10,6 +8,8 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
+use dev_cleaner_core::scanner::{ProjectInfo, RuleSource};
+use dev_cleaner_core::utils::format_size;
 use std::cmp::Ordering;
 use std::io::{self, stdout, Write};
 
@@ -637,8 +637,8 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::{Category, Confidence, ProjectType, RiskLevel};
     use chrono::{Duration, Utc};
+    use dev_cleaner_core::scanner::{Category, Confidence, ProjectType, RiskLevel};
     use std::path::PathBuf;
 
     fn project(

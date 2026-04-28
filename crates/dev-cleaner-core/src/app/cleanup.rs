@@ -1,4 +1,4 @@
-use crate::app::evaluated::{EvaluatedProject, SelectionReason, SkipReason};
+use crate::evaluation::{EvaluatedProject, SelectionReason, SkipReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockedSummary {
@@ -120,7 +120,7 @@ impl CleanupService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::evaluated::{SafetyFlags, SkipReason};
+    use crate::evaluation::{SafetyFlags, SkipReason};
     use crate::scanner::{Category, Confidence, ProjectType, RiskLevel};
     use crate::ProjectInfo;
     use chrono::Utc;

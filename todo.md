@@ -15,3 +15,17 @@
 - [ ] Keep/Protect：`.dev-cleaner-keep` / `.dev-cleaner-keep-patterns` + config keep_paths/keep_roots
 - [ ] History（JSONL）：`history list/show/top-growth`
 - [ ] TUI 升级：搜索/过滤/排序/详情面板/流式更新
+
+## Core 拆分审查修复清单（2026-04-28）
+
+- [x] TUI 扫描入口改走 `ScanService`，避免绕过 keep/protect 评估。
+- [x] TUI 清理路径恢复 observer 输出，避免 core 默认 no-op 后长清理无反馈。
+- [x] `Cleaner` 在 destructive 层补上 `protected/recent` 防线，避免非 CLI 调用绕过 `CleanupService`。
+- [x] Trash restore 从 core 中移除直接 `println!`，改为 observer/event 交给 adapter 渲染。
+- [x] `recommend` 结果保留 typed `EvaluatedProject` / skip reason，避免退回纯 stringly `ProjectInfo`。
+- [x] root crate 明确为 adapter/compat 层，内部改直接引用 `dev_cleaner_core`，减少 core/adapter 边界混淆。
+- [x] 更新 `AGENTS.md` 的模块路径，避免继续指向已删除的 `src/scanner` 等旧路径。
+- [x] `Cargo.lock` 纳入版本控制，root 依赖 core 时补 version，避免 CLI workspace 构建不可复现/发布受阻。
+- [x] benchmark 改直接引用 `dev_cleaner_core`。
+- [x] 补 CLI `plan -> apply` 集成测试、TUI keep/protect 边界测试、recent/in-use 时间边界测试、stats public API 兼容测试。
+- [x] 记录后续范围：Swift/FFI/UniFFI、JSON DTO facade、GUI 可取消 streaming scan 属于下一阶段接口层，不在本轮 core Rust API 修复中实现。

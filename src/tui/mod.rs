@@ -1,12 +1,15 @@
-use crate::evaluation::EvaluatedProject;
-use crate::utils::format_size;
-use crate::{Cleaner, Config, ProjectInfo, Scanner};
+use crate::clean_progress::TerminalCleanObserver;
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use dev_cleaner_core::app::{ScanRequest, ScanService};
+use dev_cleaner_core::evaluation::EvaluatedProject;
+use dev_cleaner_core::scanner::RiskLevel;
+use dev_cleaner_core::utils::format_size;
+use dev_cleaner_core::{Cleaner, Config, ProjectInfo};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -83,7 +86,9 @@ impl AppState {
             .into_iter()
             .map(|project| {
                 let recent = project.days_since_modified() < recent_days;
-                EvaluatedProject::from(project).mark_recent(recent)
+                let mut evaluated = EvaluatedProject::from(project);
+                evaluated.safety.recent = recent;
+                evaluated
             })
             .collect::<Vec<_>>();
         let mut app = Self {
@@ -122,12 +127,12 @@ impl AppState {
             if !self.query.is_empty() {
                 let q = self.query.to_ascii_lowercase();
                 let path = p
-                    .project
+                    .info
                     .cleanable_dir
                     .display()
                     .to_string()
                     .to_ascii_lowercase();
-                let name = p.project.project_type_display_name().to_ascii_lowercase();
+                let name = p.info.project_type_display_name().to_ascii_lowercase();
                 if !path.contains(&q) && !name.contains(&q) {
                     continue;
                 }
@@ -137,32 +142,32 @@ impl AppState {
 
         self.visible_indices.sort_by(|a, b| match self.sort_key {
             SortKey::Size => self.projects[*b]
-                .project
+                .info
                 .size
-                .cmp(&self.projects[*a].project.size)
+                .cmp(&self.projects[*a].info.size)
                 .then_with(|| {
                     self.projects[*b]
-                        .project
+                        .info
                         .days_since_modified()
-                        .cmp(&self.projects[*a].project.days_since_modified())
+                        .cmp(&self.projects[*a].info.days_since_modified())
                 }),
             SortKey::Age => self.projects[*b]
-                .project
+                .info
                 .days_since_modified()
-                .cmp(&self.projects[*a].project.days_since_modified())
+                .cmp(&self.projects[*a].info.days_since_modified())
                 .then_with(|| {
                     self.projects[*b]
-                        .project
+                        .info
                         .size
-                        .cmp(&self.projects[*a].project.size)
+                        .cmp(&self.projects[*a].info.size)
                 }),
             SortKey::Source => source_sort_rank(&self.projects[*a])
                 .cmp(&source_sort_rank(&self.projects[*b]))
                 .then_with(|| {
                     self.projects[*b]
-                        .project
+                        .info
                         .size
-                        .cmp(&self.projects[*a].project.size)
+                        .cmp(&self.projects[*a].info.size)
                 }),
         });
 
@@ -185,14 +190,14 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(idx, _)| self.selected[*idx])
-            .map(|(_, p)| p.project.size)
+            .map(|(_, p)| p.info.size)
             .sum()
     }
 
     fn visible_total_size(&self) -> u64 {
         self.visible_indices
             .iter()
-            .map(|idx| self.projects[*idx].project.size)
+            .map(|idx| self.projects[*idx].info.size)
             .sum()
     }
 
@@ -442,13 +447,13 @@ fn handle_key(app: &mut AppState, key: KeyCode) -> AppOutcome {
 }
 
 fn default_selectable(project: &EvaluatedProject, recent_days: i64) -> bool {
-    !project.project.in_use
+    !project.info.in_use
         && !project.safety.protected
-        && project.project.days_since_modified() >= recent_days
+        && project.info.days_since_modified() >= recent_days
 }
 
 fn selection_status(project: &EvaluatedProject) -> &'static str {
-    if project.project.in_use {
+    if project.info.in_use {
         "in-use"
     } else if project.safety.protected {
         "protected"
@@ -460,24 +465,24 @@ fn selection_status(project: &EvaluatedProject) -> &'static str {
 }
 
 fn detection_source(project: &EvaluatedProject) -> &'static str {
-    let Some(rule) = &project.project.matched_rule else {
+    let Some(rule) = &project.info.matched_rule else {
         return "unknown";
     };
 
     match rule.source {
-        crate::scanner::RuleSource::Builtin => "builtin",
-        crate::scanner::RuleSource::Custom => "custom",
-        crate::scanner::RuleSource::Gitignore => "gitignore",
-        crate::scanner::RuleSource::Heuristic => "heuristic",
+        dev_cleaner_core::scanner::RuleSource::Builtin => "builtin",
+        dev_cleaner_core::scanner::RuleSource::Custom => "custom",
+        dev_cleaner_core::scanner::RuleSource::Gitignore => "gitignore",
+        dev_cleaner_core::scanner::RuleSource::Heuristic => "heuristic",
     }
 }
 
 fn source_sort_rank(project: &EvaluatedProject) -> u8 {
-    match project.project.matched_rule.as_ref().map(|r| r.source) {
-        Some(crate::scanner::RuleSource::Custom) => 0,
-        Some(crate::scanner::RuleSource::Builtin) => 1,
-        Some(crate::scanner::RuleSource::Heuristic) => 2,
-        Some(crate::scanner::RuleSource::Gitignore) => 3,
+    match project.info.matched_rule.as_ref().map(|r| r.source) {
+        Some(dev_cleaner_core::scanner::RuleSource::Custom) => 0,
+        Some(dev_cleaner_core::scanner::RuleSource::Builtin) => 1,
+        Some(dev_cleaner_core::scanner::RuleSource::Heuristic) => 2,
+        Some(dev_cleaner_core::scanner::RuleSource::Gitignore) => 3,
         None => 4,
     }
 }
@@ -491,7 +496,7 @@ fn decision_summary(project: &EvaluatedProject, recent_days: i64) -> &'static st
 }
 
 fn block_reason(project: &EvaluatedProject, recent_days: i64) -> String {
-    if project.project.in_use {
+    if project.info.in_use {
         return "Project appears active (lock file modified recently).".to_string();
     }
     if project.safety.protected {
@@ -519,22 +524,24 @@ pub fn run_tui(path: PathBuf) -> Result<()> {
 }
 
 pub fn run_tui_with_config(path: PathBuf, config: &Config) -> Result<()> {
-    let mut scanner = Scanner::new(&path)
-        .exclude_dirs(&config.exclude_dirs)
-        .custom_patterns(&config.custom_patterns);
+    let (projects, recent_days) = load_tui_projects(path, config)?;
+    run_tui_projects(projects, false, false, recent_days)
+}
 
-    if let Some(depth) = config.default_depth {
-        scanner = scanner.max_depth(depth);
-    }
-    if let Some(min_size_mb) = config.min_size_mb {
-        scanner = scanner.min_size(min_size_mb * 1024 * 1024);
-    }
-    if let Some(max_age_days) = config.max_age_days {
-        scanner = scanner.max_age_days(max_age_days);
-    }
-
-    let projects = scanner.scan()?;
-    run_tui_projects(projects, false, false, 7)
+fn load_tui_projects(path: PathBuf, config: &Config) -> Result<(Vec<ProjectInfo>, i64)> {
+    let request = ScanRequest {
+        path: Some(path),
+        max_risk: Some(RiskLevel::High),
+        ..Default::default()
+    };
+    let discovered = ScanService::new().discover(config, &request)?;
+    let recent_days = discovered.resolved.visibility.recent_days;
+    let projects = discovered
+        .projects
+        .into_iter()
+        .map(ProjectInfo::from)
+        .collect();
+    Ok((projects, recent_days))
 }
 
 pub fn run_tui_projects(
@@ -583,7 +590,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: AppSt
                     disable_raw_mode()?;
                     let selected = app.get_selected_projects();
                     let cleaner = Cleaner::new().verbose(true);
-                    let result = cleaner.clean_multiple(&selected)?;
+                    let mut observer = TerminalCleanObserver::new(true);
+                    let result = cleaner.clean_multiple_with_observer(&selected, &mut observer)?;
                     println!("\nCleaning completed!");
                     println!("  Cleaned: {}", result.cleaned_count);
                     println!(
@@ -687,11 +695,11 @@ fn draw_project_list(f: &mut Frame, area: Rect, app: &mut AppState) {
             let line = format!(
                 "{} {:>8} {:<10} {:<10} {:<8} {}",
                 selected_marker,
-                format_size(p.project.size),
+                format_size(p.info.size),
                 detection_source(p),
                 selection_status(p),
-                p.project.project_type_display_name(),
-                p.project.cleanable_dir.display(),
+                p.info.project_type_display_name(),
+                p.info.cleanable_dir.display(),
             );
             ListItem::new(line)
         })
@@ -716,7 +724,7 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &AppState) {
     let text = if let Some(p) = app.selected_project() {
         vec![
             Line::from(Span::styled(
-                p.project.cleanable_dir.display().to_string(),
+                p.info.cleanable_dir.display().to_string(),
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(format!(
@@ -725,9 +733,9 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &AppState) {
             )),
             Line::from(format!("Reason: {}", block_reason(p, app.recent_days),)),
             Line::from(""),
-            Line::from(format!("Type: {}", p.project.project_type_display_name())),
-            Line::from(format!("Size: {}", format_size(p.project.size))),
-            Line::from(format!("Age: {} days", p.project.days_since_modified())),
+            Line::from(format!("Type: {}", p.info.project_type_display_name())),
+            Line::from(format!("Size: {}", format_size(p.info.size))),
+            Line::from(format!("Age: {} days", p.info.days_since_modified())),
             Line::from(format!("Source: {}", detection_source(p))),
             Line::from(format!(
                 "Protected by: {}",
@@ -855,9 +863,11 @@ fn draw_help(f: &mut Frame) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::{Category, RiskLevel};
     use chrono::Duration;
+    use dev_cleaner_core::scanner::{Category, RiskLevel};
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn project(
         name: &str,
@@ -870,11 +880,11 @@ mod tests {
     ) -> ProjectInfo {
         ProjectInfo {
             root: PathBuf::from("/repo"),
-            project_type: crate::scanner::ProjectType::Rust,
+            project_type: dev_cleaner_core::scanner::ProjectType::Rust,
             project_name: Some(name.to_string()),
             category,
             risk_level,
-            confidence: crate::scanner::Confidence::High,
+            confidence: dev_cleaner_core::scanner::Confidence::High,
             matched_rule: None,
             cleanable_dir: PathBuf::from(format!("/repo/{name}")),
             size,
@@ -887,6 +897,29 @@ mod tests {
             selection_reason: None,
             skip_reason: None,
         }
+    }
+
+    #[test]
+    fn load_tui_projects_applies_keep_policy() {
+        let temp = TempDir::new().unwrap();
+        let project_root = temp.path().join("app");
+        let target = project_root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            project_root.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        fs::write(project_root.join(".dev-cleaner-keep"), "").unwrap();
+        fs::write(target.join("artifact.bin"), b"x").unwrap();
+
+        let (projects, recent_days) =
+            load_tui_projects(project_root.clone(), &Config::default()).unwrap();
+
+        assert_eq!(recent_days, 7);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].cleanable_dir, target);
+        assert!(projects[0].protected);
     }
 
     #[test]
@@ -921,11 +954,7 @@ mod tests {
         assert_eq!(app.visible_indices.len(), 3);
         assert_eq!(app.selected_count(), 1);
         assert_eq!(
-            app.selected_project()
-                .unwrap()
-                .project
-                .project_name
-                .as_deref(),
+            app.selected_project().unwrap().info.project_name.as_deref(),
             Some("build")
         );
 
@@ -946,11 +975,7 @@ mod tests {
         );
         assert_eq!(app.visible_indices.len(), 1);
         assert_eq!(
-            app.selected_project()
-                .unwrap()
-                .project
-                .project_name
-                .as_deref(),
+            app.selected_project().unwrap().info.project_name.as_deref(),
             Some("build")
         );
 
@@ -964,20 +989,12 @@ mod tests {
         app.list_state.select(Some(0));
         assert_eq!(handle_key(&mut app, KeyCode::Down), AppOutcome::Continue);
         assert_eq!(
-            app.selected_project()
-                .unwrap()
-                .project
-                .project_name
-                .as_deref(),
+            app.selected_project().unwrap().info.project_name.as_deref(),
             Some("deps")
         );
         assert_eq!(handle_key(&mut app, KeyCode::Up), AppOutcome::Continue);
         assert_eq!(
-            app.selected_project()
-                .unwrap()
-                .project
-                .project_name
-                .as_deref(),
+            app.selected_project().unwrap().info.project_name.as_deref(),
             Some("build")
         );
 
@@ -1096,29 +1113,17 @@ mod tests {
         app.list_state.select(Some(0));
         assert_eq!(handle_key(&mut app, KeyCode::Up), AppOutcome::Continue);
         assert_eq!(
-            app.selected_project()
-                .unwrap()
-                .project
-                .project_name
-                .as_deref(),
+            app.selected_project().unwrap().info.project_name.as_deref(),
             Some("one")
         );
         assert_eq!(handle_key(&mut app, KeyCode::Down), AppOutcome::Continue);
         assert_eq!(
-            app.selected_project()
-                .unwrap()
-                .project
-                .project_name
-                .as_deref(),
+            app.selected_project().unwrap().info.project_name.as_deref(),
             Some("two")
         );
         assert_eq!(handle_key(&mut app, KeyCode::Down), AppOutcome::Continue);
         assert_eq!(
-            app.selected_project()
-                .unwrap()
-                .project
-                .project_name
-                .as_deref(),
+            app.selected_project().unwrap().info.project_name.as_deref(),
             Some("one")
         );
     }

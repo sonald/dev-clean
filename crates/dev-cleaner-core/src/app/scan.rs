@@ -1,5 +1,5 @@
-use crate::app::evaluated::{EvaluatedProject, SafetyFlags};
 use crate::config::{Config, ScanProfile};
+use crate::evaluation::{EvaluatedProject, SafetyFlags};
 use crate::policy::KeepPolicy;
 use crate::scanner::{Category, ProjectInfo, RiskLevel, Scanner};
 use anyhow::{bail, Context, Result};
@@ -602,6 +602,28 @@ mod tests {
             evaluated[0].safety.protected_by.as_deref(),
             Some("project_marker:.dev-cleaner-keep")
         );
+    }
+
+    #[test]
+    fn evaluate_projects_marks_exact_recent_boundary_as_not_recent() {
+        let service = ScanService::new();
+        let evaluated = service.evaluate_projects_with_config(
+            &Config::default(),
+            vec![project_info(
+                PathBuf::from("/repo/app"),
+                PathBuf::from("/repo/app/target"),
+                ProjectType::Rust,
+                Category::Build,
+                RiskLevel::Medium,
+                false,
+                false,
+                Utc::now() - chrono::Duration::days(7),
+            )],
+            7,
+        );
+
+        assert_eq!(evaluated.len(), 1);
+        assert!(!evaluated[0].is_recent());
     }
 
     #[test]

@@ -296,7 +296,7 @@ impl Scanner {
     ///
     /// # Example
     /// ```no_run
-    /// use dev_cleaner::Scanner;
+    /// use dev_cleaner_core::Scanner;
     ///
     /// let scanner = Scanner::new("~/projects");
     /// let (total, rx) = scanner.scan_with_streaming().unwrap();

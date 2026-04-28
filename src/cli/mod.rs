@@ -1,25 +1,27 @@
-use crate::app::{
-    ApplyPlanRequest, ApplyPlanService, BlockedSummary as AppBlockedSummary, CleanupRequest,
-    CleanupService, EvaluatedProject as AppEvaluatedProject, ScanRequest, ScanService,
-    VisibilityOptions,
-};
-use crate::audit::AuditLogger;
-use crate::cleaner::CleanOptions;
+use crate::clean_progress::{TerminalCleanObserver, TerminalRestoreObserver};
 use crate::interactive::{ProjectSelector, SelectorOptions};
-use crate::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
-use crate::scanner::{Category, ProjectDetector, RiskLevel, RuleSource};
-use crate::trash::{
-    default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
-    restore_batch, trash_entries_for_batch,
-};
-use crate::utils::{format_size, parse_size};
-use crate::{Cleaner, CleanupPlan, Config, ProjectInfo};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use crossterm::{
     event::{self, Event, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode},
+};
+use dev_cleaner_core::app::{
+    ApplyPlanRequest, ApplyPlanService, BlockedSummary as AppBlockedSummary, CleanupRequest,
+    CleanupService, ScanRequest, ScanService, VisibilityOptions,
+};
+use dev_cleaner_core::audit::AuditLogger;
+use dev_cleaner_core::cleaner::CleanOptions;
+use dev_cleaner_core::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
+use dev_cleaner_core::scanner::{Category, ProjectDetector, RiskLevel, RuleSource};
+use dev_cleaner_core::trash::{
+    default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
+    restore_batch_with_observer, trash_entries_for_batch,
+};
+use dev_cleaner_core::utils::{format_size, parse_size};
+use dev_cleaner_core::{
+    Cleaner, CleanupPlan, Config, EvaluatedProject as AppEvaluatedProject, ProjectInfo,
 };
 use serde_json::json;
 use std::fs;
@@ -855,12 +857,12 @@ impl Cli {
 
 #[cfg(test)]
 fn canonicalize_lossy(path: &std::path::Path) -> PathBuf {
-    crate::app::canonicalize_lossy(path)
+    dev_cleaner_core::app::canonicalize_lossy(path)
 }
 
 #[cfg(test)]
 fn derive_scan_root(roots: &[PathBuf]) -> PathBuf {
-    crate::app::derive_scan_root(roots)
+    dev_cleaner_core::app::derive_scan_root(roots)
 }
 
 fn build_scan_request(
@@ -1346,11 +1348,15 @@ fn run_clean(
         dry_run,
         verbose,
         force,
+        include_recent,
+        force_protected,
         trash,
+        trash_root: None,
     };
 
     let cleaner = Cleaner::with_options(options);
-    let mut result = cleaner.clean_multiple(&split.selected)?;
+    let mut observer = TerminalCleanObserver::new(verbose);
+    let mut result = cleaner.clean_multiple_with_observer(&split.selected, &mut observer)?;
     result.skipped_count += split.blocked_summary.total_count();
     result.bytes_skipped = result
         .bytes_skipped
@@ -1418,7 +1424,7 @@ fn run_clean(
 }
 
 fn build_share_snippet(
-    result: &crate::cleaner::CleanResult,
+    result: &dev_cleaner_core::cleaner::CleanResult,
     dry_run: bool,
     trash: bool,
 ) -> Option<String> {
@@ -1443,7 +1449,7 @@ fn build_share_snippet(
 }
 
 fn print_share_block_if_applicable(
-    result: &crate::cleaner::CleanResult,
+    result: &dev_cleaner_core::cleaner::CleanResult,
     dry_run: bool,
     trash: bool,
     auto: bool,
@@ -1627,7 +1633,7 @@ fn run_stats(
         }
     } else {
         // Display terminal output
-        stats.display_terminal(top_n);
+        crate::stats::display_terminal(&stats, top_n);
     }
 
     Ok(())
@@ -1685,7 +1691,7 @@ fn run_plan(
     let max_risk_level = discovered.resolved.max_risk;
     let projects = project_infos_from_evaluated(discovered.projects);
 
-    let mut params = crate::plan::PlanParams::default();
+    let mut params = dev_cleaner_core::plan::PlanParams::default();
     params.max_risk = Some(max_risk_level);
     params.category = category_filter;
     params.recent_days = Some(recent_days);
@@ -1777,6 +1783,11 @@ fn run_recommend(
     opts.max_risk = Some(max_risk);
 
     let result = recommend_projects(projects, &opts);
+    let selected_projects = result
+        .selected
+        .iter()
+        .map(ProjectInfo::from)
+        .collect::<Vec<_>>();
 
     #[derive(Serialize)]
     struct RecommendOutput {
@@ -1801,11 +1812,11 @@ fn run_recommend(
             "recent": { "count": result.blocked.recent_count, "bytes": result.blocked.recent_bytes },
             "risk": { "count": result.blocked.risk_count, "bytes": result.blocked.risk_bytes },
         }),
-        projects: result.selected.clone(),
+        projects: selected_projects.clone(),
     };
 
     if let Some(plan_path) = &output_plan {
-        let mut params = crate::plan::PlanParams::default();
+        let mut params = dev_cleaner_core::plan::PlanParams::default();
         params.cleanup_bytes = cleanup_bytes;
         params.free_at_least_bytes = free_at_least_bytes;
         params.max_risk = Some(max_risk);
@@ -1813,7 +1824,8 @@ fn run_recommend(
         params.strategy = Some(opts.strategy.as_str().to_string());
         params.recent_days = Some(recent_days);
 
-        let plan = CleanupPlan::new_with_params(scan_root.clone(), result.selected.clone(), params);
+        let plan =
+            CleanupPlan::new_with_params(scan_root.clone(), selected_projects.clone(), params);
         plan.save_json(plan_path)?;
     }
 
@@ -1981,9 +1993,13 @@ fn run_apply(
         dry_run,
         verbose,
         force,
+        include_recent,
+        force_protected,
         trash,
+        trash_root: None,
     });
-    let mut result = cleaner.clean_multiple(&verified_projects)?;
+    let mut observer = TerminalCleanObserver::new(verbose);
+    let mut result = cleaner.clean_multiple_with_observer(&verified_projects, &mut observer)?;
     result.skipped_count += skipped_pre;
     result.bytes_skipped = result.bytes_skipped.saturating_add(skipped_pre_bytes);
     result.run_id = run_id.clone();
@@ -2107,7 +2123,9 @@ fn run_undo(
     println!("  Trash root: {}", trash_root.display());
     println!("  Batch: {}", batch_id.cyan().bold());
 
-    let result = restore_batch(&trash_root, &batch_id, dry_run, force, verbose)?;
+    let mut observer = TerminalRestoreObserver::new(verbose);
+    let result =
+        restore_batch_with_observer(&trash_root, &batch_id, dry_run, force, &mut observer)?;
 
     println!("\n{}", "Restore completed!".green().bold());
     println!("  Restored: {}", result.restored_count.to_string().green());
@@ -2412,7 +2430,7 @@ fn run_profile(
             category,
             max_risk,
         } => {
-            let profile = crate::config::ScanProfile {
+            let profile = dev_cleaner_core::config::ScanProfile {
                 paths,
                 depth,
                 min_size_mb,
@@ -2557,12 +2575,12 @@ fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditRecord;
-    use crate::cleaner::CleanResult;
-    use crate::plan::CleanupPlan;
-    use crate::scanner::{Category, Confidence};
     use crate::ProjectType;
     use chrono::Utc;
+    use dev_cleaner_core::audit::AuditRecord;
+    use dev_cleaner_core::cleaner::CleanResult;
+    use dev_cleaner_core::plan::CleanupPlan;
+    use dev_cleaner_core::scanner::{Category, Confidence};
     use std::fs;
     use tempfile::TempDir;
 
@@ -2808,7 +2826,7 @@ mod tests {
             tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             created_at: Utc::now(),
             scan_root: PathBuf::from("."),
-            params: Some(crate::plan::PlanParams::default()),
+            params: Some(dev_cleaner_core::plan::PlanParams::default()),
             projects: vec![project],
         };
         plan.save_json(&plan_path).unwrap();
@@ -2862,7 +2880,7 @@ mod tests {
             tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             created_at: Utc::now(),
             scan_root: project_root.clone(),
-            params: Some(crate::plan::PlanParams::default()),
+            params: Some(dev_cleaner_core::plan::PlanParams::default()),
             projects: vec![ProjectInfo {
                 root: project_root,
                 project_type: ProjectType::Rust,

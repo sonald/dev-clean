@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use dev_cleaner::scanner::{RiskLevel, Scanner};
-use dev_cleaner::ProjectInfo;
+use dev_cleaner_core::scanner::{RiskLevel, Scanner};
+use dev_cleaner_core::ProjectInfo;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;

@@ -1,7 +1,7 @@
 use crate::app::cleanup::{BlockedSummary, CleanupRequest, CleanupSelection, CleanupService};
-use crate::app::evaluated::{EvaluatedProject, SafetyFlags, SkipReason};
 use crate::app::scan::canonicalize_lossy;
 use crate::config::Config;
+use crate::evaluation::{EvaluatedProject, SafetyFlags, SkipReason};
 use crate::plan::CleanupPlan;
 use crate::policy::KeepPolicy;
 use crate::scanner::{ProjectInfo, Scanner};
@@ -245,6 +245,13 @@ mod tests {
         assert!(status.success());
     }
 
+    fn touch_days_ago(path: &Path, days: i64) {
+        let timestamp = (Utc::now() - Duration::days(days))
+            .format("%Y%m%d%H%M")
+            .to_string();
+        touch_with_timestamp(path, &timestamp);
+    }
+
     fn sample_project(
         root: PathBuf,
         target: PathBuf,
@@ -468,10 +475,10 @@ mod tests {
         fs::write(protected_root.join(".dev-cleaner-keep"), "").unwrap();
         fs::write(&in_use_lock, "{}").unwrap();
 
-        touch_with_timestamp(&protected_target, "202603010101");
-        touch_with_timestamp(&recent_target, "202603250101");
-        touch_with_timestamp(&in_use_target, "202603010101");
-        touch_with_timestamp(&in_use_lock, "202603250101");
+        touch_days_ago(&protected_target, 30);
+        touch_days_ago(&recent_target, 1);
+        touch_days_ago(&in_use_target, 30);
+        touch_days_ago(&in_use_lock, 1);
 
         let plan = CleanupPlan {
             schema_version: 3,
