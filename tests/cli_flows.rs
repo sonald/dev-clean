@@ -33,6 +33,18 @@ fn run(workspace: &TempDir, args: &[&str]) -> Output {
     output
 }
 
+fn run_failure(workspace: &TempDir, args: &[&str]) -> Output {
+    let output = command(workspace).args(args).output().unwrap();
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded: {:?}\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 fn write_project(root: &Path, name: &str, artifact_bytes: usize) -> PathBuf {
     let project_root = root.join(name);
     let target_dir = project_root.join("target");
@@ -46,8 +58,31 @@ fn write_project(root: &Path, name: &str, artifact_bytes: usize) -> PathBuf {
     project_root
 }
 
+fn write_apply_plan(workspace: &TempDir, project_root: &Path, plan_name: &str) -> PathBuf {
+    let plan_path = workspace.path().join(plan_name);
+    run(
+        workspace,
+        &[
+            "plan",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+            "-o",
+            plan_path.to_str().unwrap(),
+        ],
+    );
+    plan_path
+}
+
 fn parse_json_value(stdout: &[u8]) -> Value {
     serde_json::from_slice(stdout).unwrap()
+}
+
+fn parse_json_lines(stdout: &[u8]) -> Vec<Value> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
 }
 
 #[test]
@@ -105,6 +140,277 @@ fn scan_json_reports_cleanable_targets() {
         projects[0]["cleanable_dir"].as_str().unwrap(),
         project_root.join("target").to_str().unwrap()
     );
+}
+
+#[test]
+fn bridge_scan_streams_jsonl_events() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "bridge-scan-app", 1024);
+
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "scan",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+        ],
+    );
+
+    let events = parse_json_lines(&output.stdout);
+    assert!(events.iter().any(|event| event["type"] == "ready"));
+    assert!(events.iter().any(|event| event["type"] == "scan_item"));
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "scan_finished")
+        .unwrap();
+    assert_eq!(finished["total_count"], 1);
+}
+
+#[test]
+fn bridge_clean_defaults_to_trash_without_trash_flag() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "bridge-default-trash-app", 2048);
+    let target = project_root.join("target");
+
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "clean",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+            "--force",
+            "--max-risk",
+            "all",
+        ],
+    );
+
+    assert!(!target.exists());
+    let events = parse_json_lines(&output.stdout);
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "cleanup_started")
+        .unwrap();
+    assert_eq!(started["mode"], "trash");
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "cleanup_finished")
+        .unwrap();
+    assert_eq!(finished["payload"]["cleaned_count"], 1);
+    assert!(finished["payload"]["trash_batch_id"].as_str().is_some());
+    assert!(workspace
+        .path()
+        .join("trash")
+        .join("trash_log.jsonl")
+        .exists());
+    let audit_content = fs::read_to_string(audit_log_path(&workspace)).unwrap();
+    assert!(audit_content.contains("\"result\":\"completed\""));
+    assert!(!audit_content.contains("\"result\":\"attempted\""));
+}
+
+#[test]
+fn bridge_clean_permanent_delete_requires_explicit_flag_and_does_not_create_trash_batch() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "bridge-delete-app", 2048);
+    let target = project_root.join("target");
+
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "clean",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+            "--force",
+            "--max-risk",
+            "all",
+            "--permanent-delete",
+        ],
+    );
+
+    assert!(!target.exists());
+    let events = parse_json_lines(&output.stdout);
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "cleanup_finished")
+        .unwrap();
+    assert_eq!(finished["payload"]["cleaned_count"], 1);
+    assert!(finished["payload"]["trash_batch_id"].is_null());
+    assert!(finished["payload"]["run_id"].as_str().is_some());
+    assert!(!workspace
+        .path()
+        .join("trash")
+        .join("trash_log.jsonl")
+        .exists());
+    let audit_content = fs::read_to_string(audit_log_path(&workspace)).unwrap();
+    assert!(audit_content.contains("\"command\":\"clean\""));
+    assert!(audit_content.contains("\"result\":\"completed\""));
+    assert!(!audit_content.contains("\"result\":\"attempted\""));
+}
+
+#[test]
+fn bridge_clean_rejects_trash_and_permanent_delete_together() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "bridge-conflict-app", 1024);
+
+    let output = run_failure(
+        &workspace,
+        &[
+            "bridge",
+            "clean",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+            "--trash",
+            "--permanent-delete",
+        ],
+    );
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Use either --trash"));
+    assert!(project_root.join("target").exists());
+}
+
+#[test]
+fn bridge_apply_defaults_to_trash_without_trash_flag() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "bridge-apply-default-trash-app", 2048);
+    let plan_path = write_apply_plan(&workspace, &project_root, "bridge-apply-plan.json");
+
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "apply",
+            plan_path.to_str().unwrap(),
+            "--include-recent",
+            "--force",
+        ],
+    );
+
+    assert!(!project_root.join("target").exists());
+    let events = parse_json_lines(&output.stdout);
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "cleanup_started")
+        .unwrap();
+    assert_eq!(started["mode"], "trash");
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "cleanup_finished")
+        .unwrap();
+    assert!(finished["payload"]["trash_batch_id"].as_str().is_some());
+    assert!(workspace
+        .path()
+        .join("trash")
+        .join("trash_log.jsonl")
+        .exists());
+}
+
+#[test]
+fn bridge_apply_rejects_trash_and_permanent_delete_together() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "bridge-apply-conflict-app", 1024);
+    let plan_path = write_apply_plan(&workspace, &project_root, "bridge-apply-conflict-plan.json");
+
+    let output = run_failure(
+        &workspace,
+        &[
+            "bridge",
+            "apply",
+            plan_path.to_str().unwrap(),
+            "--include-recent",
+            "--trash",
+            "--permanent-delete",
+        ],
+    );
+
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Use either --trash"));
+    assert!(project_root.join("target").exists());
+}
+
+#[test]
+fn bridge_clean_cancel_file_stops_before_next_item() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "bridge-cancel-app", 2048);
+    let cancel_file = workspace.path().join("cancel");
+    fs::write(&cancel_file, "stop").unwrap();
+
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "clean",
+            project_root.to_str().unwrap(),
+            "--include-recent",
+            "--force",
+            "--max-risk",
+            "all",
+            "--cancel-file",
+            cancel_file.to_str().unwrap(),
+        ],
+    );
+
+    assert!(project_root.join("target").exists());
+    let events = parse_json_lines(&output.stdout);
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "cleanup_cancelled"));
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "cleanup_finished")
+        .unwrap();
+    assert_eq!(finished["payload"]["cleaned_count"], 0);
+    assert_eq!(finished["payload"]["cancelled"], true);
+    assert!(finished["payload"]["trash_batch_id"].is_null());
+    assert!(!workspace.path().join("trash").exists());
+
+    let audit_content = fs::read_to_string(audit_log_path(&workspace)).unwrap();
+    assert!(audit_content.contains("\"type\":\"run_started\""));
+    assert!(audit_content.contains("\"type\":\"run_finished\""));
+    assert!(!audit_content.contains("\"type\":\"item_action\""));
+    assert!(!audit_content.contains(project_root.join("target").to_str().unwrap()));
+}
+
+#[test]
+fn bridge_config_save_uses_resolved_config_path_not_snapshot_path() {
+    let workspace = TempDir::new().unwrap();
+    let snapshot_path = workspace.path().join("snapshot.json");
+    let supplied_config_path = workspace.path().join("gui-supplied").join("config.toml");
+    let snapshot = serde_json::json!({
+        "config_path": supplied_config_path,
+        "config": {
+            "exclude_dirs": ["saved-to-resolved-path"]
+        },
+        "gui_preferences": {
+            "appearance": "light",
+            "launch_at_login": true
+        }
+    });
+    fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "config",
+            "save",
+            "--input",
+            snapshot_path.to_str().unwrap(),
+        ],
+    );
+
+    let events = parse_json_lines(&output.stdout);
+    let saved = events
+        .iter()
+        .find(|event| event["type"] == "config_saved")
+        .unwrap();
+    let resolved_config_path = PathBuf::from(saved["path"].as_str().unwrap());
+    assert_ne!(resolved_config_path, supplied_config_path);
+    assert!(resolved_config_path.exists());
+    assert!(fs::read_to_string(&resolved_config_path)
+        .unwrap()
+        .contains("saved-to-resolved-path"));
+    assert!(!supplied_config_path.exists());
 }
 
 #[test]

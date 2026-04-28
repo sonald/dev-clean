@@ -205,7 +205,7 @@ pub fn latest_batch_id(root: &Path) -> Result<Option<String>> {
     Ok(latest)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct RestoreResult {
     pub restored_count: usize,
     pub skipped_count: usize,
@@ -336,7 +336,7 @@ pub fn restore_batch_with_observer<O: RestoreObserver>(
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct PurgeResult {
     pub removed_batches: usize,
     pub removed_entries: usize,
@@ -398,7 +398,7 @@ pub fn purge_trash_batch(root: &Path, batch_id: &str, dry_run: bool) -> Result<P
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 pub struct GcResult {
     pub removed_batches: usize,
     pub removed_entries: usize,

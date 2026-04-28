@@ -1,6 +1,10 @@
 # Rust
 /target/
 
+# macOS app build products
+/dist/
+/macos/DevCleanerMac/.build/
+
 # IDE
 .vscode/
 .idea/

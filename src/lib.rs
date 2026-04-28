@@ -1,3 +1,4 @@
+pub mod bridge;
 mod clean_progress;
 pub mod cli;
 pub mod interactive;

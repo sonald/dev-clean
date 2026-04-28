@@ -1,3 +1,4 @@
+use crate::bridge::{run_bridge, BridgeCommands};
 use crate::clean_progress::{TerminalCleanObserver, TerminalRestoreObserver};
 use crate::interactive::{ProjectSelector, SelectorOptions};
 use anyhow::{Context, Result};
@@ -482,6 +483,13 @@ pub enum Commands {
         #[command(subcommand)]
         command: AuditCommands,
     },
+
+    /// Internal JSONL bridge for the macOS app.
+    #[command(hide = true)]
+    Bridge {
+        #[command(subcommand)]
+        command: BridgeCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -848,6 +856,10 @@ impl Cli {
             }
             Commands::Audit { command } => {
                 run_audit(command, &config)?;
+            }
+            Commands::Bridge { command } => {
+                let config_path = self.config.unwrap_or_else(Config::default_path);
+                run_bridge(command, &config, config_path)?;
             }
         }
 
@@ -1352,6 +1364,7 @@ fn run_clean(
         force_protected,
         trash,
         trash_root: None,
+        cancel_file: None,
     };
 
     let cleaner = Cleaner::with_options(options);
@@ -1997,6 +2010,7 @@ fn run_apply(
         force_protected,
         trash,
         trash_root: None,
+        cancel_file: None,
     });
     let mut observer = TerminalCleanObserver::new(verbose);
     let mut result = cleaner.clean_multiple_with_observer(&verified_projects, &mut observer)?;

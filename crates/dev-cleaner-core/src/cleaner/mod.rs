@@ -28,6 +28,9 @@ pub struct CleanOptions {
 
     /// Explicit trash root for non-CLI callers that cannot use process defaults.
     pub trash_root: Option<PathBuf>,
+
+    /// Optional cancellation sentinel checked between projects.
+    pub cancel_file: Option<PathBuf>,
 }
 
 impl Default for CleanOptions {
@@ -40,6 +43,7 @@ impl Default for CleanOptions {
             force_protected: false,
             trash: false,
             trash_root: None,
+            cancel_file: None,
         }
     }
 }
@@ -105,6 +109,7 @@ pub trait CleanObserver {
     fn on_dry_run(&mut self, _project: &ProjectInfo, _action: CleanAction) {}
     fn on_cleaned(&mut self, _project: &ProjectInfo, _size: u64) {}
     fn on_failed(&mut self, _project: &ProjectInfo, _error: &anyhow::Error) {}
+    fn on_cancelled(&mut self, _remaining_projects: usize) {}
     fn on_finish(&mut self, _result: &CleanResult) {}
 }
 
@@ -174,6 +179,12 @@ impl Cleaner {
         self
     }
 
+    /// Set an optional cancellation sentinel path.
+    pub fn cancel_file(mut self, cancel_file: Option<PathBuf>) -> Self {
+        self.options.cancel_file = cancel_file;
+        self
+    }
+
     /// Clean multiple projects with progress bar
     pub fn clean_multiple(&self, projects: &[ProjectInfo]) -> Result<CleanResult> {
         let mut observer = NoopCleanObserver;
@@ -200,15 +211,27 @@ impl Cleaner {
         let mut failed_count = 0;
         let mut errors = Vec::new();
 
-        let trash_manager = self.build_trash_manager()?;
-        let trash_batch_id = trash_manager.as_ref().map(|m| m.batch_id.clone());
+        let mut trash_manager = None;
 
-        for project in projects {
+        for (index, project) in projects.iter().enumerate() {
+            if self.cancel_requested() {
+                observer.on_cancelled(projects.len().saturating_sub(index));
+                break;
+            }
+
             observer.on_project(project);
 
             if self.skip_blocked_project(project, observer, &mut skipped_count, &mut bytes_skipped)
             {
                 continue;
+            }
+
+            if self.options.trash
+                && !self.options.dry_run
+                && project.cleanable_dir.exists()
+                && trash_manager.is_none()
+            {
+                trash_manager = self.build_trash_manager()?;
             }
 
             match self.clean_single_impl(project, trash_manager.as_ref(), observer) {
@@ -236,7 +259,7 @@ impl Cleaner {
             bytes_skipped,
             failed_count,
             errors,
-            trash_batch_id,
+            trash_batch_id: trash_manager.as_ref().map(|m| m.batch_id.clone()),
             run_id: None,
         };
         observer.on_finish(&result);
@@ -318,7 +341,11 @@ impl Cleaner {
             return Ok(size);
         }
 
-        let trash_manager = self.build_trash_manager()?;
+        let trash_manager = if self.options.trash && !self.options.dry_run && existed {
+            self.build_trash_manager()?
+        } else {
+            None
+        };
 
         match self.clean_single_impl(project, trash_manager.as_ref(), observer) {
             Ok(size) => {
@@ -413,6 +440,13 @@ impl Cleaner {
         };
 
         Ok(Some(manager))
+    }
+
+    fn cancel_requested(&self) -> bool {
+        self.options
+            .cancel_file
+            .as_ref()
+            .is_some_and(|path| path.exists())
     }
 }
 

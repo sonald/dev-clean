@@ -1,0 +1,7 @@
+[actions.Run]
+command = "./script/build_and_run_mac.sh"
+description = "Build and run the Dev Cleaner macOS app"
+
+[actions."Build Only"]
+command = "./script/build_and_run_mac.sh --build-only"
+description = "Build the Dev Cleaner macOS app bundle without launching it"
