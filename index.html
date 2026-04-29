@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Dev Cleaner - Clean build artifacts without guessing</title>
+    <meta
+      name="description"
+      content="Dev Cleaner is a Rust CLI/TUI for scanning, planning, trashing, and undoing cleanup of developer build artifacts."
+    >
+    <meta property="og:title" content="Dev Cleaner">
+    <meta
+      property="og:description"
+      content="Clean build artifacts without guessing. Scan fast, inspect rules, plan changes, and use undoable trash batches."
+    >
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="assets/dev-cleaner-logo.png">
+    <link rel="icon" href="assets/dev-cleaner-logo.png">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <header class="site-header" id="top">
+      <a class="brand" href="#top" aria-label="Dev Cleaner home">
+        <img src="assets/dev-cleaner-logo.png" alt="" class="brand-mark">
+        <span>Dev Cleaner</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary navigation">
+        <a href="#quickstart">Quickstart</a>
+        <a href="#safety">Safety</a>
+        <a href="#commands">Commands</a>
+        <a href="https://github.com/sonald/dev-clean">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero section-shell">
+        <div class="hero-copy">
+          <h1>Clean build artifacts without <span>guessing</span></h1>
+          <p class="hero-lede">
+            Dev Cleaner scans your workspace, shows what it found and why,
+            then safely moves junk to an undoable trash batch.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="#quickstart">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M5 12h12m0 0-5-5m5 5-5 5"></path>
+              </svg>
+              Quickstart
+            </a>
+            <a class="button button-secondary" href="https://github.com/sonald/dev-clean">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.7c-2.78.61-3.37-1.18-3.37-1.18-.45-1.15-1.11-1.45-1.11-1.45-.9-.62.07-.61.07-.61 1 .07 1.53 1.04 1.53 1.04.89 1.52 2.34 1.08 2.91.83.09-.65.35-1.08.63-1.33-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.64 0 0 .84-.27 2.75 1.02A9.55 9.55 0 0 1 12 6.04c.85 0 1.7.11 2.5.33 1.9-1.29 2.74-1.02 2.74-1.02.55 1.37.2 2.39.1 2.64.64.7 1.02 1.59 1.02 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.86v2.75c0 .27.18.58.69.48A10 10 0 0 0 12 2Z"></path>
+              </svg>
+              GitHub
+            </a>
+          </div>
+          <div class="install-command" id="quickstart">
+            <code>cargo install dev-cleaner</code>
+            <button class="copy-button" data-copy="cargo install dev-cleaner" aria-label="Copy install command">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M8 8h11v11H8z"></path>
+                <path d="M5 15H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1v1"></path>
+              </svg>
+            </button>
+          </div>
+          <div class="platform-row" aria-label="Project properties">
+            <span>Linux</span>
+            <span>macOS</span>
+            <span>Windows</span>
+            <span>Rust</span>
+            <span>Offline-first</span>
+          </div>
+        </div>
+
+        <div class="product-preview" aria-label="Dev Cleaner terminal preview">
+          <div class="window-bar">
+            <span class="dot red"></span>
+            <span class="dot amber"></span>
+            <span class="dot green"></span>
+            <strong>dev-cleaner</strong>
+          </div>
+          <div class="terminal-tabs" role="tablist" aria-label="Workflow preview">
+            <button class="terminal-tab active" data-preview="scan" role="tab" aria-selected="true">[1] Scan</button>
+            <button class="terminal-tab" data-preview="plan" role="tab" aria-selected="false">[2] Plan</button>
+            <button class="terminal-tab" data-preview="trash" role="tab" aria-selected="false">[3] Trash</button>
+            <button class="terminal-tab" data-preview="undo" role="tab" aria-selected="false">[4] Undo</button>
+          </div>
+          <div class="terminal-meta">
+            <span>Workspace: ~/projects/acme</span>
+            <span>Profile: default</span>
+          </div>
+          <pre class="terminal-output" id="terminal-output" aria-live="polite"></pre>
+          <div class="terminal-footer">
+            <span>Enter: open</span>
+            <span>Space: toggle</span>
+            <span>p: plan</span>
+            <span>Scan complete</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="feature-section section-shell" aria-labelledby="features-title">
+        <h2 id="features-title">Built for safe, confident cleanup</h2>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <div class="feature-icon search-icon"></div>
+            <h3>Fast scanning</h3>
+            <p>Parallel traversal and streaming size calculation surface candidates quickly.</p>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon rule-icon"></div>
+            <h3>Rule attribution</h3>
+            <p>Every finding can explain the built-in, custom, gitignore, or heuristic rule.</p>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon shield-icon"></div>
+            <h3>Risk and confidence</h3>
+            <p>Default filters keep higher-risk dependency and gitignore discoveries hidden.</p>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon plan-icon"></div>
+            <h3>Plan before action</h3>
+            <p>Generate machine-readable plans, review them, and apply only what you approve.</p>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon trash-icon"></div>
+            <h3>Undoable trash</h3>
+            <p>Move targets into batch trash and restore the latest run when needed.</p>
+          </article>
+          <article class="feature-card">
+            <div class="feature-icon terminal-icon"></div>
+            <h3>Terminal first</h3>
+            <p>Use fast CLI flows or a keyboard-driven TUI when selecting targets manually.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="workflow section-shell" aria-labelledby="workflow-title">
+        <h2 id="workflow-title">A simple, safe workflow</h2>
+        <div class="workflow-grid">
+          <article class="workflow-step">
+            <span class="step-number blue">1</span>
+            <h3>Scan</h3>
+            <code>dev-cleaner scan --explain</code>
+            <p>Find cleanable targets and see the exact rule behind each path.</p>
+          </article>
+          <article class="workflow-step">
+            <span class="step-number teal">2</span>
+            <h3>Plan</h3>
+            <code>dev-cleaner plan -o plan.json</code>
+            <p>Review the complete cleanup plan before touching the filesystem.</p>
+          </article>
+          <article class="workflow-step">
+            <span class="step-number green">3</span>
+            <h3>Trash</h3>
+            <code>dev-cleaner apply plan.json --trash</code>
+            <p>Move approved directories into an undoable trash batch.</p>
+          </article>
+          <article class="workflow-step">
+            <span class="step-number orange">4</span>
+            <h3>Undo</h3>
+            <code>dev-cleaner undo</code>
+            <p>Restore the last trash batch if a cleanup needs to be reversed.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="safety section-shell" id="safety" aria-labelledby="safety-title">
+        <div class="safety-copy">
+          <h2 id="safety-title">Safety by design</h2>
+          <div class="safety-point">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3 5 6v5c0 4.5 2.9 8.6 7 10 4.1-1.4 7-5.5 7-10V6l-7-3Z"></path>
+              <path d="m9 12 2 2 4-5"></path>
+            </svg>
+            <div>
+              <h3>Conservative by default</h3>
+              <p>Built-in rules target common build artifacts, while high-risk discoveries require opt-in.</p>
+            </div>
+          </div>
+          <div class="safety-point">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v18"></path>
+              <path d="M6 8h12"></path>
+              <path d="m6 8-3 6h6L6 8Z"></path>
+              <path d="m18 8-3 6h6l-3-6Z"></path>
+            </svg>
+            <div>
+              <h3>Provenance you can trust</h3>
+              <p>Use <code>--explain</code> to inspect source, category, risk, and confidence metadata.</p>
+            </div>
+          </div>
+          <div class="safety-point">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M7 11V8a5 5 0 0 1 10 0v3"></path>
+              <path d="M6 11h12v10H6z"></path>
+            </svg>
+            <div>
+              <h3>Your data stays local</h3>
+              <p>Scanning, planning, trashing, and restoring all run on your machine.</p>
+            </div>
+          </div>
+        </div>
+        <div class="json-panel" aria-label="Machine-readable finding example">
+          <pre><code>{
+  "path": "target/debug/",
+  "size": 1585157120,
+  "rule": "rust/cargo-target",
+  "risk": "medium",
+  "confidence": "high",
+  "evidence": [
+    "path matches **/target/**",
+    "contains Cargo.lock up the tree"
+  ]
+}</code></pre>
+          <p>Every finding includes machine-readable provenance.</p>
+        </div>
+      </section>
+
+      <section class="commands section-shell" id="commands" aria-labelledby="commands-title">
+        <h2 id="commands-title">Commands you will use</h2>
+        <div class="command-grid">
+          <article class="command-card">
+            <code>dev-cleaner scan</code>
+            <p>Scan the workspace and show a summary.</p>
+            <button class="copy-button" data-copy="dev-cleaner scan" aria-label="Copy scan command"></button>
+          </article>
+          <article class="command-card">
+            <code>dev-cleaner clean --dry-run</code>
+            <p>Preview what would be cleaned before deleting or trashing.</p>
+            <button class="copy-button" data-copy="dev-cleaner clean --dry-run" aria-label="Copy dry-run command"></button>
+          </article>
+          <article class="command-card">
+            <code>dev-cleaner plan -o plan.json</code>
+            <p>Write a reviewable cleanup plan.</p>
+            <button class="copy-button" data-copy="dev-cleaner plan -o plan.json" aria-label="Copy plan command"></button>
+          </article>
+          <article class="command-card">
+            <code>dev-cleaner apply plan.json --trash</code>
+            <p>Apply a plan using undoable trash mode.</p>
+            <button class="copy-button" data-copy="dev-cleaner apply plan.json --trash" aria-label="Copy apply command"></button>
+          </article>
+          <article class="command-card">
+            <code>dev-cleaner recommend --cleanup 10GB</code>
+            <p>Build a cleanup recommendation for a target amount of space.</p>
+            <button class="copy-button" data-copy="dev-cleaner recommend --cleanup 10GB" aria-label="Copy recommend command"></button>
+          </article>
+          <article class="command-card">
+            <code>dev-cleaner undo</code>
+            <p>Restore the latest trash batch.</p>
+            <button class="copy-button" data-copy="dev-cleaner undo" aria-label="Copy undo command"></button>
+          </article>
+        </div>
+        <a class="text-link" href="https://github.com/sonald/dev-clean#usage">See all options on GitHub</a>
+      </section>
+    </main>
+
+    <footer class="site-footer section-shell">
+      <div>
+        <a class="brand footer-brand" href="#top" aria-label="Dev Cleaner home">
+          <img src="assets/dev-cleaner-logo.png" alt="" class="brand-mark">
+          <span>Dev Cleaner</span>
+        </a>
+        <p>A Rust CLI/TUI for safe cleanup of temporary developer build directories.</p>
+      </div>
+      <div class="footer-links">
+        <a href="#quickstart">Quickstart</a>
+        <a href="https://github.com/sonald/dev-clean">GitHub</a>
+        <a href="https://github.com/sonald/dev-clean/blob/main/README.md">Documentation</a>
+        <a href="https://github.com/sonald/dev-clean/blob/main/LICENSE">License</a>
+      </div>
+    </footer>
+
+    <script src="script.js"></script>
+  </body>
+</html>
