@@ -2,6 +2,8 @@
 
 A fast, intelligent developer tool for scanning and cleaning temporary build directories across multiple programming languages.
 
+Project homepage: <https://sonald.me/dev-clean/>
+
 ## Features
 
 - **Multi-Language Support**: Automatically detects and cleans 18+ project types
