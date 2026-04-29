@@ -19,8 +19,12 @@ struct DevCleanerMacApp: App {
         .commands {
             CommandGroup(replacing: .newItem) { }
             CommandMenu("Dev Cleaner") {
-                Button("Smart Scan") {
-                    Task { await model.smartScan() }
+                Button(model.isScanning ? "Stop Scan" : "Smart Scan") {
+                    if model.isScanning {
+                        model.stopScan()
+                    } else {
+                        model.startSmartScan()
+                    }
                 }
                 .keyboardShortcut("r", modifiers: [.command])
 

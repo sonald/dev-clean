@@ -117,6 +117,7 @@ struct AuditRun: Codable, Identifiable, Hashable {
 
 struct GuiPreferences: Codable, Equatable {
     var appearance: String = "dark"
+    var scanRootPath: String = FileManager.default.homeDirectoryForCurrentUser.path
     var launchAtLogin: Bool = false
     var showMenubarIcon: Bool = true
     var alertsEnabled: Bool = false
@@ -126,12 +127,28 @@ struct GuiPreferences: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case appearance
+        case scanRootPath = "scan_root_path"
         case launchAtLogin = "launch_at_login"
         case showMenubarIcon = "show_menubar_icon"
         case alertsEnabled = "alerts_enabled"
         case notificationThresholdGb = "notification_threshold_gb"
         case trashRetentionDays = "trash_retention_days"
         case trashLimitGb = "trash_limit_gb"
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        appearance = try container.decodeIfPresent(String.self, forKey: .appearance) ?? "dark"
+        scanRootPath = try container.decodeIfPresent(String.self, forKey: .scanRootPath)
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
+        showMenubarIcon = try container.decodeIfPresent(Bool.self, forKey: .showMenubarIcon) ?? true
+        alertsEnabled = try container.decodeIfPresent(Bool.self, forKey: .alertsEnabled) ?? false
+        notificationThresholdGb = try container.decodeIfPresent(UInt64.self, forKey: .notificationThresholdGb) ?? 1
+        trashRetentionDays = try container.decodeIfPresent(Int.self, forKey: .trashRetentionDays) ?? 30
+        trashLimitGb = try container.decodeIfPresent(UInt64.self, forKey: .trashLimitGb) ?? 10
     }
 }
 

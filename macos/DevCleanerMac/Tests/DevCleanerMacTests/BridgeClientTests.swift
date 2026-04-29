@@ -38,6 +38,10 @@ final class BridgeClientTests: XCTestCase {
         XCTAssertThrowsError(try BridgeEventDecoder.decode(Data(#"{"type":"ready"}"#.utf8)))
     }
 
+    func testGuiPreferencesDefaultScanRootPathUsesHome() {
+        XCTAssertEqual(GuiPreferences().scanRootPath, FileManager.default.homeDirectoryForCurrentUser.path)
+    }
+
     func testBridgeClientRunPropagatesDecodeFailure() async throws {
         let helperDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("dev-cleaner-helper-\(UUID().uuidString)", isDirectory: true)
@@ -61,6 +65,43 @@ final class BridgeClientTests: XCTestCase {
             XCTAssertTrue(message.contains("Failed to decode helper event"))
         } catch {
             XCTFail("expected decodeFailed, got \(error)")
+        }
+    }
+
+    func testBridgeClientRunTerminatesOnCancellation() async throws {
+        let helperDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dev-cleaner-helper-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: helperDirectory, withIntermediateDirectories: true)
+        let helperURL = helperDirectory.appendingPathComponent("helper.sh")
+        let script = """
+        #!/bin/sh
+        printf '%s\\n' '{"type":"ready","version":"1.2.3"}'
+        while true; do sleep 1; done
+        """
+        try script.write(to: helperURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: helperURL.path)
+        defer { try? FileManager.default.removeItem(at: helperDirectory) }
+
+        let ready = expectation(description: "helper emitted ready")
+        let client = try BridgeClient(helperURL: helperURL)
+        let task = Task {
+            try await client.run(arguments: []) { event in
+                if case .ready = event {
+                    ready.fulfill()
+                }
+            }
+        }
+
+        await fulfillment(of: [ready], timeout: 2)
+        task.cancel()
+
+        do {
+            try await task.value
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
         }
     }
 
@@ -101,6 +142,66 @@ final class BridgeClientTests: XCTestCase {
             model.selectedProjectIDs = [project.id]
             XCTAssertEqual(model.selectedBytes, 1024)
             XCTAssertEqual(model.selectedProjects.count, 1)
+        }
+    }
+
+    func testSmartScanUsesSelectedRoot() async {
+        let bridge = RecordingBridgeRunner()
+        let model = await AppModel(bridge: bridge)
+
+        await MainActor.run {
+            model.setScanRoot(path: "/tmp/dev-clean-root", persist: false)
+            model.startSmartScan()
+        }
+
+        let didRecordScan = await waitUntil { bridge.recordedArguments.count == 1 }
+        XCTAssertTrue(didRecordScan)
+        let arguments = bridge.recordedArguments.last ?? []
+        XCTAssertEqual(Array(arguments.prefix(2)), ["scan", "/tmp/dev-clean-root"])
+    }
+
+    func testRecommendationUsesSelectedRoot() async {
+        let bridge = RecordingBridgeRunner()
+        let model = await AppModel(bridge: bridge)
+
+        await MainActor.run {
+            model.setScanRoot(path: "/tmp/dev-clean-recommend", persist: false)
+        }
+        await model.generateRecommendation()
+
+        let arguments = bridge.recordedArguments.last ?? []
+        XCTAssertEqual(Array(arguments.prefix(2)), ["recommend", "/tmp/dev-clean-recommend"])
+    }
+
+    func testStopScanCancelsTaskAndKeepsPartialResults() async {
+        let project = makeProject()
+        let bridge = RecordingBridgeRunner(events: [.scanItem(project)], waitUntilCancelled: true)
+        let model = await AppModel(bridge: bridge)
+
+        await MainActor.run {
+            model.startSmartScan()
+        }
+
+        let didStartScan = await waitUntil {
+            await MainActor.run {
+                model.isScanning && model.projects.count == 1
+            }
+        }
+        XCTAssertTrue(didStartScan)
+
+        await MainActor.run {
+            model.stopScan()
+        }
+
+        let didStopScan = await waitUntil {
+            await MainActor.run { !model.isScanning }
+        }
+        XCTAssertTrue(didStopScan)
+
+        await MainActor.run {
+            XCTAssertEqual(model.projects.map(\.id), [project.id])
+            XCTAssertNil(model.alert)
+            XCTAssertTrue(model.scanStatusMessage.contains("stopped"))
         }
     }
 
@@ -164,8 +265,38 @@ final class BridgeClientTests: XCTestCase {
 
 private final class RecordingBridgeRunner: BridgeRunning {
     private(set) var recordedArguments: [[String]] = []
+    var events: [BridgeEvent]
+    var waitUntilCancelled: Bool
+
+    init(events: [BridgeEvent] = [], waitUntilCancelled: Bool = false) {
+        self.events = events
+        self.waitUntilCancelled = waitUntilCancelled
+    }
 
     func run(arguments: [String], onEvent: @escaping @MainActor (BridgeEvent) -> Void) async throws {
         recordedArguments.append(arguments)
+        for event in events {
+            await onEvent(event)
+        }
+        if waitUntilCancelled {
+            while !Task.isCancelled {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            throw CancellationError()
+        }
     }
+}
+
+private func waitUntil(
+    timeout: TimeInterval = 1,
+    condition: @escaping () async -> Bool
+) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while Date() < deadline {
+        if await condition() {
+            return true
+        }
+        try? await Task.sleep(nanoseconds: 10_000_000)
+    }
+    return await condition()
 }

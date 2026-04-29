@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import SwiftUI
 
 @MainActor
@@ -12,6 +13,7 @@ final class AppModel: ObservableObject {
     @Published var riskFilter = "all"
     @Published var isScanning = false
     @Published var scanProgress: Double = 0
+    @Published var scanStatusMessage = "Ready to scan."
     @Published var isCleaning = false
     @Published var cleanupMode: CleanupMode = .trash
     @Published var cleanupLog: [String] = []
@@ -27,6 +29,7 @@ final class AppModel: ObservableObject {
     @Published var alert: AppAlert?
 
     private let bridge: BridgeRunning
+    private var scanTask: Task<Void, Never>?
     private var cancelFile: URL?
 
     init(bridge: BridgeRunning? = nil) {
@@ -65,15 +68,68 @@ final class AppModel: ObservableObject {
         selectedProjects.reduce(0) { $0 + $1.size }
     }
 
+    var scanRootPath: String {
+        normalizedScanRootPath(preferences.scanRootPath)
+    }
+
+    var scanRootDisplayName: String {
+        DevCleanerFormatters.shortPath(scanRootPath)
+    }
+
     func bootstrap() async {
         await loadConfig()
         await refreshTrash()
         await refreshAudit()
     }
 
+    func startSmartScan() {
+        guard !isScanning else {
+            stopScan()
+            return
+        }
+        scanTask = Task { [weak self] in
+            await self?.smartScan()
+        }
+    }
+
+    func stopScan() {
+        guard isScanning else { return }
+        scanStatusMessage = "Stopping scan..."
+        scanTask?.cancel()
+    }
+
+    func chooseScanRoot() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Scan Root"
+        panel.prompt = "Use Folder"
+        panel.message = "Choose the folder Dev Cleaner should scan."
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: scanRootPath)
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setScanRoot(path: url.path)
+    }
+
+    func resetScanRootToHome() {
+        setScanRoot(path: FileManager.default.homeDirectoryForCurrentUser.path)
+    }
+
+    func setScanRoot(path: String, persist: Bool = true) {
+        preferences.scanRootPath = normalizedScanRootPath(path)
+        scanStatusMessage = "Ready to scan \(scanRootDisplayName)."
+        if persist {
+            Task { await saveConfig(showAlert: false) }
+        }
+    }
+
     func smartScan() async {
+        let root = scanRootPath
         isScanning = true
         scanProgress = 0
+        scanStatusMessage = "Scanning \(DevCleanerFormatters.shortPath(root))..."
         cleanupLog.removeAll()
         projects.removeAll()
         selectedProjectIDs.removeAll()
@@ -81,19 +137,25 @@ final class AppModel: ObservableObject {
         selectedSection = .scanResults
 
         do {
-            try await bridge.run(arguments: ["scan", FileManager.default.homeDirectoryForCurrentUser.path, "--depth", "4", "--max-risk", "all"]) { [weak self] event in
+            try await bridge.run(arguments: ["scan", root, "--depth", "4", "--max-risk", "all"]) { [weak self] event in
                 self?.handle(event)
             }
+            scanStatusMessage = "Scan complete."
+        } catch is CancellationError {
+            scanStatusMessage = "Scan stopped. Partial results are preserved."
         } catch {
             alert = AppAlert(title: "Scan Failed", message: error.localizedDescription)
+            scanStatusMessage = "Scan failed."
         }
         isScanning = false
+        scanTask = nil
     }
 
     func generateRecommendation(strategy: String = "balanced", target: String = "10GB") async {
+        guard !isScanning else { return }
         selectedSection = .recommendations
         do {
-            try await bridge.run(arguments: ["recommend", FileManager.default.homeDirectoryForCurrentUser.path, "--cleanup", target, "--strategy", strategy, "--max-risk", "all"]) { [weak self] event in
+            try await bridge.run(arguments: ["recommend", scanRootPath, "--cleanup", target, "--strategy", strategy, "--max-risk", "all"]) { [weak self] event in
                 self?.handle(event)
             }
         } catch {
@@ -185,7 +247,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func saveConfig() async {
+    func saveConfig(showAlert: Bool = true) async {
         guard var snapshot = configSnapshot else { return }
         snapshot.guiPreferences = preferences
         do {
@@ -194,6 +256,9 @@ final class AppModel: ObservableObject {
             try data.write(to: url)
             try await bridge.run(arguments: ["config", "save", "--input", url.path]) { [weak self] event in
                 self?.handle(event)
+            }
+            if !showAlert {
+                alert = nil
             }
         } catch {
             alert = AppAlert(title: "Save Failed", message: error.localizedDescription)
@@ -236,7 +301,7 @@ final class AppModel: ObservableObject {
             "schema_version": 3,
             "tool_version": "mac",
             "created_at": ISO8601DateFormatter().string(from: Date()),
-            "scan_root": FileManager.default.homeDirectoryForCurrentUser.path,
+            "scan_root": scanRootPath,
             "projects": try projects.map { try $0.asJSONObject() }
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
@@ -347,6 +412,13 @@ private final class MockBridgeRunner: BridgeRunning {
     func run(arguments: [String], onEvent: @escaping @MainActor (BridgeEvent) -> Void) async throws {
         await onEvent(.error("Bridge helper is unavailable. Build the Rust helper first."))
     }
+}
+
+private func normalizedScanRootPath(_ path: String) -> String {
+    let fallback = FileManager.default.homeDirectoryForCurrentUser.path
+    let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return fallback }
+    return (trimmed as NSString).expandingTildeInPath
 }
 
 extension Encodable {

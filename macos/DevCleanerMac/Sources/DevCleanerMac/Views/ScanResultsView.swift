@@ -41,7 +41,22 @@ struct ScanResultsView: View {
                 Text("High").tag("high")
             }
             .labelsHidden()
+            Label(model.scanRootDisplayName, systemImage: "folder")
+                .font(.caption)
+                .foregroundStyle(DCColor.secondary)
+                .lineLimit(1)
+                .frame(maxWidth: 180, alignment: .leading)
             Spacer()
+            Button {
+                if model.isScanning {
+                    model.stopScan()
+                } else {
+                    model.startSmartScan()
+                }
+            } label: {
+                Label(model.isScanning ? "Stop Scan" : "Scan", systemImage: model.isScanning ? "stop.circle" : "scope")
+            }
+            .buttonStyle(model.isScanning ? PrimaryButtonStyle(color: DCColor.red) : PrimaryButtonStyle())
             Button {
                 model.presentCleanupPlan(mode: .trash)
             } label: {
@@ -62,6 +77,15 @@ struct ScanResultsView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
             }
+            HStack {
+                Text(model.scanStatusMessage)
+                    .font(.caption)
+                    .foregroundStyle(DCColor.secondary)
+                    .lineLimit(1)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
             List(model.visibleProjects, selection: $model.focusedProjectID) { project in
                 ProjectRow(project: project, selected: model.selectedProjectIDs.contains(project.id)) {
                     if model.selectedProjectIDs.contains(project.id) {

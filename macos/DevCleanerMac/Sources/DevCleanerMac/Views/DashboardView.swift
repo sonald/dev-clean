@@ -15,14 +15,49 @@ struct DashboardView: View {
                     }
                     Spacer()
                     Button {
-                        Task { await model.smartScan() }
+                        if model.isScanning {
+                            model.stopScan()
+                        } else {
+                            model.startSmartScan()
+                        }
                     } label: {
-                        Label(model.isScanning ? "Scanning" : "Smart Scan", systemImage: "scope")
+                        Label(model.isScanning ? "Stop" : "Smart Scan", systemImage: model.isScanning ? "stop.circle" : "scope")
                     }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(model.isScanning)
+                    .buttonStyle(PrimaryButtonStyle(color: model.isScanning ? DCColor.red : DCColor.blue))
                 }
                 .foregroundStyle(DCColor.text)
+
+                DCCard {
+                    HStack(spacing: 12) {
+                        Image(systemName: "folder")
+                            .foregroundStyle(DCColor.blue)
+                            .frame(width: 22)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(model.scanRootDisplayName)
+                                .font(.headline)
+                                .lineLimit(1)
+                            Text(model.scanStatusMessage)
+                                .font(.caption)
+                                .foregroundStyle(DCColor.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer()
+                        Button {
+                            model.chooseScanRoot()
+                        } label: {
+                            Label("Choose Folder", systemImage: "folder.badge.plus")
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(model.isScanning)
+                        Button {
+                            model.resetScanRootToHome()
+                        } label: {
+                            Label("Reset", systemImage: "house")
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .disabled(model.isScanning)
+                    }
+                }
 
                 HStack(spacing: 16) {
                     DCCard {

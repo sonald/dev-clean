@@ -379,6 +379,8 @@ pub struct BridgeConfigSnapshot {
 pub struct GuiPreferences {
     #[serde(default = "default_appearance")]
     pub appearance: String,
+    #[serde(default = "default_scan_root_path")]
+    pub scan_root_path: String,
     #[serde(default)]
     pub launch_at_login: bool,
     #[serde(default = "default_true")]
@@ -397,6 +399,7 @@ impl Default for GuiPreferences {
     fn default() -> Self {
         Self {
             appearance: default_appearance(),
+            scan_root_path: default_scan_root_path(),
             launch_at_login: false,
             show_menubar_icon: true,
             alerts_enabled: false,
@@ -409,6 +412,13 @@ impl Default for GuiPreferences {
 
 fn default_appearance() -> String {
     "dark".to_string()
+}
+
+fn default_scan_root_path() -> String {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .display()
+        .to_string()
 }
 
 fn default_true() -> bool {
@@ -1080,6 +1090,7 @@ mod tests {
     fn gui_preferences_have_safe_defaults() {
         let prefs = GuiPreferences::default();
         assert_eq!(prefs.appearance, "dark");
+        assert!(!prefs.scan_root_path.is_empty());
         assert!(prefs.show_menubar_icon);
         assert_eq!(prefs.trash_retention_days, 30);
     }

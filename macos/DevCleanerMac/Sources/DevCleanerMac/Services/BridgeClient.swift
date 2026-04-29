@@ -72,9 +72,25 @@ final class BridgeClient: BridgeRunning {
     }
 
     func run(arguments: [String], onEvent: @escaping @MainActor (BridgeEvent) -> Void) async throws {
+        let processBox = RunningProcessBox()
+        return try await withTaskCancellationHandler {
+            try await runProcess(arguments: arguments, processBox: processBox, onEvent: onEvent)
+        } onCancel: {
+            processBox.terminate()
+        }
+    }
+
+    private func runProcess(
+        arguments: [String],
+        processBox: RunningProcessBox,
+        onEvent: @escaping @MainActor (BridgeEvent) -> Void
+    ) async throws {
+        try Task.checkCancellation()
+
         let process = Process()
         process.executableURL = helperURL
         process.arguments = ["bridge"] + arguments
+        processBox.set(process)
 
         let output = Pipe()
         let error = Pipe()
@@ -89,6 +105,7 @@ final class BridgeClient: BridgeRunning {
 
         do {
             for try await line in output.fileHandleForReading.bytes.lines {
+                try Task.checkCancellation()
                 guard let data = line.data(using: .utf8) else { continue }
                 do {
                     let event = try BridgeEventDecoder.decode(data)
@@ -97,6 +114,9 @@ final class BridgeClient: BridgeRunning {
                     throw BridgeClientError.decodeFailed("Failed to decode helper event: \(error.localizedDescription)")
                 }
             }
+        } catch is CancellationError {
+            processBox.terminate()
+            throw CancellationError()
         } catch {
             if process.isRunning {
                 process.terminate()
@@ -106,9 +126,33 @@ final class BridgeClient: BridgeRunning {
         }
 
         process.waitUntilExit()
+        if Task.isCancelled {
+            throw CancellationError()
+        }
         if process.terminationStatus != 0 {
             let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             throw BridgeClientError.failedExit(process.terminationStatus, stderr)
+        }
+    }
+}
+
+private final class RunningProcessBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+
+    func set(_ process: Process) {
+        lock.lock()
+        self.process = process
+        lock.unlock()
+    }
+
+    func terminate() {
+        lock.lock()
+        let process = process
+        lock.unlock()
+
+        if process?.isRunning == true {
+            process?.terminate()
         }
     }
 }
