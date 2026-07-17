@@ -985,7 +985,7 @@ fn normalize_relative_path(relative: &Path) -> String {
 
 fn apply_matched_rule(info: &mut ProjectInfo, rule: RuleRef, basename: &str, relative_path: &str) {
     let category = classify_category(basename, relative_path);
-    let risk_level = risk_for_rule(rule.source, category);
+    let risk_level = risk_for_rule(info, rule.source, category);
     let confidence = confidence_for_rule(rule.source);
 
     info.category = category;
@@ -1059,11 +1059,37 @@ fn default_risk_level(category: Category) -> RiskLevel {
     }
 }
 
-fn risk_for_rule(source: RuleSource, category: Category) -> RiskLevel {
+fn risk_for_rule(info: &ProjectInfo, source: RuleSource, category: Category) -> RiskLevel {
+    if source == RuleSource::Builtin && is_uv_managed_venv(info) {
+        return RiskLevel::Medium;
+    }
+
     match source {
         RuleSource::Gitignore => RiskLevel::High,
         _ => default_risk_level(category),
     }
+}
+
+fn is_uv_managed_venv(info: &ProjectInfo) -> bool {
+    if info
+        .cleanable_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(".venv")
+        || !info.root.join("pyproject.toml").is_file()
+        || !info.root.join("uv.lock").is_file()
+    {
+        return false;
+    }
+
+    let Ok(config) = std::fs::read_to_string(info.cleanable_dir.join("pyvenv.cfg")) else {
+        return false;
+    };
+
+    config.lines().any(|line| {
+        line.split_once('=')
+            .is_some_and(|(key, value)| key.trim() == "uv" && !value.trim().is_empty())
+    })
 }
 
 fn confidence_for_rule(source: RuleSource) -> Confidence {
@@ -1177,6 +1203,47 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_type, ProjectType::Python);
         assert!(results[0].cleanable_dir.ends_with("mypkg.egg-info"));
+    }
+
+    #[test]
+    fn test_scanner_treats_verified_uv_venv_as_medium_risk() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let uv_project = root.join("uv-project");
+        let uv_venv = uv_project.join(".venv");
+        fs::create_dir_all(&uv_venv).unwrap();
+        fs::write(
+            uv_project.join("pyproject.toml"),
+            "[project]\nname = \"uv-project\"\n",
+        )
+        .unwrap();
+        fs::write(uv_project.join("uv.lock"), "version = 1\n").unwrap();
+        fs::write(
+            uv_venv.join("pyvenv.cfg"),
+            "implementation = CPython\nuv = 0.11.27\n",
+        )
+        .unwrap();
+
+        let plain_project = root.join("plain-project");
+        let plain_venv = plain_project.join(".venv");
+        fs::create_dir_all(&plain_venv).unwrap();
+        fs::write(
+            plain_project.join("pyproject.toml"),
+            "[project]\nname = \"plain-project\"\n",
+        )
+        .unwrap();
+        fs::write(plain_project.join("uv.lock"), "version = 1\n").unwrap();
+        fs::write(plain_venv.join("pyvenv.cfg"), "implementation = CPython\n").unwrap();
+
+        let results = Scanner::new(root)
+            .max_risk(RiskLevel::Medium)
+            .scan()
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].cleanable_dir, uv_venv);
+        assert_eq!(results[0].risk_level, RiskLevel::Medium);
     }
 
     #[test]
