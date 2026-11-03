@@ -44,10 +44,10 @@
 - [x] 1.7 审计补齐：bridge 的 restore / purge / gc 写审计（命令名与 CLI 一致：`undo` / `trash`）；History 的 "Last 30 Days" 改按日期，"Restore" 按 `undo` 过滤。
 
 ### 阶段 2：检测精度（core）
-- [ ] 2.1 遍历不进入隐藏目录（扫描根本身除外；`.venv`、`.next` 等目标照常识别），也不进入 `node_modules` 内部寻找项目。
-- [ ] 2.2 含有 git 跟踪文件的目录永不作为候选（`git ls-files`；不在仓库或 git 不可用时保持原行为）。
-- [ ] 2.3 in-use 锁文件补全：`uv.lock`、`bun.lock`、`bun.lockb`、`Package.resolved`、`mix.lock` 等。
-- [ ] 2.4 大小按实际占用块计算，硬链接只在全部链接都位于目标内时计入（pnpm/uv 场景不再虚高）。
+- [x] 2.1 遍历不进入隐藏目录（扫描根本身除外；`.venv`、`.next` 等目标照常识别），也不进入 `node_modules` 内部寻找项目。实测 home 扫描：GUI 等效 79→12 项、13.7s→2.9s；CLI 默认 51→5 项，45 个扩展 `dist` 全部排除。
+- [x] 2.2 含有 git 跟踪文件的目录永不作为候选（`git ls-files`；不在仓库或 git 不可用时保持原行为）。已知代价：`target/` 里误提交了少量文件时整个目录也会被排除（本机 tokio 源码目录 1.18 GB）。
+- [x] 2.3 in-use 锁文件补全：`uv.lock`、`bun.lock`、`bun.lockb`、`Package.resolved`、`mix.lock` 等。
+- [x] 2.4 大小按实际占用块计算，硬链接只在全部链接都位于目标内时计入（pnpm/uv 硬链接模式不再虚高）。APFS 克隆仍按全量计：本机实测目标目录无克隆；升级路径 `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` 已验证可用。
 
 ### 阶段 3：回收站真正释放空间
 - [x] 3.1 GUI 启动时和每次清理后按保留天数自动 `trash gc`（容量上限改为超限提醒：按容量清理会删掉刚移入的批次，破坏撤销）。

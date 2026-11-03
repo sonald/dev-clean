@@ -228,18 +228,56 @@ impl ProjectDetector {
         }
     }
 
+    /// True when `dir` holds files tracked by git (it is source, not a build artifact).
+    ///
+    /// Returns false outside a work tree or when git cannot run, so callers keep their
+    /// normal rules. Only spawns git when a `.git` entry exists on the way up, which keeps
+    /// scans of non-repo folders free of process launches.
+    pub fn contains_tracked_files(dir: &Path) -> bool {
+        let Some(work_tree) = dir.ancestors().find(|p| p.join(".git").exists()) else {
+            return false;
+        };
+        let Ok(relative) = dir.strip_prefix(work_tree) else {
+            return false;
+        };
+        let pathspec = if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        };
+        std::process::Command::new("git")
+            .arg("--literal-pathspecs")
+            .arg("-C")
+            .arg(work_tree)
+            .args(["ls-files", "-z", "--"])
+            .arg(pathspec)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|out| out.status.success() && !out.stdout.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Check if a directory is currently in use based on lock files
     pub fn is_in_use(project_dir: &Path, project_type: ProjectType) -> bool {
         match project_type {
             ProjectType::NodeJs => {
                 // Check if package-lock.json or yarn.lock was recently modified
-                let lock_files = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml"];
+                let lock_files = [
+                    "package-lock.json",
+                    "npm-shrinkwrap.json",
+                    "yarn.lock",
+                    "pnpm-lock.yaml",
+                    "bun.lock",
+                    "bun.lockb",
+                ];
                 Self::check_recent_lock_files(project_dir, &lock_files)
             }
             ProjectType::Rust => Self::check_recent_lock_files(project_dir, &["Cargo.lock"]),
-            ProjectType::Python => {
-                Self::check_recent_lock_files(project_dir, &["Pipfile.lock", "poetry.lock"])
-            }
+            ProjectType::Python => Self::check_recent_lock_files(
+                project_dir,
+                &["Pipfile.lock", "poetry.lock", "uv.lock", "pdm.lock"],
+            ),
             ProjectType::Dart => Self::check_recent_lock_files(project_dir, &["pubspec.lock"]),
             ProjectType::Haskell => {
                 Self::check_recent_lock_files(project_dir, &["stack.yaml.lock"])
@@ -247,6 +285,11 @@ impl ProjectDetector {
             ProjectType::Go => Self::check_recent_lock_files(project_dir, &["go.sum"]),
             ProjectType::Ruby => Self::check_recent_lock_files(project_dir, &["Gemfile.lock"]),
             ProjectType::Php => Self::check_recent_lock_files(project_dir, &["composer.lock"]),
+            ProjectType::Swift => Self::check_recent_lock_files(project_dir, &["Package.resolved"]),
+            ProjectType::Elixir => Self::check_recent_lock_files(project_dir, &["mix.lock"]),
+            ProjectType::DotNet => {
+                Self::check_recent_lock_files(project_dir, &["packages.lock.json"])
+            }
             _ => false,
         }
     }
@@ -517,6 +560,24 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_in_use_detects_modern_lock_files() {
+        let temp = TempDir::new().unwrap();
+        for (lock, project_type) in [
+            ("uv.lock", ProjectType::Python),
+            ("bun.lock", ProjectType::NodeJs),
+            ("Package.resolved", ProjectType::Swift),
+            ("mix.lock", ProjectType::Elixir),
+            ("packages.lock.json", ProjectType::DotNet),
+        ] {
+            let dir = temp.path().join(lock.replace('.', "-"));
+            fs::create_dir_all(&dir).unwrap();
+            assert!(!ProjectDetector::is_in_use(&dir, project_type), "{lock}");
+            fs::write(dir.join(lock), "").unwrap();
+            assert!(ProjectDetector::is_in_use(&dir, project_type), "{lock}");
+        }
+    }
 
     fn touch_with_timestamp(path: &Path, timestamp: &str) {
         let status = Command::new("touch")

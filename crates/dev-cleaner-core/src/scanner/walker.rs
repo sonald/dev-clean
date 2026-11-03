@@ -172,6 +172,9 @@ pub struct Scanner {
     /// Compiled custom patterns for hot-path matching
     compiled_custom_patterns: Arc<Vec<CompiledCustomPattern>>,
 
+    /// Hidden folder names that custom patterns reach through (e.g. `.yarn` in `.yarn/cache`)
+    custom_hidden_components: HashSet<String>,
+
     /// Filter results by category (None = all)
     category_filter: Option<Category>,
 
@@ -195,6 +198,7 @@ impl Scanner {
             exclude_dirs: HashSet::new(),
             custom_patterns: Vec::new(),
             compiled_custom_patterns: Arc::new(Vec::new()),
+            custom_hidden_components: HashSet::new(),
             category_filter: None,
             max_risk: None,
         }
@@ -210,6 +214,17 @@ impl Scanner {
     pub fn custom_patterns(mut self, patterns: &[CustomPattern]) -> Self {
         self.custom_patterns = patterns.to_vec();
         self.compiled_custom_patterns = Arc::new(compile_custom_patterns(patterns));
+        // ponytail: literal components only; a wildcard reaching into dot-folders is not honoured.
+        self.custom_hidden_components = patterns
+            .iter()
+            .flat_map(|p| {
+                p.directory
+                    .split(['/', '\\'])
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|component| component.starts_with('.'))
+            .collect();
         self
     }
 
@@ -377,7 +392,7 @@ impl Scanner {
                     if !candidate_matchers.matches(dir_name.as_ref(), &relative_path)
                         && !ProjectDetector::is_cmake_build_dir(dir)
                     {
-                        return WalkState::Continue;
+                        return scanner.descend_state(&entry);
                     }
                 }
 
@@ -391,7 +406,7 @@ impl Scanner {
                     return WalkState::Skip;
                 }
 
-                WalkState::Continue
+                scanner.descend_state(&entry)
             })
         });
 
@@ -438,6 +453,27 @@ impl Scanner {
 
         walker.threads(num_cpus::get());
         walker
+    }
+
+    /// Whether to walk into a directory that is not itself a cleanable target.
+    ///
+    /// Hidden folders below the scan root hold tool and app state (editor extensions,
+    /// global installs, plugin managers) and `node_modules` holds installed packages:
+    /// neither is where the user's own projects live, and their `dist`/`build` folders are
+    /// runtime code. Targets with such names (`.venv`, `.next`, `node_modules`) were already
+    /// matched before this is consulted, so only non-target folders are pruned. The scan
+    /// root itself (depth 0) is always walked, so `scan ~/.config` still works.
+    fn descend_state(&self, entry: &ignore::DirEntry) -> WalkState {
+        let name = entry.file_name().to_string_lossy();
+        let prune = entry.depth() > 0
+            && (name == "node_modules"
+                || (name.starts_with('.')
+                    && !self.custom_hidden_components.contains(name.as_ref())));
+        if prune {
+            WalkState::Skip
+        } else {
+            WalkState::Continue
+        }
     }
 
     fn emit_scan_trace(&self, trace: ScanPerfTrace) {
@@ -499,8 +535,16 @@ impl Scanner {
         self.check_directory_impl(dir, true)
     }
 
-    /// Implementation of directory checking with configurable fast mode
+    /// Implementation of directory checking with configurable fast mode.
+    ///
+    /// Shared by discovery and `revalidate_target`, so plan application gets the same guard.
     fn check_directory_impl(&self, dir: &Path, fast_mode: bool) -> Option<ProjectInfo> {
+        let info = self.match_directory(dir, fast_mode)?;
+        // Committed `dist/`, `build/` or `vendor/` folders are source, not artifacts.
+        (!ProjectDetector::contains_tracked_files(dir)).then_some(info)
+    }
+
+    fn match_directory(&self, dir: &Path, fast_mode: bool) -> Option<ProjectInfo> {
         // Try to detect project type by looking at parent directories
         let mut current = dir;
 
@@ -1100,21 +1144,9 @@ fn confidence_for_rule(source: RuleSource) -> Confidence {
     }
 }
 
-/// Calculate total size of a directory recursively
+/// Calculate the reclaimable size of a directory (same rules as streaming scans).
 fn calculate_dir_size(dir: &Path) -> Result<u64> {
-    let mut total = 0u64;
-
-    for entry in walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_type().is_file() {
-            total += entry.metadata()?.len();
-        }
-    }
-
-    Ok(total)
+    super::size_calculator::reclaimable_size(dir, None)
 }
 
 /// Convert SystemTime to DateTime<Utc>
@@ -1155,6 +1187,109 @@ mod tests {
         fs::create_dir_all(project_root.join("node_modules")).unwrap();
         fs::write(project_root.join("package.json"), "{}").unwrap();
         project_root
+    }
+
+    fn found_relative(results: &[ProjectInfo], root: &Path) -> Vec<String> {
+        let mut found = results
+            .iter()
+            .map(|p| {
+                p.cleanable_dir
+                    .strip_prefix(root)
+                    .unwrap()
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn test_scanner_skips_projects_inside_hidden_dirs_and_node_modules() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        // An installed editor extension and a globally installed package: runtime code.
+        for installed in [
+            ".cursor/extensions/ext-1.0.0",
+            "lib/node_modules/typescript",
+        ] {
+            let dir = root.join(installed);
+            fs::create_dir_all(dir.join("dist")).unwrap();
+            fs::write(dir.join("package.json"), "{}").unwrap();
+        }
+        // A real project keeps both its hidden and its regular targets.
+        let app = root.join("work/app");
+        fs::create_dir_all(app.join("dist")).unwrap();
+        fs::create_dir_all(app.join(".next")).unwrap();
+        fs::write(app.join("package.json"), "{}").unwrap();
+
+        // Both traversal paths: no prefilter (high risk) and name prefilter (medium).
+        for scanner in [
+            Scanner::new(root),
+            Scanner::new(root).max_risk(RiskLevel::Medium),
+        ] {
+            let results = scanner.scan().unwrap();
+            assert_eq!(
+                found_relative(&results, root),
+                vec!["work/app/.next", "work/app/dist"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_scanner_walks_hidden_scan_root_and_custom_hidden_paths() {
+        let temp = TempDir::new().unwrap();
+        let config_root = temp.path().join(".config");
+        let tool = config_root.join("tool");
+        fs::create_dir_all(tool.join("dist")).unwrap();
+        fs::write(tool.join("package.json"), "{}").unwrap();
+        let results = Scanner::new(&config_root).scan().unwrap();
+        assert_eq!(found_relative(&results, &config_root), vec!["tool/dist"]);
+
+        let yarn_app = temp.path().join("yarn-app");
+        fs::create_dir_all(yarn_app.join(".yarn/cache")).unwrap();
+        fs::write(yarn_app.join(".yarnrc.yml"), "").unwrap();
+        let patterns = vec![CustomPattern {
+            name: "Yarn cache".to_string(),
+            directory: ".yarn/cache".to_string(),
+            marker_files: vec![".yarnrc.yml".to_string()],
+            marker_mode: MarkerMode::AnyOf,
+        }];
+        let results = Scanner::new(&yarn_app)
+            .custom_patterns(&patterns)
+            .scan()
+            .unwrap();
+        assert_eq!(found_relative(&results, &yarn_app), vec![".yarn/cache"]);
+    }
+
+    #[test]
+    fn test_scanner_ignores_targets_with_git_tracked_files() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("action");
+        fs::create_dir_all(repo.join("dist")).unwrap();
+        fs::create_dir_all(repo.join("build")).unwrap();
+        fs::write(repo.join("package.json"), "{}").unwrap();
+        fs::write(repo.join("dist/index.js"), "module.exports = 1;").unwrap();
+        fs::write(repo.join("build/out.js"), "x").unwrap();
+        for args in [&["init", "-q"][..], &["add", "dist/index.js"][..]] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let results = Scanner::new(temp.path()).scan().unwrap();
+        assert_eq!(found_relative(&results, temp.path()), vec!["action/build"]);
+        // Plan application re-validates through the same guard.
+        let scanner = Scanner::new(&repo);
+        assert!(scanner.revalidate_target(repo.join("dist")).is_none());
+        assert!(scanner.revalidate_target(repo.join("build")).is_some());
     }
 
     #[test]

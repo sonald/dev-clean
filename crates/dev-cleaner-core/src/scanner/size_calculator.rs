@@ -4,6 +4,7 @@ use anyhow::Result;
 use crossbeam::channel::Sender;
 use rayon::prelude::*;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -147,31 +148,79 @@ fn calculate_dir_size_with_timeout(dir: &Path, timeout: Duration) -> Result<u64>
     if timeout.is_zero() {
         return Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir));
     }
+    reclaimable_size(dir, Some(timeout))
+}
 
+/// Bytes that deleting `dir` would release.
+///
+/// Counts allocated blocks rather than apparent length, and counts a hard-linked file
+/// only when every one of its links is inside `dir`: pnpm and uv link packages from a
+/// shared store, and deleting those links frees nothing.
+// ponytail: APFS clones (pnpm/uv `clone` mode) still count in full. Upgrade path, verified
+// on APFS: getattrlist(ATTR_CMNEXT_PRIVATESIZE, FSOPT_ATTR_CMN_EXTENDED) returns 0 for a clone.
+pub(crate) fn reclaimable_size(dir: &Path, timeout: Option<Duration>) -> Result<u64> {
     let start = Instant::now();
     let mut total = 0u64;
-    let mut checked_entries = 0usize;
+    // (device, inode) -> (bytes, link count, links seen inside `dir`)
+    let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
 
-    for entry in walkdir::WalkDir::new(dir)
+    for (checked, entry) in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
+        .enumerate()
     {
-        checked_entries += 1;
-        if checked_entries % 256 == 0 && start.elapsed() >= timeout {
-            return Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir));
+        if let Some(timeout) = timeout {
+            if checked % 256 == 0 && start.elapsed() >= timeout {
+                return Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir));
+            }
         }
-
-        if entry.file_type().is_file() {
-            total += entry.metadata()?.len();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let bytes = allocated_bytes(&metadata);
+        match hard_link(&metadata) {
+            Some((key, links)) => linked.entry(key).or_insert((bytes, links, 0)).2 += 1,
+            None => total = total.saturating_add(bytes),
         }
     }
 
-    if start.elapsed() >= timeout {
-        Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir))
-    } else {
-        Ok(total)
+    let fully_contained = linked
+        .values()
+        .filter(|(_, links, seen)| seen >= links)
+        .map(|(bytes, _, _)| *bytes)
+        .sum::<u64>();
+    let total = total.saturating_add(fully_contained);
+
+    match timeout {
+        Some(timeout) if start.elapsed() >= timeout => {
+            Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir))
+        }
+        _ => Ok(total),
     }
+}
+
+#[cfg(unix)]
+fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len()
+}
+
+#[cfg(unix)]
+fn hard_link(metadata: &std::fs::Metadata) -> Option<((u64, u64), u64)> {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.nlink() > 1).then(|| ((metadata.dev(), metadata.ino()), metadata.nlink()))
+}
+
+#[cfg(not(unix))]
+fn hard_link(_metadata: &std::fs::Metadata) -> Option<((u64, u64), u64)> {
+    None
 }
 
 #[cfg(test)]
@@ -182,6 +231,27 @@ mod tests {
     use std::fs;
     use std::thread;
     use tempfile::TempDir;
+
+    #[test]
+    #[cfg(unix)]
+    fn reclaimable_size_counts_blocks_and_only_fully_contained_hard_links() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("node_modules");
+        let store = temp.path().join("store");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&store).unwrap();
+
+        fs::write(target.join("own.bin"), vec![1u8; 10_000]).unwrap();
+        fs::hard_link(target.join("own.bin"), target.join("own-link.bin")).unwrap();
+        fs::write(store.join("shared.bin"), vec![2u8; 50_000]).unwrap();
+        fs::hard_link(store.join("shared.bin"), target.join("shared.bin")).unwrap();
+
+        let own_blocks = fs::metadata(target.join("own.bin")).unwrap().blocks() * 512;
+        assert!(own_blocks >= 10_000);
+        // Two links to one inode count once; the store-shared file is not reclaimable.
+        assert_eq!(reclaimable_size(&target, None).unwrap(), own_blocks);
+    }
 
     #[test]
     fn test_size_calculator() {
