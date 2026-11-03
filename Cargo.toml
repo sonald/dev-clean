@@ -3,7 +3,7 @@ members = [".", "crates/dev-cleaner-core"]
 
 [package]
 name = "dev-cleaner"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Sian Cao"]
 description = "A smart developer tool for cleaning temporary build directories"
@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/sonald/dev-clean"
 
 [dependencies]
-dev-cleaner-core = { path = "crates/dev-cleaner-core", version = "0.2.0" }
+dev-cleaner-core = { path = "crates/dev-cleaner-core", version = "0.3.0" }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "cargo"] }

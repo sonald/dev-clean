@@ -16,5 +16,8 @@
 .DS_Store
 Thumbs.db
 
+# Shell completion cache
+.zcache/
+
 # Config
 config.toml

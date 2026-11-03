@@ -1,6 +1,6 @@
 [package]
 name = "dev-cleaner-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Sian Cao"]
 description = "Core library for scanning and cleaning developer build artifacts"
