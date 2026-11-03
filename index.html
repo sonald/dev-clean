@@ -6,7 +6,7 @@
     <title>Dev Cleaner - Clean build artifacts without guessing</title>
     <meta
       name="description"
-      content="Dev Cleaner is a Rust CLI/TUI for scanning, planning, trashing, and undoing cleanup of developer build artifacts."
+      content="Dev Cleaner is a Rust CLI/TUI and macOS app for scanning, planning, trashing, and undoing cleanup of developer build artifacts."
     >
     <meta property="og:title" content="Dev Cleaner">
     <meta
@@ -63,6 +63,7 @@
               </svg>
             </button>
           </div>
+          <a class="text-link release-link" href="https://github.com/sonald/dev-clean/releases/tag/v0.3.0">New in 0.3.0: cleanups go to the trash by default</a>
           <div class="platform-row" aria-label="Project properties">
             <span>Linux</span>
             <span>macOS</span>
@@ -86,15 +87,15 @@
             <button class="terminal-tab" data-preview="undo" role="tab" aria-selected="false">[4] Undo</button>
           </div>
           <div class="terminal-meta">
-            <span>Workspace: ~/projects/acme</span>
+            <span>Workspace: ~/acme</span>
             <span>Profile: default</span>
           </div>
           <pre class="terminal-output" id="terminal-output" aria-live="polite"></pre>
           <div class="terminal-footer">
-            <span>Enter: open</span>
-            <span>Space: toggle</span>
-            <span>p: plan</span>
-            <span>Scan complete</span>
+            <span>Trash by default</span>
+            <span>undo restores</span>
+            <span>purge frees space</span>
+            <span>v0.3.0</span>
           </div>
         </div>
       </section>
@@ -125,12 +126,12 @@
           <article class="feature-card">
             <div class="feature-icon trash-icon"></div>
             <h3>Undoable trash</h3>
-            <p>Move targets into batch trash and restore the latest run when needed.</p>
+            <p>Cleanups go to an undoable trash by default. Restore a batch with undo, or purge it to free the space.</p>
           </article>
           <article class="feature-card">
             <div class="feature-icon terminal-icon"></div>
-            <h3>Terminal first</h3>
-            <p>Use fast CLI flows or a keyboard-driven TUI when selecting targets manually.</p>
+            <h3>Terminal or native app</h3>
+            <p>Fast CLI flows, a keyboard-driven TUI, or the SwiftUI macOS app on the same engine (build from source).</p>
           </article>
         </div>
       </section>
@@ -153,7 +154,7 @@
           <article class="workflow-step">
             <span class="step-number green">3</span>
             <h3>Trash</h3>
-            <code>dev-cleaner apply plan.json --trash</code>
+            <code>dev-cleaner apply plan.json</code>
             <p>Move approved directories into an undoable trash batch.</p>
           </article>
           <article class="workflow-step">
@@ -175,7 +176,7 @@
             </svg>
             <div>
               <h3>Conservative by default</h3>
-              <p>Built-in rules target common build artifacts, while high-risk discoveries require opt-in.</p>
+              <p>Built-in rules target common build artifacts, folders with git-tracked files are never touched, and high-risk discoveries require opt-in.</p>
             </div>
           </div>
           <div class="safety-point">
@@ -203,15 +204,21 @@
         </div>
         <div class="json-panel" aria-label="Machine-readable finding example">
           <pre><code>{
-  "path": "target/debug/",
-  "size": 1585157120,
-  "rule": "rust/cargo-target",
-  "risk": "medium",
+  "root": "/Users/you/acme/api",
+  "project_type": "Rust",
+  "category": "build",
+  "risk_level": "medium",
   "confidence": "high",
-  "evidence": [
-    "path matches **/target/**",
-    "contains Cargo.lock up the tree"
-  ]
+  "matched_rule": {
+    "source": "builtin",
+    "pattern": "target"
+  },
+  "cleanable_dir": "/Users/you/acme/api/target",
+  "size": 188743680,
+  "last_modified": "2026-09-03T16:00:00Z",
+  "in_use": false,
+  "protected": false,
+  "recent": false
 }</code></pre>
           <p>Every finding includes machine-readable provenance.</p>
         </div>
@@ -227,7 +234,7 @@
           </article>
           <article class="command-card">
             <code>dev-cleaner clean --dry-run</code>
-            <p>Preview what would be cleaned before deleting or trashing.</p>
+            <p>Preview what would move to the trash, without changing anything.</p>
             <button class="copy-button" data-copy="dev-cleaner clean --dry-run" aria-label="Copy dry-run command"></button>
           </article>
           <article class="command-card">
@@ -236,9 +243,9 @@
             <button class="copy-button" data-copy="dev-cleaner plan -o plan.json" aria-label="Copy plan command"></button>
           </article>
           <article class="command-card">
-            <code>dev-cleaner apply plan.json --trash</code>
-            <p>Apply a plan using undoable trash mode.</p>
-            <button class="copy-button" data-copy="dev-cleaner apply plan.json --trash" aria-label="Copy apply command"></button>
+            <code>dev-cleaner apply plan.json</code>
+            <p>Apply a plan; directories go to the undoable trash.</p>
+            <button class="copy-button" data-copy="dev-cleaner apply plan.json" aria-label="Copy apply command"></button>
           </article>
           <article class="command-card">
             <code>dev-cleaner recommend --cleanup 10GB</code>
@@ -261,7 +268,7 @@
           <img src="assets/dev-cleaner-logo.png" alt="" class="brand-mark">
           <span>Dev Cleaner</span>
         </a>
-        <p>A Rust CLI/TUI for safe cleanup of temporary developer build directories.</p>
+        <p>A Rust CLI/TUI and macOS app for safe cleanup of temporary developer build directories.</p>
       </div>
       <div class="footer-links">
         <a href="#quickstart">Quickstart</a>

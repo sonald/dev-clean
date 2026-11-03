@@ -1,54 +1,56 @@
 const previewData = {
-  scan: `Summary
-Total found     3.21 GB   1,243 files
-Safe to clean   2.83 GB   default filter
-At risk         382 MB    opt in with --max-risk high
-Ignored         0 B
+  scan: `$ dev-cleaner scan
+Scanning for cleanable directories...
+Found 4 potential projects, calculating sizes...
 
-Path            Size     Rule          Risk
-target/debug/   1.48 GB  rust/target   Med
-.next/cache/    512 MB   web/cache     Low
-dist/           146 MB   web/dist      Med
-.pytest_cache/  35 MB    py/cache      Low
-node_modules/   382 MB   node/deps     High`,
+  ✓ Node.js source: builtin /Users/you/acme/web/.next (64.00 MB)
+  ✓ Node.js source: builtin /Users/you/acme/web/dist (24.00 MB)
+  ✓ Python source: builtin /Users/you/acme/ml/.pytest_cache (6.00 MB)
+  ✓ Rust source: builtin /Users/you/acme/api/target (180.00 MB)
 
-  plan: `Writing cleanup plan
-Output          plan.json
-Schema          cleanup-plan/v1
-Candidates      4 selected
-Dry run         true
+✓ 4 cleanable directories found
+Total size: 274.00 MB`,
 
-Plan preview
-1. target/debug/      1.48 GB   rust/cargo-target
-2. .next/cache/       512 MB    web/next-cache
-3. dist/              146 MB    web/dist
-4. .pytest_cache/     35 MB     python/pytest-cache
+  plan: `$ dev-cleaner plan -o plan.json
+Plan file created: plan.json
 
-No filesystem changes were made.`,
+$ dev-cleaner apply plan.json --dry-run --yes
+Applying cleanup plan...
+  Plan: plan.json
+  Projects: 4 (0 skipped in verify)
+  Total size: 274.00 MB
+[DRY RUN] Would move to trash: /Users/you/acme/api/target (180.00 MB)
+[DRY RUN] Would move to trash: /Users/you/acme/web/.next (64.00 MB)
+[DRY RUN] Would move to trash: /Users/you/acme/web/dist (24.00 MB)
+[DRY RUN] Would move to trash: /Users/you/acme/ml/.pytest_cache (6.00 MB)
 
-  trash: `Applying plan.json with --trash
-Batch           2026-04-29T13-30-00Z
-Trash root      ~/Library/Application Support/dev-cleaner/trash
+Dry run completed. Nothing was changed.
+  Would move to trash: 274.00 MB`,
 
-Moved
-target/debug/       -> batch/target-debug
-.next/cache/        -> batch/next-cache
-dist/               -> batch/dist
-.pytest_cache/      -> batch/pytest-cache
+  trash: `$ dev-cleaner apply plan.json --yes
+Applying cleanup plan...
+  Plan: plan.json
+  Projects: 4 (0 skipped in verify)
+  Total size: 274.00 MB
 
-Undo with: dev-cleaner undo --batch 2026-04-29T13-30-00Z`,
+Cleaning completed!
+  Cleaned: 4
+  Skipped: 0 (0 B)
+  Failed: 0
+  Moved to trash: 274.00 MB
+  Trash batch: 20261103060844-1793686124976164000-99413
+  Undo: dev-cleaner undo --batch 20261103060844-1793686124976164000-99413
+  Release space: dev-cleaner trash purge --batch 20261103060844-1793686124976164000-99413`,
 
-  undo: `Restoring latest trash batch
-Batch           2026-04-29T13-30-00Z
-Entries         4
+  undo: `$ dev-cleaner undo
+Restoring from trash...
+  Trash root: /Users/you/Library/Application Support/dev-cleaner/trash
+  Batch: 20261103060844-1793686124976164000-99413
 
-Restored
-target/debug/
-.next/cache/
-dist/
-.pytest_cache/
-
-Restore complete.`
+Restore completed!
+  Restored: 4
+  Skipped: 0
+  Failed: 0`
 };
 
 const output = document.querySelector("#terminal-output");

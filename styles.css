@@ -830,3 +830,12 @@ h2 {
     transition: none !important;
   }
 }
+
+.hero-copy .release-link {
+  margin: 18px 0 0;
+}
+
+.terminal-output {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
