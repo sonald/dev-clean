@@ -1391,6 +1391,7 @@ fn run_clean(
 
     if !auto
         && !force
+        && !dry_run
         && !confirm_execution_summary(
             "clean",
             split.selected.len(),
@@ -2057,7 +2058,7 @@ fn run_apply(
         return Ok(());
     }
 
-    if !force && !yes {
+    if !force && !yes && !dry_run {
         let should_continue = confirm_execution_summary(
             "apply",
             verified_projects.len(),

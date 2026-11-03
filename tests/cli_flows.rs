@@ -705,7 +705,6 @@ fn plan_apply_dry_run_keeps_target() {
             plan_path.to_str().unwrap(),
             "--dry-run",
             "--include-recent",
-            "--force",
         ],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
