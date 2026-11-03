@@ -36,6 +36,9 @@ struct BridgeProject: Codable, Identifiable, Hashable {
     var riskLabel: String {
         (riskLevel ?? "medium").capitalized + " Risk"
     }
+    var isHighRisk: Bool { riskLevel == "high" }
+    /// In-use items are always skipped by the helper unless forced, so the GUI never offers them.
+    var isSelectable: Bool { !inUse && protected != true }
 
     enum CodingKeys: String, CodingKey {
         case root
@@ -100,8 +103,30 @@ struct AuditRun: Codable, Identifiable, Hashable {
     var skipped: Int
     var failed: Int
     var freedBytes: UInt64
+    var mode: String?
 
     var id: String { runId }
+
+    /// Bytes that actually left the disk: permanent deletes and trash purges.
+    var reclaimedBytes: UInt64 {
+        switch mode {
+        case "permanent_delete", "purge", "gc": freedBytes
+        case nil: command == "clean" || command == "apply" ? 0 : freedBytes
+        default: 0
+        }
+    }
+
+    var startedDate: Date? {
+        startedAt.flatMap { AuditRun.parseDate($0) }
+    }
+
+    static func parseDate(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
+    }
 
     enum CodingKeys: String, CodingKey {
         case runId = "run_id"
@@ -112,85 +137,51 @@ struct AuditRun: Codable, Identifiable, Hashable {
         case skipped
         case failed
         case freedBytes = "freed_bytes"
+        case mode
     }
 }
 
+/// Mirrors `GuiPreferences` in `src/bridge.rs`; fields missing on either side are dropped on save.
 struct GuiPreferences: Codable, Equatable {
-    var appearance: String = "dark"
     var scanRootPath: String = FileManager.default.homeDirectoryForCurrentUser.path
     var scanRoots: [String] = [FileManager.default.homeDirectoryForCurrentUser.path]
-    var followSymlinks: Bool = false
-    var ignoreHiddenDirs: Bool = false
-    var launchAtLogin: Bool = false
-    var showMenubarIcon: Bool = true
-    var alertsEnabled: Bool = false
-    var alertBeforeLargeCleanup: Bool = true
-    var alertAfterCleanup: Bool = true
-    var alertForProtectedSkips: Bool = true
-    var notificationThresholdGb: UInt64 = 1
+    var scanDepth: Int = 4
+    var recentDays: Int = 7
+    var includeRecent: Bool = false
+    var showHighRisk: Bool = false
     var trashRetentionDays: Int = 30
     var trashLimitGb: UInt64 = 10
     var autoGcTrash: Bool = true
-    var protectRecentFiles: Bool = false
-    var protectRecentDays: Int = 7
-    var protectLargeFiles: Bool = false
-    var protectLargeFileGb: UInt64 = 1
-    var protectHighRiskItems: Bool = true
-    var verifyFileSignatures: Bool = true
 
     enum CodingKeys: String, CodingKey {
-        case appearance
         case scanRootPath = "scan_root_path"
         case scanRoots = "scan_roots"
-        case followSymlinks = "follow_symlinks"
-        case ignoreHiddenDirs = "ignore_hidden_dirs"
-        case launchAtLogin = "launch_at_login"
-        case showMenubarIcon = "show_menubar_icon"
-        case alertsEnabled = "alerts_enabled"
-        case alertBeforeLargeCleanup = "alert_before_large_cleanup"
-        case alertAfterCleanup = "alert_after_cleanup"
-        case alertForProtectedSkips = "alert_for_protected_skips"
-        case notificationThresholdGb = "notification_threshold_gb"
+        case scanDepth = "scan_depth"
+        case recentDays = "recent_days"
+        case includeRecent = "include_recent"
+        case showHighRisk = "show_high_risk"
         case trashRetentionDays = "trash_retention_days"
         case trashLimitGb = "trash_limit_gb"
         case autoGcTrash = "auto_gc_trash"
-        case protectRecentFiles = "protect_recent_files"
-        case protectRecentDays = "protect_recent_days"
-        case protectLargeFiles = "protect_large_files"
-        case protectLargeFileGb = "protect_large_file_gb"
-        case protectHighRiskItems = "protect_high_risk_items"
-        case verifyFileSignatures = "verify_file_signatures"
     }
 
     init() {}
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        appearance = try container.decodeIfPresent(String.self, forKey: .appearance) ?? "dark"
-        scanRootPath = try container.decodeIfPresent(String.self, forKey: .scanRootPath)
-            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let defaults = GuiPreferences()
+        scanRootPath = try container.decodeIfPresent(String.self, forKey: .scanRootPath) ?? defaults.scanRootPath
         scanRoots = try container.decodeIfPresent([String].self, forKey: .scanRoots) ?? [scanRootPath]
         if scanRoots.isEmpty {
             scanRoots = [scanRootPath]
         }
-        followSymlinks = try container.decodeIfPresent(Bool.self, forKey: .followSymlinks) ?? false
-        ignoreHiddenDirs = try container.decodeIfPresent(Bool.self, forKey: .ignoreHiddenDirs) ?? false
-        launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
-        showMenubarIcon = try container.decodeIfPresent(Bool.self, forKey: .showMenubarIcon) ?? true
-        alertsEnabled = try container.decodeIfPresent(Bool.self, forKey: .alertsEnabled) ?? false
-        alertBeforeLargeCleanup = try container.decodeIfPresent(Bool.self, forKey: .alertBeforeLargeCleanup) ?? true
-        alertAfterCleanup = try container.decodeIfPresent(Bool.self, forKey: .alertAfterCleanup) ?? true
-        alertForProtectedSkips = try container.decodeIfPresent(Bool.self, forKey: .alertForProtectedSkips) ?? true
-        notificationThresholdGb = try container.decodeIfPresent(UInt64.self, forKey: .notificationThresholdGb) ?? 1
-        trashRetentionDays = try container.decodeIfPresent(Int.self, forKey: .trashRetentionDays) ?? 30
-        trashLimitGb = try container.decodeIfPresent(UInt64.self, forKey: .trashLimitGb) ?? 10
-        autoGcTrash = try container.decodeIfPresent(Bool.self, forKey: .autoGcTrash) ?? true
-        protectRecentFiles = try container.decodeIfPresent(Bool.self, forKey: .protectRecentFiles) ?? false
-        protectRecentDays = try container.decodeIfPresent(Int.self, forKey: .protectRecentDays) ?? 7
-        protectLargeFiles = try container.decodeIfPresent(Bool.self, forKey: .protectLargeFiles) ?? false
-        protectLargeFileGb = try container.decodeIfPresent(UInt64.self, forKey: .protectLargeFileGb) ?? 1
-        protectHighRiskItems = try container.decodeIfPresent(Bool.self, forKey: .protectHighRiskItems) ?? true
-        verifyFileSignatures = try container.decodeIfPresent(Bool.self, forKey: .verifyFileSignatures) ?? true
+        scanDepth = try container.decodeIfPresent(Int.self, forKey: .scanDepth) ?? defaults.scanDepth
+        recentDays = try container.decodeIfPresent(Int.self, forKey: .recentDays) ?? defaults.recentDays
+        includeRecent = try container.decodeIfPresent(Bool.self, forKey: .includeRecent) ?? defaults.includeRecent
+        showHighRisk = try container.decodeIfPresent(Bool.self, forKey: .showHighRisk) ?? defaults.showHighRisk
+        trashRetentionDays = try container.decodeIfPresent(Int.self, forKey: .trashRetentionDays) ?? defaults.trashRetentionDays
+        trashLimitGb = try container.decodeIfPresent(UInt64.self, forKey: .trashLimitGb) ?? defaults.trashLimitGb
+        autoGcTrash = try container.decodeIfPresent(Bool.self, forKey: .autoGcTrash) ?? defaults.autoGcTrash
     }
 }
 
@@ -214,10 +205,28 @@ enum CleanupMode: String {
     var title: String {
         switch self {
         case .dryRun: "Dry Run"
-        case .trash: "Clean with Trash"
+        case .trash: "Move to Trash"
         case .permanentDelete: "Delete Permanently"
         }
     }
+
+    /// What the byte total means for this mode. Only permanent deletion frees space immediately.
+    var bytesLabel: String {
+        switch self {
+        case .dryRun: "WOULD FREE"
+        case .trash: "MOVED TO TRASH"
+        case .permanentDelete: "SPACE FREED"
+        }
+    }
+}
+
+/// A cleanup the user has asked for but not yet confirmed.
+struct PendingCleanup: Identifiable {
+    var id = UUID()
+    var mode: CleanupMode
+    var items: [BridgeProject]
+
+    var totalBytes: UInt64 { items.reduce(0) { $0 + $1.size } }
 }
 
 enum AppSection: String, CaseIterable, Identifiable {

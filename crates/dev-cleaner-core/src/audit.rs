@@ -17,6 +17,9 @@ pub enum AuditRecord {
         run_id: String,
         command: String,
         ts: String,
+        /// Execution mode (`dry_run`, `trash`, `delete`); absent in older logs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     ItemAction {
         run_id: String,
@@ -49,6 +52,7 @@ pub struct AuditRunSummary {
     pub skipped: usize,
     pub failed: usize,
     pub freed_bytes: u64,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,11 +86,16 @@ impl AuditLogger {
     }
 
     pub fn start_run(&self, command: &str) -> Result<String> {
+        self.start_run_with_mode(command, None)
+    }
+
+    pub fn start_run_with_mode(&self, command: &str, mode: Option<&str>) -> Result<String> {
         let run_id = generate_run_id();
         self.append(&AuditRecord::RunStarted {
             run_id: run_id.clone(),
             command: command.to_string(),
             ts: Utc::now().to_rfc3339(),
+            mode: mode.map(str::to_string),
         })?;
         Ok(run_id)
     }
@@ -198,6 +207,7 @@ impl AuditLogger {
                     run_id,
                     command,
                     ts,
+                    mode,
                 } => {
                     let summary = runs.entry(run_id.clone()).or_insert(AuditRunSummary {
                         run_id,
@@ -208,8 +218,10 @@ impl AuditLogger {
                         skipped: 0,
                         failed: 0,
                         freed_bytes: 0,
+                        mode: None,
                     });
                     summary.started_at = Some(ts);
+                    summary.mode = mode;
                 }
                 AuditRecord::RunFinished {
                     run_id,
@@ -229,6 +241,7 @@ impl AuditLogger {
                         skipped: 0,
                         failed: 0,
                         freed_bytes: 0,
+                        mode: None,
                     });
                     summary.finished_at = Some(ts);
                     summary.cleaned = cleaned;
@@ -253,6 +266,7 @@ impl AuditLogger {
                     run_id,
                     command,
                     ts,
+                    ..
                 } => {
                     out.push_str(&format!(
                         "run_started,{},{},{},,,,,,,,\n",
@@ -424,6 +438,7 @@ mod tests {
                 run_id: "run-1".to_string(),
                 command: "clean".to_string(),
                 ts: Utc::now().to_rfc3339(),
+                mode: None,
             })
             .unwrap(),
             serde_json::to_string(&AuditRecord::RunFinished {
@@ -457,6 +472,7 @@ mod tests {
                 run_id: "run,1".to_string(),
                 command: "cle\"an".to_string(),
                 ts: "2026-01-01T00:00:00Z".to_string(),
+                mode: None,
             },
             AuditRecord::ItemAction {
                 run_id: "run,1".to_string(),
@@ -498,6 +514,7 @@ mod tests {
                 run_id: "run-rotate".to_string(),
                 command: "clean".to_string(),
                 ts: Utc::now().to_rfc3339(),
+                mode: None,
             })
             .unwrap();
 

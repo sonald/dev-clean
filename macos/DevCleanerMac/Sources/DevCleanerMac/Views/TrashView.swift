@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TrashView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var confirmEmpty = false
 
     var body: some View {
         ScrollView {
@@ -45,13 +46,14 @@ struct TrashView: View {
                                 .font(.system(size: 13))
                                 .foregroundStyle(DCColor.secondary)
                             Button {
-                                Task { await model.emptyTrash() }
+                                confirmEmpty = true
                             } label: {
                                 Label("Empty Trash Now", systemImage: "trash.slash")
                                     .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(PrimaryButtonStyle(color: DCColor.red))
                             .disabled(model.trashBatches.isEmpty)
+                            .emptyTrashConfirmation(isPresented: $confirmEmpty, model: model)
                             Divider().overlay(DCColor.border)
                             Text("Recovery Policy")
                                 .font(.headline)
@@ -72,6 +74,7 @@ struct TrashView: View {
 private struct TrashBatchCard: View {
     @EnvironmentObject private var model: AppModel
     var batch: TrashBatch
+    @State private var confirmPurge = false
 
     private var isExpanded: Bool {
         model.selectedTrashBatchID == batch.batchId && !model.trashEntries.isEmpty
@@ -122,13 +125,37 @@ private struct TrashBatchCard: View {
                     .buttonStyle(GhostButtonStyle())
                     Spacer()
                     Button(role: .destructive) {
-                        Task { await model.purge(batch: batch) }
+                        confirmPurge = true
                     } label: {
                         Label("Delete Permanently", systemImage: "trash")
                     }
                     .buttonStyle(PrimaryButtonStyle(color: DCColor.red))
+                    .confirmationDialog(
+                        "Permanently delete this batch?",
+                        isPresented: $confirmPurge,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Delete \(batch.entriesCount) Items Permanently", role: .destructive) {
+                            Task { await model.purge(batch: batch) }
+                        }
+                    } message: {
+                        Text("\(DevCleanerFormatters.bytes(batch.totalSize)) will be deleted and cannot be restored.")
+                    }
                 }
             }
+        }
+    }
+}
+
+extension View {
+    /// Shared by the Trash pane and Settings so both paths ask before deleting everything.
+    func emptyTrashConfirmation(isPresented: Binding<Bool>, model: AppModel) -> some View {
+        confirmationDialog("Empty the Dev Cleaner Trash?", isPresented: isPresented, titleVisibility: .visible) {
+            Button("Delete All \(model.trashBatches.count) Batches Permanently", role: .destructive) {
+                Task { await model.emptyTrash() }
+            }
+        } message: {
+            Text("\(DevCleanerFormatters.bytes(model.trashTotalBytes)) will be deleted and cannot be restored.")
         }
     }
 }

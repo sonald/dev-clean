@@ -2,7 +2,8 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var tab = "general"
+    @State private var tab = "scanning"
+    @State private var confirmEmpty = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -10,26 +11,21 @@ struct SettingsView: View {
                 Text("Dev Cleaner")
                     .font(.headline)
                     .padding(.bottom, 8)
-                SettingsTab(title: "General", id: "general", tab: $tab)
+                SettingsTab(title: "Scanning", id: "scanning", tab: $tab)
                 SettingsTab(title: "Scan Roots", id: "roots", tab: $tab)
                 SettingsTab(title: "Protection Rules", id: "protection", tab: $tab)
                 SettingsTab(title: "Trash Retention", id: "trash", tab: $tab)
-                SettingsTab(title: "Alerts", id: "alerts", tab: $tab)
                 Spacer()
+                Text("Changes are saved automatically.")
+                    .font(.caption)
+                    .foregroundStyle(DCColor.tertiary)
                 Button {
                     model.startSmartScan()
                 } label: {
-                    Label("Start Deep Scan", systemImage: "scope")
+                    Label("Scan Now", systemImage: "scope")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(SecondaryButtonStyle())
-                Button {
-                    Task { await model.saveConfig() }
-                } label: {
-                    Label("Save Changes", systemImage: "checkmark")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(PrimaryButtonStyle())
             }
             .padding(18)
             .frame(width: 220)
@@ -43,13 +39,16 @@ struct SettingsView: View {
         }
         .background(DCColor.window)
         .foregroundStyle(DCColor.text)
+        .onChange(of: model.preferences) { _ in
+            model.schedulePreferencesSave()
+        }
     }
 
     @ViewBuilder
     private var settingsContent: some View {
         switch tab {
         case "roots":
-            SettingsPanel(title: "Scan Roots", subtitle: "Configure primary directories Dev Cleaner analyzes.") {
+            SettingsPanel(title: "Scan Roots", subtitle: "Folders Dev Cleaner searches for build artifacts.") {
                 SettingsSectionHeader("Active Directories") {
                     Button {
                         model.addScanRoot()
@@ -79,86 +78,48 @@ struct SettingsView: View {
                         Divider().overlay(DCColor.border)
                     }
                 }
-                SettingsSectionHeader("Scan Behavior") { EmptyView() }
-                ToggleRow(
-                    title: "Follow Symlinks",
-                    subtitle: "Resolve symbolic links to their target directories during the scan.",
-                    isOn: $model.preferences.followSymlinks
-                )
-                ToggleRow(
-                    title: "Ignore Hidden Directories",
-                    subtitle: "Skip directories starting with a dot to improve scan speed.",
-                    isOn: $model.preferences.ignoreHiddenDirs
-                )
             }
         case "protection":
-            SettingsPanel(title: "Protection Rules", subtitle: "Protected paths take precedence over all scan settings.") {
-                SettingsSectionHeader("Rules") {
+            SettingsPanel(title: "Protection Rules", subtitle: "Protected paths are never listed or cleaned.") {
+                SettingsSectionHeader("Protected Folders") {
                     Button {
                         model.addProtectedFolder()
                     } label: {
-                        Label("Add Rule", systemImage: "plus")
+                        Label("Add Folder", systemImage: "plus")
                     }
                     .buttonStyle(PrimaryButtonStyle())
                 }
                 RuleTable(paths: model.protectedPaths) { path in
                     model.removeProtectedPath(path)
                 }
-                SettingsSectionHeader("Automatic Protection") { EmptyView() }
-                ToggleStepperRow(
-                    title: "Protect Recent Files",
-                    subtitle: "Exclude files accessed within the last configured number of days.",
-                    isOn: $model.preferences.protectRecentFiles,
-                    value: $model.preferences.protectRecentDays,
-                    suffix: "days",
-                    range: 1...60
-                )
-                ToggleStepperRow(
-                    title: "Protect Large Files",
-                    subtitle: "Auto-protect files larger than threshold.",
-                    isOn: $model.preferences.protectLargeFiles,
-                    value: Binding(
-                        get: { Int(model.preferences.protectLargeFileGb) },
-                        set: { model.preferences.protectLargeFileGb = UInt64($0) }
-                    ),
-                    suffix: "GB",
-                    range: 1...100
-                )
-                SettingsSectionHeader("Risk Overrides") { EmptyView() }
-                ToggleRow(
-                    title: "High Risk Items",
-                    subtitle: "Never delete system-critical binaries.",
-                    isOn: $model.preferences.protectHighRiskItems
-                )
-                ToggleRow(
-                    title: "Integrity Verification",
-                    subtitle: "Scan for file signatures before action.",
-                    isOn: $model.preferences.verifyFileSignatures
-                )
+                Text("A project is also protected when its root contains a `.dev-cleaner-keep` file. Glob rules (`keep_globs`, `keep_project_roots`) can be added in the config file.")
+                    .font(.caption)
+                    .foregroundStyle(DCColor.tertiary)
             }
         case "trash":
-            SettingsPanel(title: "Trash Retention", subtitle: "Manage deleted files and recoverable batches.") {
+            SettingsPanel(title: "Trash Retention", subtitle: "Trashed items still use disk space until they are purged.") {
                 HStack(alignment: .top, spacing: 22) {
                     VStack(alignment: .leading, spacing: 18) {
                         SettingsSectionHeader("Storage Path") { EmptyView() }
-                        Text("~/Library/Application Support/dev-cleaner/trash")
+                        Text(model.trashRoot.map(DevCleanerFormatters.shortPath) ?? "Loading...")
                             .font(.system(size: 12, design: .monospaced))
                             .foregroundStyle(DCColor.secondary)
+                            .textSelection(.enabled)
                             .padding(12)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(DCColor.elevated)
                             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                         ToggleStepperRow(
-                            title: "Automatic cleanup policy",
-                            subtitle: "Remove files that have exceeded the retention period.",
+                            title: "Purge old batches automatically",
+                            subtitle: "Runs at launch and after each cleanup. Batches older than this are deleted permanently.",
                             isOn: $model.preferences.autoGcTrash,
                             value: $model.preferences.trashRetentionDays,
                             suffix: "days",
                             range: 1...180
                         )
                         StepperRow(
-                            title: "Maximum trash size limit",
-                            subtitle: "Oldest files are removed when trash exceeds this size.",
+                            title: "Warn when Trash exceeds",
+                            subtitle: "Trash and Dashboard show a warning above this size. Recent batches are never purged automatically.",
                             value: Binding(
                                 get: { Int(model.preferences.trashLimitGb) },
                                 set: { model.preferences.trashLimitGb = UInt64($0) }
@@ -175,11 +136,12 @@ struct SettingsView: View {
                             Text(DevCleanerFormatters.bytes(model.trashTotalBytes))
                                 .font(.system(size: 32, weight: .bold))
                             Button("Empty Trash Now") {
-                                Task { await model.emptyTrash() }
+                                confirmEmpty = true
                             }
                             .buttonStyle(PrimaryButtonStyle(color: DCColor.red))
                             .disabled(model.trashBatches.isEmpty)
-                            Text("Immediate deletion is permanent.")
+                            .emptyTrashConfirmation(isPresented: $confirmEmpty, model: model)
+                            Text("Emptying is permanent.")
                                 .font(.caption2)
                                 .foregroundStyle(DCColor.tertiary)
                         }
@@ -187,40 +149,36 @@ struct SettingsView: View {
                     }
                     .frame(width: 260)
                 }
-                Text("Files moved to the Dev Cleaner Trash are stored locally and can be restored to their original locations until the retention period expires or manual emptying occurs.")
-                    .font(.caption)
-                    .foregroundStyle(DCColor.indigo)
-                    .padding(12)
-                    .background(DCColor.indigo.opacity(0.10))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-            }
-        case "alerts":
-            SettingsPanel(title: "Alerts Settings", subtitle: "Manage system alerts and thresholds.") {
-                ToggleRow(title: "Enable alerts", subtitle: "Allow Dev Cleaner to notify you about cleanup activity.", isOn: $model.preferences.alertsEnabled)
-                ToggleRow(title: "Warn Before Large Cleanup", subtitle: "Show a confirmation before actions exceed the configured threshold.", isOn: $model.preferences.alertBeforeLargeCleanup)
-                ToggleRow(title: "Notify After Cleanup", subtitle: "Send a completion alert after cleanup or restore actions finish.", isOn: $model.preferences.alertAfterCleanup)
-                ToggleRow(title: "Protected Skip Alerts", subtitle: "Notify when protected paths are skipped by policy.", isOn: $model.preferences.alertForProtectedSkips)
-                StepperRow(
-                    title: "Large cleanup threshold",
-                    subtitle: "Any cleanup above this size requires explicit attention.",
-                    value: Binding(
-                        get: { Int(model.preferences.notificationThresholdGb) },
-                        set: { model.preferences.notificationThresholdGb = UInt64($0) }
-                    ),
-                    suffix: "GB",
-                    range: 1...100
-                )
             }
         default:
-            SettingsPanel(title: "General Settings", subtitle: "Manage how Dev Cleaner starts and operates.") {
-                ToggleRow(title: "Launch at Login", subtitle: "Start Dev Cleaner when you sign in.", isOn: $model.preferences.launchAtLogin)
-                ToggleRow(title: "Menubar Icon", subtitle: "Keep quick access visible in the macOS menu bar.", isOn: $model.preferences.showMenubarIcon)
-                Picker("Appearance", selection: $model.preferences.appearance) {
-                    Text("Light").tag("light")
-                    Text("Dark").tag("dark")
-                    Text("System").tag("system")
-                }
-                .pickerStyle(.segmented)
+            SettingsPanel(title: "Scanning", subtitle: "What Dev Cleaner looks for and what it shows.") {
+                StepperRow(
+                    title: "Scan depth",
+                    subtitle: "How many folder levels below each scan root are searched.",
+                    value: $model.preferences.scanDepth,
+                    suffix: "levels",
+                    range: 1...12
+                )
+                StepperRow(
+                    title: "Recent-change protection",
+                    subtitle: "Items modified within this window are hidden and never cleaned.",
+                    value: $model.preferences.recentDays,
+                    suffix: "days",
+                    range: 1...60
+                )
+                ToggleRow(
+                    title: "Show recently modified items",
+                    subtitle: "List items inside the protection window so they can be cleaned deliberately.",
+                    isOn: $model.preferences.includeRecent
+                )
+                ToggleRow(
+                    title: "Show high-risk items",
+                    subtitle: "Dependencies such as node_modules and .venv, and folders matched only by .gitignore. Hidden by default.",
+                    isOn: $model.preferences.showHighRisk
+                )
+                Text("Scan settings apply to the next scan.")
+                    .font(.caption)
+                    .foregroundStyle(DCColor.tertiary)
             }
         }
     }
@@ -362,7 +320,13 @@ private struct RuleTable: View {
             .font(.caption.weight(.bold))
             .foregroundStyle(DCColor.secondary)
             .padding(.vertical, 10)
-            ForEach(rows, id: \.pattern) { row in
+            if rows.isEmpty {
+                Text("No protected folders yet.")
+                    .foregroundStyle(DCColor.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 14)
+            }
+            ForEach(rows, id: \.rawValue) { row in
                 HStack {
                     Text(row.type).frame(width: 140, alignment: .leading)
                     Text(row.pattern).font(.system(size: 12, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading)
@@ -390,17 +354,9 @@ private struct RuleTable: View {
     }
 
     private var rows: [RuleRow] {
-        let configured = paths.map {
-            RuleRow(type: "Folder", pattern: DevCleanerFormatters.shortPath($0), scope: "System-wide", status: "Active", rawValue: $0, removable: true)
+        paths.map {
+            RuleRow(type: "Folder", pattern: DevCleanerFormatters.shortPath($0), scope: "Folder and subfolders", status: "Active", rawValue: $0, removable: true)
         }
-        if !configured.isEmpty {
-            return configured
-        }
-        return [
-            RuleRow(type: "Folder", pattern: "~/.ssh", scope: "System-wide", status: "Active", rawValue: "~/.ssh", removable: false),
-            RuleRow(type: "Folder", pattern: "~/.aws", scope: "System-wide", status: "Active", rawValue: "~/.aws", removable: false),
-            RuleRow(type: "Category", pattern: "Active project roots", scope: "System-wide", status: "Active", rawValue: "Active project roots", removable: false)
-        ]
     }
 }
 

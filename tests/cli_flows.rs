@@ -550,7 +550,8 @@ fn plan_apply_dry_run_keeps_target() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("Applying cleanup plan"));
-    assert!(stdout.contains("Cleaning completed!"));
+    assert!(stdout.contains("Dry run completed. Nothing was changed."));
+    assert!(stdout.contains("Would free"));
     assert!(project_root.join("target").join("artifact.bin").exists());
 }
 

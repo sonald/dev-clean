@@ -49,10 +49,132 @@ final class BridgeClientTests: XCTestCase {
 
         XCTAssertEqual(preferences.scanRootPath, "/tmp/primary")
         XCTAssertEqual(preferences.scanRoots, ["/tmp/primary", "/tmp/secondary"])
-        XCTAssertTrue(preferences.followSymlinks)
         XCTAssertEqual(preferences.trashRetentionDays, 45)
-        XCTAssertTrue(preferences.alertBeforeLargeCleanup)
-        XCTAssertTrue(preferences.protectHighRiskItems)
+        XCTAssertEqual(preferences.scanDepth, 4)
+        XCTAssertEqual(preferences.recentDays, 7)
+        XCTAssertFalse(preferences.showHighRisk)
+        XCTAssertFalse(preferences.includeRecent)
+        XCTAssertTrue(preferences.autoGcTrash)
+    }
+
+    func testCommonAncestorPath() {
+        XCTAssertEqual(commonAncestorPath(["/Users/a/work", "/Users/a/Documents/x"]), "/Users/a")
+        XCTAssertEqual(commonAncestorPath(["/Users/a/work"]), "/Users/a/work")
+        XCTAssertEqual(commonAncestorPath(["/Volumes/SSD/code", "/Users/a"]), "/")
+        XCTAssertEqual(commonAncestorPath(["/tmp/ab", "/tmp/a"]), "/tmp")
+    }
+
+    func testPlanScanRootCoversEveryRoot() async {
+        let model = await AppModel(bridge: RecordingBridgeRunner())
+        await MainActor.run {
+            model.preferences.scanRoots = ["/tmp/dev-clean-a/one", "/tmp/dev-clean-b"]
+            XCTAssertEqual(model.planScanRoot, "/tmp")
+        }
+    }
+
+    func testScanArgumentsFollowPreferences() async {
+        let bridge = RecordingBridgeRunner()
+        let model = await AppModel(bridge: bridge)
+        await MainActor.run {
+            model.preferences.scanRoots = ["/tmp/dev-clean-root"]
+            model.preferences.scanDepth = 6
+            model.preferences.recentDays = 3
+            model.preferences.includeRecent = true
+            model.startSmartScan()
+        }
+        let didRecordScan = await waitUntil { bridge.recordedArguments.count == 1 }
+        XCTAssertTrue(didRecordScan)
+        XCTAssertEqual(bridge.recordedArguments.last, [
+            "scan", "/tmp/dev-clean-root", "--depth", "6", "--max-risk", "high",
+            "--recent-days", "3", "--include-recent"
+        ])
+    }
+
+    func testHighRiskAndInUseItemsAreNotOffered() async {
+        let model = await AppModel(bridge: RecordingBridgeRunner())
+        let low = makeProject(dir: "/tmp/app/target", size: 10)
+        let high = makeProject(dir: "/tmp/app/node_modules", size: 100, risk: "high")
+        let inUse = makeProject(dir: "/tmp/app/.venv", size: 1000, inUse: true)
+        await MainActor.run {
+            model.projects = [low, high, inUse]
+            model.selectedProjectIDs = [low.id, high.id]
+            model.toggleSelection(inUse)
+
+            XCTAssertEqual(model.visibleProjects.map(\.id), [low.id, inUse.id])
+            XCTAssertEqual(model.selectedProjects.map(\.id), [low.id])
+            XCTAssertEqual(model.totalCleanableBytes, 10)
+            XCTAssertEqual(model.hiddenHighRiskProjects.map(\.id), [high.id])
+
+            model.preferences.showHighRisk = true
+            XCTAssertEqual(model.selectedProjects.map(\.id), [low.id, high.id])
+            XCTAssertEqual(model.totalCleanableBytes, 110)
+        }
+    }
+
+    func testPresentCleanupReviewsExactItems() async {
+        let model = await AppModel(bridge: RecordingBridgeRunner())
+        let focused = makeProject(dir: "/tmp/app/target")
+        let other = makeProject(dir: "/tmp/other/target")
+        await MainActor.run {
+            model.projects = [focused, other]
+            model.selectedProjectIDs = [other.id]
+            model.presentCleanup(mode: .trash, items: [focused])
+            XCTAssertEqual(model.pendingCleanup?.items.map(\.id), [focused.id])
+            XCTAssertEqual(model.pendingCleanup?.mode, .trash)
+        }
+    }
+
+    func testCompletedItemsLeaveResultsAndSummaryKeepsMode() async {
+        let project = makeProject(dir: "/tmp/dev-clean-missing/target", size: 42)
+        let payload = JSONValue.object([
+            "cleaned_count": .number(1),
+            "bytes_freed": .number(42),
+            "bytes_by_category": .object(["build": .number(42)]),
+            "skipped_count": .number(1)
+        ])
+        let bridge = RecordingBridgeRunner(events: [
+            .cleanupStarted(totalCount: 2, totalBytes: 50, mode: "dry_run"),
+            .cleanupCompleted(path: project.cleanableDir, size: 42),
+            .cleanupFinished(payload)
+        ])
+        let model = await AppModel(bridge: bridge)
+        await MainActor.run {
+            model.projects = [project]
+            model.selectedProjectIDs = [project.id]
+        }
+        await model.runSelectedCleanup(mode: .dryRun)
+
+        await MainActor.run {
+            XCTAssertTrue(model.projects.isEmpty)
+            XCTAssertTrue(model.selectedProjectIDs.isEmpty)
+            XCTAssertEqual(model.lastSummary?.mode, .dryRun)
+            XCTAssertEqual(model.lastSummary?.bytesByCategory["build"], 42)
+            XCTAssertEqual(model.lastSummary?.skippedCount, 1)
+            XCTAssertEqual(model.lastSummary?.headline, "Dry Run Complete")
+        }
+    }
+
+    func testAuditFiltersUseDatesCommandsAndModes() async {
+        let model = await AppModel(bridge: RecordingBridgeRunner())
+        let recent = ISO8601DateFormatter().string(from: Date())
+        let old = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-40 * 24 * 60 * 60))
+        let runs = [
+            AuditRun(runId: "a", command: "apply", startedAt: recent, finishedAt: recent, cleaned: 1, skipped: 0, failed: 0, freedBytes: 100, mode: "dry_run"),
+            AuditRun(runId: "b", command: "apply", startedAt: old, finishedAt: old, cleaned: 1, skipped: 0, failed: 0, freedBytes: 200, mode: "trash"),
+            AuditRun(runId: "c", command: "undo", startedAt: recent, finishedAt: recent, cleaned: 2, skipped: 0, failed: 0, freedBytes: 0, mode: "restore"),
+            AuditRun(runId: "d", command: "trash", startedAt: recent, finishedAt: recent, cleaned: 3, skipped: 0, failed: 0, freedBytes: 300, mode: "purge")
+        ]
+        await MainActor.run {
+            model.auditRuns = runs
+            model.auditFilter = .last30Days
+            XCTAssertEqual(model.filteredAuditRuns.map(\.runId), ["a", "c", "d"])
+            model.auditFilter = .restore
+            XCTAssertEqual(model.filteredAuditRuns.map(\.runId), ["c"])
+            model.auditFilter = .cleanup
+            XCTAssertEqual(model.filteredAuditRuns.map(\.runId), ["a", "b"])
+        }
+        XCTAssertEqual(runs.map(\.reclaimedBytes), [0, 0, 0, 300])
+        XCTAssertEqual(runs[0].resultLabel, "Would free " + DevCleanerFormatters.bytes(100))
     }
 
     func testBridgeClientRunPropagatesDecodeFailure() async throws {
@@ -282,19 +404,19 @@ final class BridgeClientTests: XCTestCase {
         XCTAssertFalse(arguments.contains("--force"))
     }
 
-    private func makeProject(size: UInt64 = 42) -> BridgeProject {
+    private func makeProject(dir: String = "/tmp/app/target", size: UInt64 = 42, risk: String = "medium", inUse: Bool = false) -> BridgeProject {
         BridgeProject(
-            root: "/tmp/app",
+            root: (dir as NSString).deletingLastPathComponent,
             projectType: "Rust",
             projectName: nil,
             category: "build",
-            riskLevel: "medium",
+            riskLevel: risk,
             confidence: "high",
-            cleanableDir: "/tmp/app/target",
+            cleanableDir: dir,
             size: size,
             sizeCalculated: true,
             lastModified: nil,
-            inUse: false,
+            inUse: inUse,
             protected: false,
             protectedBy: nil,
             recent: false,
@@ -316,7 +438,10 @@ private final class RecordingBridgeRunner: BridgeRunning {
 
     func run(arguments: [String], onEvent: @escaping @MainActor (BridgeEvent) -> Void) async throws {
         recordedArguments.append(arguments)
-        for event in events {
+        // Replay once: follow-up calls (trash/audit refresh after cleanup) must not loop.
+        let pending = events
+        events = []
+        for event in pending {
             await onEvent(event)
         }
         if waitUntilCancelled {

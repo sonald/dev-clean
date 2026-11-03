@@ -1150,6 +1150,28 @@ fn run_keyboard_selector(
     Ok(selector.run()?.unwrap_or_default())
 }
 
+/// Mode string shared with the bridge audit records (`dry_run` / `trash` / `permanent_delete`).
+fn audit_mode(dry_run: bool, trash: bool) -> &'static str {
+    if dry_run {
+        "dry_run"
+    } else if trash {
+        "trash"
+    } else {
+        "permanent_delete"
+    }
+}
+
+/// Trash moves and dry runs do not free disk space; say what actually happened.
+fn freed_label(dry_run: bool, trash: bool) -> &'static str {
+    if dry_run {
+        "Would free"
+    } else if trash {
+        "Moved to trash"
+    } else {
+        "Space freed"
+    }
+}
+
 fn execution_mode_label(dry_run: bool, trash: bool) -> &'static str {
     if dry_run {
         "dry-run"
@@ -1339,7 +1361,9 @@ fn run_clean(
     }
 
     let audit = AuditLogger::from_config(config);
-    let run_id = audit.start_run("clean").ok();
+    let run_id = audit
+        .start_run_with_mode("clean", Some(audit_mode(dry_run, trash)))
+        .ok();
 
     if let Some(run_id) = &run_id {
         for project in &split.blocked {
@@ -1390,7 +1414,12 @@ fn run_clean(
         }
     }
 
-    println!("\n{}", "Cleaning completed!".green().bold());
+    let done_message = if dry_run {
+        "Dry run completed. Nothing was changed."
+    } else {
+        "Cleaning completed!"
+    };
+    println!("\n{}", done_message.green().bold());
     println!("  Cleaned: {}", result.cleaned_count.to_string().green());
     println!(
         "  Skipped: {} ({})",
@@ -1399,7 +1428,8 @@ fn run_clean(
     );
     println!("  Failed: {}", result.failed_count.to_string().red());
     println!(
-        "  Space freed: {}",
+        "  {}: {}",
+        freed_label(dry_run, trash),
         result.size_freed_human().green().bold()
     );
 
@@ -1412,6 +1442,10 @@ fn run_clean(
         println!(
             "  Undo: {}",
             format!("dev-cleaner undo --batch {}", batch_id).bright_black()
+        );
+        println!(
+            "  Release space: {}",
+            format!("dev-cleaner trash purge --batch {}", batch_id).bright_black()
         );
     }
 
@@ -1926,7 +1960,9 @@ fn run_apply(
 ) -> Result<()> {
     let plan = CleanupPlan::load_json(&plan_path)?;
     let audit = AuditLogger::from_config(config);
-    let run_id = audit.start_run("apply").ok();
+    let run_id = audit
+        .start_run_with_mode("apply", Some(audit_mode(dry_run, trash)))
+        .ok();
     let apply_result = ApplyPlanService::new().verify(
         config,
         ApplyPlanRequest {
@@ -2032,7 +2068,12 @@ fn run_apply(
         }
     }
 
-    println!("\n{}", "Cleaning completed!".green().bold());
+    let done_message = if dry_run {
+        "Dry run completed. Nothing was changed."
+    } else {
+        "Cleaning completed!"
+    };
+    println!("\n{}", done_message.green().bold());
     println!("  Cleaned: {}", result.cleaned_count.to_string().green());
     println!(
         "  Skipped: {} ({})",
@@ -2041,7 +2082,8 @@ fn run_apply(
     );
     println!("  Failed: {}", result.failed_count.to_string().red());
     println!(
-        "  Space freed: {}",
+        "  {}: {}",
+        freed_label(dry_run, trash),
         result.size_freed_human().green().bold()
     );
 
@@ -2050,6 +2092,10 @@ fn run_apply(
         println!(
             "  Undo: {}",
             format!("dev-cleaner undo --batch {}", batch_id).bright_black()
+        );
+        println!(
+            "  Release space: {}",
+            format!("dev-cleaner trash purge --batch {}", batch_id).bright_black()
         );
     }
 
@@ -2701,6 +2747,14 @@ mod tests {
         let split = split_selected_projects_for_clean(projects, true, true, true);
         assert_eq!(split.selected.len(), 3);
         assert_eq!(split.blocked_summary.total_count(), 0);
+    }
+
+    #[test]
+    fn freed_label_reflects_mode() {
+        assert_eq!(freed_label(true, true), "Would free");
+        assert_eq!(freed_label(false, true), "Moved to trash");
+        assert_eq!(freed_label(false, false), "Space freed");
+        assert_eq!(audit_mode(true, false), "dry_run");
     }
 
     #[test]

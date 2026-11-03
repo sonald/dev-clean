@@ -12,9 +12,10 @@ use dev_cleaner_core::trash::{
     restore_batch_with_observer, trash_entries_for_batch, RestoreObserver, TrashEntry,
 };
 use dev_cleaner_core::utils::{format_size, parse_size};
-use dev_cleaner_core::{Cleaner, CleanupPlan, Config};
+use dev_cleaner_core::{Cleaner, CleanupPlan, Config, SkipReason};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -375,82 +376,44 @@ pub struct BridgeConfigSnapshot {
     pub gui_preferences: GuiPreferences,
 }
 
+/// Preferences owned by the macOS app. Every field here must change app behaviour;
+/// unknown keys from older versions are ignored on load.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GuiPreferences {
-    #[serde(default = "default_appearance")]
-    pub appearance: String,
     #[serde(default = "default_scan_root_path")]
     pub scan_root_path: String,
     #[serde(default = "default_scan_roots")]
     pub scan_roots: Vec<String>,
+    #[serde(default = "default_scan_depth")]
+    pub scan_depth: usize,
+    #[serde(default = "default_recent_days", alias = "protect_recent_days")]
+    pub recent_days: i64,
     #[serde(default)]
-    pub follow_symlinks: bool,
+    pub include_recent: bool,
     #[serde(default)]
-    pub ignore_hidden_dirs: bool,
-    #[serde(default)]
-    pub launch_at_login: bool,
-    #[serde(default = "default_true")]
-    pub show_menubar_icon: bool,
-    #[serde(default)]
-    pub alerts_enabled: bool,
-    #[serde(default = "default_true")]
-    pub alert_before_large_cleanup: bool,
-    #[serde(default = "default_true")]
-    pub alert_after_cleanup: bool,
-    #[serde(default = "default_true")]
-    pub alert_for_protected_skips: bool,
-    #[serde(default)]
-    pub notification_threshold_gb: u64,
+    pub show_high_risk: bool,
     #[serde(default = "default_trash_retention_days")]
     pub trash_retention_days: i64,
     #[serde(default = "default_trash_limit_gb")]
     pub trash_limit_gb: u64,
     #[serde(default = "default_true")]
     pub auto_gc_trash: bool,
-    #[serde(default)]
-    pub protect_recent_files: bool,
-    #[serde(default = "default_recent_protection_days")]
-    pub protect_recent_days: i64,
-    #[serde(default)]
-    pub protect_large_files: bool,
-    #[serde(default = "default_large_file_gb")]
-    pub protect_large_file_gb: u64,
-    #[serde(default = "default_true")]
-    pub protect_high_risk_items: bool,
-    #[serde(default = "default_true")]
-    pub verify_file_signatures: bool,
 }
 
 impl Default for GuiPreferences {
     fn default() -> Self {
         Self {
-            appearance: default_appearance(),
             scan_root_path: default_scan_root_path(),
             scan_roots: default_scan_roots(),
-            follow_symlinks: false,
-            ignore_hidden_dirs: false,
-            launch_at_login: false,
-            show_menubar_icon: true,
-            alerts_enabled: false,
-            alert_before_large_cleanup: true,
-            alert_after_cleanup: true,
-            alert_for_protected_skips: true,
-            notification_threshold_gb: 1,
+            scan_depth: default_scan_depth(),
+            recent_days: default_recent_days(),
+            include_recent: false,
+            show_high_risk: false,
             trash_retention_days: default_trash_retention_days(),
             trash_limit_gb: default_trash_limit_gb(),
             auto_gc_trash: true,
-            protect_recent_files: false,
-            protect_recent_days: default_recent_protection_days(),
-            protect_large_files: false,
-            protect_large_file_gb: default_large_file_gb(),
-            protect_high_risk_items: true,
-            verify_file_signatures: true,
         }
     }
-}
-
-fn default_appearance() -> String {
-    "dark".to_string()
 }
 
 fn default_scan_root_path() -> String {
@@ -462,6 +425,10 @@ fn default_scan_root_path() -> String {
 
 fn default_scan_roots() -> Vec<String> {
     vec![default_scan_root_path()]
+}
+
+fn default_scan_depth() -> usize {
+    4
 }
 
 fn default_true() -> bool {
@@ -476,12 +443,8 @@ fn default_trash_limit_gb() -> u64 {
     10
 }
 
-fn default_recent_protection_days() -> i64 {
+fn default_recent_days() -> i64 {
     7
-}
-
-fn default_large_file_gb() -> u64 {
-    1
 }
 
 pub fn run_bridge(command: BridgeCommands, config: &Config, config_path: PathBuf) -> Result<()> {
@@ -490,7 +453,7 @@ pub fn run_bridge(command: BridgeCommands, config: &Config, config_path: PathBuf
         BridgeCommands::Recommend(args) => bridge_recommend(args, config),
         BridgeCommands::Clean(args) => bridge_clean(args, config),
         BridgeCommands::Apply(args) => bridge_apply(args, config),
-        BridgeCommands::Trash { command } => bridge_trash(command),
+        BridgeCommands::Trash { command } => bridge_trash(command, config),
         BridgeCommands::Audit { command } => bridge_audit(command, config),
         BridgeCommands::Config { command } => bridge_config(command, config, config_path),
     }
@@ -695,16 +658,19 @@ fn bridge_clean(args: BridgeCleanArgs, config: &Config) -> Result<()> {
         .map(ProjectInfo::from)
         .collect::<Vec<_>>();
     run_cleaner(
-        projects,
-        args.dry_run,
-        args.trash,
-        args.permanent_delete,
-        args.force,
-        args.include_recent,
-        args.force_protected,
-        args.cancel_file,
+        CleanerRun {
+            projects,
+            pre_skipped: Vec::new(),
+            dry_run: args.dry_run,
+            trash: args.trash,
+            permanent_delete: args.permanent_delete,
+            force: args.force,
+            include_recent: args.include_recent,
+            force_protected: args.force_protected,
+            cancel_file: args.cancel_file,
+            audit_command: "clean",
+        },
         config,
-        "clean",
     )
 }
 
@@ -726,22 +692,48 @@ fn bridge_apply(args: BridgeApplyArgs, config: &Config) -> Result<()> {
         .into_iter()
         .map(ProjectInfo::from)
         .collect::<Vec<_>>();
+    // Items rejected during plan verification must stay visible to the GUI.
+    let pre_skipped = result
+        .skipped_projects
+        .into_iter()
+        .map(|candidate| {
+            let reason = candidate.skip_reason.map_or("skipped", skip_label);
+            (ProjectInfo::from(candidate), reason)
+        })
+        .collect::<Vec<_>>();
     run_cleaner(
-        projects,
-        args.dry_run,
-        args.trash,
-        args.permanent_delete,
-        args.force,
-        args.include_recent,
-        args.force_protected,
-        args.cancel_file,
+        CleanerRun {
+            projects,
+            pre_skipped,
+            dry_run: args.dry_run,
+            trash: args.trash,
+            permanent_delete: args.permanent_delete,
+            force: args.force,
+            include_recent: args.include_recent,
+            force_protected: args.force_protected,
+            cancel_file: args.cancel_file,
+            audit_command: "apply",
+        },
         config,
-        "apply",
     )
 }
 
-fn run_cleaner(
+fn skip_label(reason: SkipReason) -> &'static str {
+    match reason {
+        SkipReason::InUse => "in_use",
+        SkipReason::Protected => "protected",
+        SkipReason::Recent => "recent",
+        SkipReason::Risk => "risk",
+        SkipReason::OutsideProjectRoot => "outside_project_root",
+        SkipReason::OutsideScanRoot => "outside_scan_root",
+        SkipReason::RuleMismatchOrMissing => "missing_or_changed",
+    }
+}
+
+struct CleanerRun {
     projects: Vec<ProjectInfo>,
+    /// Items already rejected before cleaning (e.g. plan verification), with a reason label.
+    pre_skipped: Vec<(ProjectInfo, &'static str)>,
     dry_run: bool,
     trash: bool,
     permanent_delete: bool,
@@ -749,9 +741,22 @@ fn run_cleaner(
     include_recent: bool,
     force_protected: bool,
     cancel_file: Option<PathBuf>,
-    config: &Config,
     audit_command: &'static str,
-) -> Result<()> {
+}
+
+fn run_cleaner(run: CleanerRun, config: &Config) -> Result<()> {
+    let CleanerRun {
+        projects,
+        pre_skipped,
+        dry_run,
+        trash,
+        permanent_delete,
+        force,
+        include_recent,
+        force_protected,
+        cancel_file,
+        audit_command,
+    } = run;
     if trash && permanent_delete {
         anyhow::bail!("Use either --trash or --permanent-delete, not both");
     }
@@ -763,9 +768,14 @@ fn run_cleaner(
     } else {
         "permanent_delete"
     };
+    let pre_skipped_bytes = pre_skipped.iter().map(|(p, _)| p.size).sum::<u64>();
     emit(&BridgeEvent::CleanupStarted {
-        total_count: projects.len(),
-        total_bytes: projects.iter().map(|p| p.size).sum(),
+        total_count: projects.len() + pre_skipped.len(),
+        total_bytes: projects
+            .iter()
+            .map(|p| p.size)
+            .sum::<u64>()
+            .saturating_add(pre_skipped_bytes),
         mode: mode.to_string(),
     });
     let cleaner = Cleaner::with_options(CleanOptions {
@@ -779,7 +789,7 @@ fn run_cleaner(
         cancel_file,
     });
     let audit = AuditLogger::from_config(config);
-    let run_id = audit.start_run(audit_command).ok();
+    let run_id = audit.start_run_with_mode(audit_command, Some(mode)).ok();
     let mut observer = BridgeCleanObserver::new(if dry_run {
         "dry_run"
     } else if trash {
@@ -787,7 +797,12 @@ fn run_cleaner(
     } else {
         "remove"
     });
-    let result = cleaner.clean_multiple_with_observer(&projects, &mut observer)?;
+    for (project, reason) in &pre_skipped {
+        observer.skipped(project, reason);
+    }
+    let mut result = cleaner.clean_multiple_with_observer(&projects, &mut observer)?;
+    result.skipped_count += pre_skipped.len();
+    result.bytes_skipped = result.bytes_skipped.saturating_add(pre_skipped_bytes);
     if let Some(run_id) = &run_id {
         for item in &observer.audit_items {
             let _ = audit.log_item(
@@ -811,8 +826,10 @@ fn run_cleaner(
     }
     emit(&BridgeEvent::CleanupFinished {
         payload: json!({
+            "mode": mode,
             "cleaned_count": result.cleaned_count,
             "bytes_freed": result.bytes_freed,
+            "bytes_by_category": observer.bytes_by_category,
             "skipped_count": result.skipped_count,
             "bytes_skipped": result.bytes_skipped,
             "failed_count": result.failed_count,
@@ -830,6 +847,7 @@ struct BridgeCleanObserver {
     cancelled: bool,
     audit_action: &'static str,
     audit_items: Vec<BridgeAuditItem>,
+    bytes_by_category: BTreeMap<&'static str, u64>,
 }
 
 struct BridgeAuditItem {
@@ -870,6 +888,7 @@ impl CleanObserver for BridgeCleanObserver {
             .to_string(),
             size: project.size,
         });
+        self.count_category(project, project.size);
         self.audit_items.push(BridgeAuditItem {
             path: project.cleanable_dir.clone(),
             action: "dry_run",
@@ -890,6 +909,7 @@ impl CleanObserver for BridgeCleanObserver {
             path: project.cleanable_dir.display().to_string(),
             size,
         });
+        self.count_category(project, size);
         self.audit_items.push(BridgeAuditItem {
             path: project.cleanable_dir.clone(),
             action: self.audit_action,
@@ -927,7 +947,16 @@ impl BridgeCleanObserver {
             cancelled: false,
             audit_action,
             audit_items: Vec::new(),
+            bytes_by_category: BTreeMap::new(),
         }
+    }
+
+    fn count_category(&mut self, project: &ProjectInfo, size: u64) {
+        let total = self
+            .bytes_by_category
+            .entry(project.category.as_str())
+            .or_default();
+        *total = total.saturating_add(size);
     }
 
     fn skipped(&mut self, project: &ProjectInfo, reason: &str) {
@@ -946,8 +975,9 @@ impl BridgeCleanObserver {
     }
 }
 
-fn bridge_trash(command: BridgeTrashCommands) -> Result<()> {
+fn bridge_trash(command: BridgeTrashCommands, config: &Config) -> Result<()> {
     let root = default_trash_root();
+    let audit = AuditLogger::from_config(config);
     match command {
         BridgeTrashCommands::List { top } => {
             let batches = list_trash_batches(&root)?
@@ -971,12 +1001,40 @@ fn bridge_trash(command: BridgeTrashCommands) -> Result<()> {
         } => {
             let mut observer = BridgeRestoreObserver;
             let result = restore_batch_with_observer(&root, &batch, dry_run, force, &mut observer)?;
+            if !dry_run {
+                log_trash_run(
+                    &audit,
+                    TrashRunLog {
+                        command: "undo",
+                        mode: "restore",
+                        path: root.join(&batch),
+                        done: result.restored_count,
+                        skipped: result.skipped_count,
+                        failed: result.failed_count,
+                        bytes: 0,
+                    },
+                );
+            }
             emit(&BridgeEvent::TrashOperationFinished {
                 payload: json!({ "operation": "restore", "batch": batch, "result": result }),
             });
         }
         BridgeTrashCommands::Purge { batch, dry_run } => {
             let result = purge_trash_batch(&root, &batch, dry_run)?;
+            if !dry_run {
+                log_trash_run(
+                    &audit,
+                    TrashRunLog {
+                        command: "trash",
+                        mode: "purge",
+                        path: root.join(&batch),
+                        done: result.removed_entries,
+                        skipped: 0,
+                        failed: result.failed_batches,
+                        bytes: result.removed_bytes,
+                    },
+                );
+            }
             emit(&BridgeEvent::TrashOperationFinished {
                 payload: json!({ "operation": "purge", "batch": batch, "result": result }),
             });
@@ -988,12 +1046,65 @@ fn bridge_trash(command: BridgeTrashCommands) -> Result<()> {
         } => {
             let keep_bytes = keep_gb.map(|gb| gb.saturating_mul(1024 * 1024 * 1024));
             let result = gc_trash(&root, keep_days, keep_bytes, dry_run)?;
+            // Auto-GC runs on every GUI launch; only record runs that removed something.
+            if !dry_run && result.removed_batches > 0 {
+                log_trash_run(
+                    &audit,
+                    TrashRunLog {
+                        command: "trash",
+                        mode: "gc",
+                        path: root.clone(),
+                        done: result.removed_entries,
+                        skipped: 0,
+                        failed: result.failed_batches,
+                        bytes: result.removed_bytes,
+                    },
+                );
+            }
             emit(&BridgeEvent::TrashOperationFinished {
                 payload: json!({ "operation": "gc", "result": result }),
             });
         }
     }
     Ok(())
+}
+
+struct TrashRunLog {
+    command: &'static str,
+    mode: &'static str,
+    path: PathBuf,
+    done: usize,
+    skipped: usize,
+    failed: usize,
+    bytes: u64,
+}
+
+fn log_trash_run(audit: &AuditLogger, log: TrashRunLog) {
+    let Ok(run_id) = audit.start_run_with_mode(log.command, Some(log.mode)) else {
+        return;
+    };
+    let result = if log.failed > 0 {
+        "failed"
+    } else {
+        "completed"
+    };
+    let _ = audit.log_item(
+        &run_id,
+        log.command,
+        &log.path,
+        log.mode,
+        result,
+        log.bytes,
+        None,
+    );
+    let _ = audit.finish_run(
+        &run_id,
+        log.command,
+        log.done,
+        log.skipped,
+        log.failed,
+        log.bytes,
+    );
 }
 
 struct BridgeRestoreObserver;
@@ -1140,9 +1251,19 @@ mod tests {
     #[test]
     fn gui_preferences_have_safe_defaults() {
         let prefs = GuiPreferences::default();
-        assert_eq!(prefs.appearance, "dark");
         assert!(!prefs.scan_root_path.is_empty());
-        assert!(prefs.show_menubar_icon);
+        assert!(!prefs.include_recent);
+        assert!(!prefs.show_high_risk);
+        assert_eq!(prefs.recent_days, 7);
         assert_eq!(prefs.trash_retention_days, 30);
+    }
+
+    #[test]
+    fn gui_preferences_load_legacy_files() {
+        let legacy =
+            r#"{"appearance":"light","protect_recent_days":14,"verify_file_signatures":true}"#;
+        let prefs: GuiPreferences = serde_json::from_str(legacy).unwrap();
+        assert_eq!(prefs.recent_days, 14);
+        assert!(prefs.auto_gc_trash);
     }
 }

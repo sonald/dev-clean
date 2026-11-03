@@ -58,14 +58,18 @@ struct DashboardView: View {
                     DCCard {
                         VStack(alignment: .leading, spacing: 18) {
                             HStack {
-                                Text("Macintosh HD")
+                                Text(model.volume?.name ?? "Volume unavailable")
                                     .font(.system(size: 18, weight: .semibold))
                                 Spacer()
-                                Text("500 GB Total")
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundStyle(DCColor.tertiary)
+                                if let volume = model.volume {
+                                    Text("\(DevCleanerFormatters.bytes(volume.availableBytes)) free of \(DevCleanerFormatters.bytes(volume.totalBytes))")
+                                        .font(.system(size: 12, design: .monospaced))
+                                        .foregroundStyle(DCColor.tertiary)
+                                }
                             }
-                            StorageBar(cleanableBytes: model.totalCleanableBytes)
+                            if let volume = model.volume {
+                                StorageBar(volume: volume, cleanableBytes: model.totalCleanableBytes)
+                            }
                             HStack {
                                 LegendDot(title: "Used", color: DCColor.blue)
                                 LegendDot(title: "Cleanable", color: DCColor.green)
@@ -84,6 +88,11 @@ struct DashboardView: View {
                             Text("POTENTIAL SAVINGS")
                                 .font(.caption)
                                 .foregroundStyle(DCColor.secondary)
+                            if !model.hiddenHighRiskProjects.isEmpty {
+                                Text("+ \(DevCleanerFormatters.bytes(model.hiddenHighRiskProjects.reduce(0) { $0 + $1.size })) high-risk hidden")
+                                    .font(.caption2)
+                                    .foregroundStyle(DCColor.tertiary)
+                            }
                         }
                         .frame(maxWidth: .infinity)
                     }
@@ -117,14 +126,47 @@ struct DashboardView: View {
                     CleanupSummaryView(summary: summary)
                 }
 
-                DCCard {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Protected Directories")
-                            .font(.headline)
-                        ProtectedRow(path: "~/.ssh", subtitle: "SSH Keys & Configs")
-                        ProtectedRow(path: "~/.aws", subtitle: "AWS Credentials")
-                        ProtectedRow(path: "~/Projects/Active", subtitle: "Current Workspaces")
+                HStack(alignment: .top, spacing: 16) {
+                    DCCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                Text("Protected Folders")
+                                    .font(.headline)
+                                Spacer()
+                                Button("Manage") { model.selectedSection = .settings }
+                                    .buttonStyle(GhostButtonStyle())
+                            }
+                            if model.protectedPaths.isEmpty {
+                                Text("No protected folders. Recently modified, in-use, and `.dev-cleaner-keep` projects are always skipped.")
+                                    .font(.caption)
+                                    .foregroundStyle(DCColor.secondary)
+                            }
+                            ForEach(model.protectedPaths.prefix(5), id: \.self) { path in
+                                ProtectedRow(path: DevCleanerFormatters.shortPath(path), subtitle: "Never listed or cleaned")
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    DCCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Dev Cleaner Trash")
+                                    .font(.headline)
+                                Spacer()
+                                Button("Open") { model.selectedSection = .trash }
+                                    .buttonStyle(GhostButtonStyle())
+                            }
+                            Text(DevCleanerFormatters.bytes(model.trashTotalBytes))
+                                .font(.system(size: 24, weight: .bold))
+                                .foregroundStyle(model.trashOverLimit ? DCColor.yellow : DCColor.text)
+                            Text(model.trashOverLimit
+                                 ? "Over the \(model.preferences.trashLimitGb) GB warning limit. Trashed items still use disk space."
+                                 : "\(model.trashBatches.count) recoverable batches. Space is released when batches are purged.")
+                                .font(.caption)
+                                .foregroundStyle(DCColor.secondary)
+                        }
+                    }
+                    .frame(width: 280)
                 }
             }
             .padding(24)
@@ -134,20 +176,25 @@ struct DashboardView: View {
 }
 
 private struct StorageBar: View {
+    var volume: VolumeInfo
     var cleanableBytes: UInt64
 
     var body: some View {
         GeometryReader { proxy in
             let width = proxy.size.width
+            let total = Double(max(volume.totalBytes, 1))
+            let used = Double(volume.usedBytes) / total
+            // Cleanable bytes are part of "used"; draw them as the tail of the used segment.
+            let cleanable = min(Double(cleanableBytes) / total, used)
             ZStack(alignment: .leading) {
                 Capsule().fill(DCColor.tertiary.opacity(0.30))
                 Capsule()
                     .fill(DCColor.blue)
-                    .frame(width: width * 0.55)
+                    .frame(width: width * used)
                 Capsule()
                     .fill(DCColor.green)
-                    .frame(width: max(10, width * min(Double(cleanableBytes) / Double(500 * 1024 * 1024 * 1024), 0.25)))
-                    .offset(x: width * 0.55)
+                    .frame(width: width * cleanable)
+                    .offset(x: width * (used - cleanable))
             }
         }
         .frame(height: 16)

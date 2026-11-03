@@ -10,7 +10,8 @@ struct DevCleanerMacApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 1024, minHeight: 720)
-                .preferredColorScheme(model.preferences.appearance == "system" ? nil : .dark)
+                // The palette in DesignTokens is dark-only.
+                .preferredColorScheme(.dark)
                 .task {
                     await model.bootstrap()
                 }
@@ -28,8 +29,8 @@ struct DevCleanerMacApp: App {
                 }
                 .keyboardShortcut("r", modifiers: [.command])
 
-                Button("Clean with Trash") {
-                    model.presentCleanupPlan(mode: .trash)
+                Button("Move Selected to Trash") {
+                    model.presentCleanup(mode: .trash, items: model.selectedProjects)
                 }
                 .keyboardShortcut(.delete, modifiers: [.command])
                 .disabled(model.selectedProjects.isEmpty)

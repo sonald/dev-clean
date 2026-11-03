@@ -2,53 +2,86 @@ import SwiftUI
 
 struct CleanupPlanSheet: View {
     @EnvironmentObject private var model: AppModel
-    var mode: CleanupMode
+    var pending: PendingCleanup
+
+    private var mode: CleanupMode { pending.mode }
+
+    private var headline: String {
+        let size = DevCleanerFormatters.bytes(pending.totalBytes)
+        switch mode {
+        case .dryRun: return "Preview cleanup of \(size)"
+        case .trash: return "Move \(size) to Trash"
+        case .permanentDelete: return "Permanently delete \(size)"
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Ready to release \(DevCleanerFormatters.bytes(model.selectedBytes))")
+                Text(headline)
                     .font(.system(size: 28, weight: .bold))
-                Text(mode == .permanentDelete ? "Permanent deletion cannot be undone." : "Review the cleanup plan before executing.")
+                Text(subtitle)
                     .foregroundStyle(mode == .permanentDelete ? DCColor.red : DCColor.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 48)
             .padding(.top, 32)
-            .padding(.bottom, 24)
+            .padding(.bottom, 20)
 
             VStack(alignment: .leading, spacing: 16) {
-                Text("Space Breakdown")
-                    .font(.headline)
                 HStack {
                     PlanBucket(title: "Low Risk", bytes: bytes(for: "low"), color: DCColor.green)
                     PlanBucket(title: "Medium Risk", bytes: bytes(for: "medium"), color: DCColor.yellow)
                     PlanBucket(title: "High Risk", bytes: bytes(for: "high"), color: DCColor.red)
                 }
-                DCCard {
-                    Label(mode == .permanentDelete ? "Permanent Delete Safety Check" : "Safety Check", systemImage: "shield")
-                        .font(.headline)
-                    Text(mode == .permanentDelete ? "These items will bypass Dev Cleaner Trash. Use this only when you do not need restore support." : "Selected items will be moved to internal Trash and can be restored while retained locally.")
-                        .foregroundStyle(DCColor.secondary)
-                        .padding(.top, 4)
+                Text("\(pending.items.count) ITEMS")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(DCColor.secondary)
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(pending.items) { item in
+                            HStack(spacing: 10) {
+                                RiskTag(item.riskLevel ?? "medium")
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.displayName)
+                                        .font(.system(size: 13, weight: .semibold))
+                                    Text(DevCleanerFormatters.shortPath(item.cleanableDir))
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundStyle(DCColor.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer()
+                                Text(DevCleanerFormatters.bytes(item.size))
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(DCColor.secondary)
+                            }
+                            .padding(.vertical, 7)
+                            Divider().overlay(DCColor.border)
+                        }
+                    }
                 }
+                .frame(maxHeight: 220)
             }
             .padding(.horizontal, 48)
-            .padding(.bottom, 24)
+            .padding(.bottom, 20)
 
             HStack {
-                Text(mode == .trash ? "Items can be restored from the Trash pane." : "This action is not undoable.")
+                Text(footnote)
                     .font(.caption)
                     .foregroundStyle(DCColor.secondary)
                 Spacer()
-                Button("Cancel") { model.presentedCleanupMode = nil }
+                Button("Cancel") { model.pendingCleanup = nil }
                     .buttonStyle(SecondaryButtonStyle())
-                Button("Dry Run") {
-                    Task { await model.runSelectedCleanup(mode: .dryRun) }
+                    .keyboardShortcut(.cancelAction)
+                if mode != .dryRun {
+                    Button("Dry Run") {
+                        Task { await model.runCleanup(items: pending.items, mode: .dryRun) }
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
                 }
-                .buttonStyle(SecondaryButtonStyle())
                 Button(mode.title) {
-                    Task { await model.runSelectedCleanup(mode: mode) }
+                    Task { await model.runCleanup(items: pending.items, mode: mode) }
                 }
                 .buttonStyle(PrimaryButtonStyle(color: mode == .permanentDelete ? DCColor.red : DCColor.purple))
             }
@@ -60,8 +93,20 @@ struct CleanupPlanSheet: View {
         .foregroundStyle(DCColor.text)
     }
 
+    private var subtitle: String {
+        switch mode {
+        case .dryRun: "Nothing will be changed. Each item is re-checked exactly as a real cleanup would."
+        case .trash: "Items move to the Dev Cleaner Trash and can be restored. Disk space is released when the Trash is emptied."
+        case .permanentDelete: "These items bypass the Trash. Permanent deletion cannot be undone."
+        }
+    }
+
+    private var footnote: String {
+        "Each item is re-verified before it is touched; in-use, recent, and protected items are skipped."
+    }
+
     private func bytes(for risk: String) -> UInt64 {
-        model.selectedProjects.filter { $0.riskLevel == risk }.reduce(0) { $0 + $1.size }
+        pending.items.filter { $0.riskLevel == risk }.reduce(0) { $0 + $1.size }
     }
 }
 
@@ -77,7 +122,7 @@ struct CleanupProgressOverlay: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Cleaning in Progress")
                             .font(.system(size: 28, weight: .bold))
-                        Text(model.cleanupMode == .trash ? "Moving items to Trash..." : "Applying cleanup plan...")
+                        Text(progressSubtitle)
                             .font(.system(size: 13))
                             .foregroundStyle(DCColor.secondary)
                     }
@@ -136,6 +181,16 @@ struct CleanupProgressOverlay: View {
     }
 }
 
+extension CleanupProgressOverlay {
+    private var progressSubtitle: String {
+        switch model.cleanupMode {
+        case .dryRun: "Dry run: checking items, nothing will be changed..."
+        case .trash: "Moving items to Trash..."
+        case .permanentDelete: "Deleting items permanently..."
+        }
+    }
+}
+
 private struct ProgressMetric: View {
     var title: String
     var value: String
@@ -163,58 +218,61 @@ struct CleanupSummaryOverlay: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.94, green: 0.95, blue: 0.98)
+            DCColor.window.opacity(0.96)
                 .ignoresSafeArea()
             VStack(spacing: 24) {
                 VStack(spacing: 10) {
-                    Image(systemName: summary.cancelled ? "stop.circle.fill" : "checkmark.seal.fill")
+                    Image(systemName: summary.cancelled ? "stop.circle.fill" : summary.mode == .dryRun ? "eye.circle.fill" : "checkmark.seal.fill")
                         .font(.system(size: 48))
                         .foregroundStyle(summary.cancelled ? DCColor.yellow : DCColor.green)
-                    Text(summary.cancelled ? "Cleanup Stopped" : "Cleanup Complete")
+                    Text(summary.headline)
                         .font(.system(size: 28, weight: .bold))
-                        .foregroundStyle(Color(red: 0.10, green: 0.11, blue: 0.12))
-                    Text(summary.cancelled ? "Partial results were preserved in the audit log." : "Your development environment is operating at peak efficiency.")
+                    Text(summary.detail)
                         .font(.system(size: 13))
-                        .foregroundStyle(Color(red: 0.44, green: 0.46, blue: 0.53))
+                        .foregroundStyle(DCColor.secondary)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 460)
                 }
 
                 VStack(spacing: 2) {
-                    Text("TOTAL SPACE RELEASED")
+                    Text(summary.mode.bytesLabel)
                         .font(.caption.weight(.bold))
-                        .foregroundStyle(Color(red: 0.44, green: 0.46, blue: 0.53))
+                        .foregroundStyle(DCColor.secondary)
                     Text(DevCleanerFormatters.bytes(summary.bytesFreed))
                         .font(.system(size: 48, weight: .bold))
-                        .foregroundStyle(Color(red: 0.10, green: 0.11, blue: 0.12))
                 }
 
                 HStack(spacing: 24) {
-                    SummaryTile(title: "Items Cleaned", value: "\(summary.cleanedCount)")
+                    SummaryTile(title: summary.mode == .dryRun ? "Would Clean" : "Items Cleaned", value: "\(summary.cleanedCount)")
                     SummaryTile(title: "Items Skipped", value: "\(summary.skippedCount)")
                     SummaryTile(title: "Failed", value: "\(summary.failedCount)")
                 }
 
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("SPACE RECLAIMED BY CATEGORY")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(Color(red: 0.44, green: 0.46, blue: 0.53))
-                    CategoryBar(title: "Build", fraction: 0.66, bytes: summary.bytesFreed * 66 / 100, color: DCColor.blue)
-                    CategoryBar(title: "Cache", fraction: 0.25, bytes: summary.bytesFreed * 25 / 100, color: DCColor.purple)
-                    CategoryBar(title: "Deps", fraction: 0.09, bytes: summary.bytesFreed * 9 / 100, color: DCColor.secondary)
+                if !summary.bytesByCategory.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("BY CATEGORY")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(DCColor.secondary)
+                        ForEach(summary.categoryRows, id: \.category) { row in
+                            CategoryBar(title: row.category.capitalized, fraction: row.fraction, bytes: row.bytes, color: color(for: row.category))
+                        }
+                    }
+                    .frame(width: 400)
                 }
-                .frame(width: 400)
 
                 HStack(spacing: 14) {
-                    Button("Go back to Dashboard") {
+                    Button("Done") {
                         model.showCleanupSummary = false
-                        model.selectedSection = .dashboard
                     }
                     .buttonStyle(PrimaryButtonStyle())
-                    Button("View Trash") {
-                        model.showCleanupSummary = false
-                        model.selectedSection = .trash
+                    if summary.mode == .trash {
+                        Button("View Trash") {
+                            model.showCleanupSummary = false
+                            model.selectedSection = .trash
+                        }
+                        .buttonStyle(GhostButtonStyle())
                     }
-                    .buttonStyle(GhostButtonStyle())
-                    Button("View Detailed Audit Log") {
+                    Button("View Audit Log") {
                         model.showCleanupSummary = false
                         model.selectedSection = .history
                     }
@@ -222,7 +280,51 @@ struct CleanupSummaryOverlay: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .foregroundStyle(DCColor.text)
         }
+    }
+
+    private func color(for category: String) -> Color {
+        switch category {
+        case "build": DCColor.blue
+        case "cache": DCColor.purple
+        case "deps": DCColor.yellow
+        default: DCColor.secondary
+        }
+    }
+}
+
+extension CleanupSummary {
+    var headline: String {
+        if cancelled { return "Cleanup Stopped" }
+        switch mode {
+        case .dryRun: return "Dry Run Complete"
+        case .trash: return "Moved to Trash"
+        case .permanentDelete: return "Cleanup Complete"
+        }
+    }
+
+    var detail: String {
+        var parts: [String] = []
+        switch mode {
+        case .dryRun: parts.append("Nothing was changed.")
+        case .trash: parts.append("Items can be restored from Trash. Space is released when the Trash is emptied or expires.")
+        case .permanentDelete: parts.append("Deleted items cannot be restored.")
+        }
+        if skippedCount > 0 {
+            parts.append("\(skippedCount) skipped items are listed in the audit log with the reason.")
+        }
+        if cancelled {
+            parts.append("Remaining items were not processed.")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    var categoryRows: [(category: String, bytes: UInt64, fraction: Double)] {
+        let total = max(bytesByCategory.values.reduce(0, +), 1)
+        return bytesByCategory
+            .sorted { $0.value > $1.value }
+            .map { (category: $0.key, bytes: $0.value, fraction: Double($0.value) / Double(total)) }
     }
 }
 
@@ -234,10 +336,9 @@ private struct SummaryTile: View {
         VStack(spacing: 8) {
             Text(title)
                 .font(.system(size: 13))
-                .foregroundStyle(Color(red: 0.44, green: 0.46, blue: 0.53))
+                .foregroundStyle(DCColor.secondary)
             Text(value)
                 .font(.system(size: 24, weight: .bold))
-                .foregroundStyle(Color(red: 0.10, green: 0.11, blue: 0.12))
         }
         .frame(width: 150)
     }
@@ -253,11 +354,11 @@ private struct CategoryBar: View {
         HStack {
             Text(title)
                 .font(.system(size: 12))
-                .foregroundStyle(Color(red: 0.55, green: 0.57, blue: 0.64))
-                .frame(width: 56, alignment: .leading)
+                .foregroundStyle(DCColor.secondary)
+                .frame(width: 64, alignment: .leading)
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(Color.black.opacity(0.08))
+                    Capsule().fill(DCColor.elevated)
                     Capsule()
                         .fill(color)
                         .frame(width: proxy.size.width * fraction)
@@ -266,7 +367,6 @@ private struct CategoryBar: View {
             .frame(height: 6)
             Text(DevCleanerFormatters.bytes(bytes))
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Color(red: 0.10, green: 0.11, blue: 0.12))
                 .frame(width: 76, alignment: .trailing)
         }
     }
@@ -296,11 +396,11 @@ struct CleanupSummaryView: View {
     var body: some View {
         DCCard {
             VStack(alignment: .leading, spacing: 12) {
-                Label(summary.cancelled ? "Cleanup Stopped" : "Cleanup Complete", systemImage: summary.cancelled ? "stop.circle" : "checkmark.seal")
+                Label(summary.headline, systemImage: summary.cancelled ? "stop.circle" : "checkmark.seal")
                     .font(.title3.bold())
                     .foregroundStyle(summary.cancelled ? DCColor.yellow : DCColor.green)
                 HStack {
-                    SummaryMetric(title: "TOTAL SPACE RELEASED", value: DevCleanerFormatters.bytes(summary.bytesFreed))
+                    SummaryMetric(title: summary.mode.bytesLabel, value: DevCleanerFormatters.bytes(summary.bytesFreed))
                     SummaryMetric(title: "Items Cleaned", value: "\(summary.cleanedCount)")
                     SummaryMetric(title: "Items Skipped", value: "\(summary.skippedCount)")
                     SummaryMetric(title: "Failed", value: "\(summary.failedCount)")

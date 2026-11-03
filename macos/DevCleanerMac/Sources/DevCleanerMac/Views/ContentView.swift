@@ -22,8 +22,8 @@ struct ContentView: View {
             }
         }
         .background(DCColor.window)
-        .sheet(item: $model.presentedCleanupMode) { mode in
-            CleanupPlanSheet(mode: mode)
+        .sheet(item: $model.pendingCleanup) { pending in
+            CleanupPlanSheet(pending: pending)
                 .environmentObject(model)
         }
         .alert(item: $model.alert) { alert in
@@ -48,8 +48,4 @@ struct ContentView: View {
             SettingsView()
         }
     }
-}
-
-extension CleanupMode: Identifiable {
-    var id: String { rawValue }
 }

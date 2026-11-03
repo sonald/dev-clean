@@ -35,12 +35,17 @@ final class AppModel: ObservableObject {
     @Published var auditFilter: AuditFilter = .all
     @Published var preferences = GuiPreferences()
     @Published var configSnapshot: ConfigSnapshot?
-    @Published var presentedCleanupMode: CleanupMode?
+    @Published var pendingCleanup: PendingCleanup?
     @Published var alert: AppAlert?
+    @Published var trashRoot: String?
+    @Published var volume: VolumeInfo?
 
     private let bridge: BridgeRunning
     private var scanTask: Task<Void, Never>?
     private var cancelFile: URL?
+    /// Helper events report canonical paths; map them back to scan result ids.
+    private var cleanupIDsByCanonicalPath: [String: String] = [:]
+    private var preferencesSaveTask: Task<Void, Never>?
 
     init(bridge: BridgeRunning? = nil) {
         if let bridge {
@@ -50,8 +55,26 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Only items the user can currently see and act on; hidden or in-use ids never reach a plan.
     var selectedProjects: [BridgeProject] {
-        projects.filter { selectedProjectIDs.contains($0.id) }
+        projects.filter { selectedProjectIDs.contains($0.id) && isShown($0) && $0.isSelectable }
+    }
+
+    func isShown(_ project: BridgeProject) -> Bool {
+        preferences.showHighRisk || !project.isHighRisk
+    }
+
+    var hiddenHighRiskProjects: [BridgeProject] {
+        preferences.showHighRisk ? [] : projects.filter(\.isHighRisk)
+    }
+
+    func toggleSelection(_ project: BridgeProject) {
+        guard project.isSelectable else { return }
+        if selectedProjectIDs.contains(project.id) {
+            selectedProjectIDs.remove(project.id)
+        } else {
+            selectedProjectIDs.insert(project.id)
+        }
     }
 
     var focusedProject: BridgeProject? {
@@ -66,12 +89,13 @@ final class AppModel: ObservableObject {
                 || project.cleanableDir.localizedCaseInsensitiveContains(searchText)
             let matchesCategory = categoryFilter == "all" || project.category == categoryFilter
             let matchesRisk = riskFilter == "all" || project.riskLevel == riskFilter
-            return matchesSearch && matchesCategory && matchesRisk
+            return isShown(project) && matchesSearch && matchesCategory && matchesRisk
         }
     }
 
+    /// Space the user could reclaim from what is shown: hidden high-risk and in-use items excluded.
     var totalCleanableBytes: UInt64 {
-        projects.reduce(0) { $0 + $1.size }
+        projects.filter { isShown($0) && $0.isSelectable }.reduce(0) { $0 + $1.size }
     }
 
     var selectedBytes: UInt64 {
@@ -112,11 +136,12 @@ final class AppModel: ObservableObject {
         case .all:
             return auditRuns
         case .last30Days:
-            return Array(auditRuns.prefix(30))
+            let cutoff = Date().addingTimeInterval(-30 * 24 * 60 * 60)
+            return auditRuns.filter { ($0.startedDate ?? .distantPast) >= cutoff }
         case .cleanup:
-            return auditRuns.filter { $0.command.localizedCaseInsensitiveContains("clean") || $0.command.localizedCaseInsensitiveContains("apply") }
+            return auditRuns.filter { $0.command == "clean" || $0.command == "apply" }
         case .restore:
-            return auditRuns.filter { $0.command.localizedCaseInsensitiveContains("restore") }
+            return auditRuns.filter { $0.command == "undo" || $0.mode == "restore" }
         }
     }
 
@@ -126,8 +151,47 @@ final class AppModel: ObservableObject {
 
     func bootstrap() async {
         await loadConfig()
+        refreshVolume()
+        await purgeExpiredTrash()
         await refreshTrash()
         await refreshAudit()
+    }
+
+    var trashOverLimit: Bool {
+        trashTotalBytes > preferences.trashLimitGb * 1024 * 1024 * 1024
+    }
+
+    /// Retention-based only: a size cap would purge the batch the user just created and break undo.
+    func purgeExpiredTrash() async {
+        guard preferences.autoGcTrash else { return }
+        do {
+            try await bridge.run(arguments: ["trash", "gc", "--keep-days", "\(preferences.trashRetentionDays)"]) { _ in }
+        } catch {
+            alert = AppAlert(title: "Trash Cleanup Failed", message: error.localizedDescription)
+        }
+    }
+
+    /// Debounced so steppers do not spawn one helper process per click.
+    func schedulePreferencesSave() {
+        preferencesSaveTask?.cancel()
+        preferencesSaveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.saveConfig(showAlert: false)
+        }
+    }
+
+    func refreshVolume() {
+        volume = VolumeInfo.forPath(scanRootPath)
+    }
+
+    var scanArguments: [String] {
+        // Scan up to high risk so hidden items can be counted; the UI hides them unless shown.
+        var args = ["--depth", "\(preferences.scanDepth)", "--max-risk", "high", "--recent-days", "\(preferences.recentDays)"]
+        if preferences.includeRecent {
+            args.append("--include-recent")
+        }
+        return args
     }
 
     func startSmartScan() {
@@ -244,7 +308,7 @@ final class AppModel: ObservableObject {
                 scanStatusMessage = roots.count > 1
                     ? "Scanning \(DevCleanerFormatters.shortPath(root)) (\(index + 1)/\(roots.count))..."
                     : "Scanning \(DevCleanerFormatters.shortPath(root))..."
-                try await bridge.run(arguments: ["scan", root, "--depth", "4", "--max-risk", "all"]) { [weak self] event in
+                try await bridge.run(arguments: ["scan", root] + scanArguments) { [weak self] event in
                     self?.handle(event)
                 }
             }
@@ -263,7 +327,13 @@ final class AppModel: ObservableObject {
         guard !isScanning else { return }
         selectedSection = .recommendations
         do {
-            try await bridge.run(arguments: ["recommend", scanRootPath, "--cleanup", target, "--strategy", strategy, "--max-risk", "all"]) { [weak self] event in
+            var args = ["recommend", scanRootPath, "--cleanup", target, "--strategy", strategy,
+                        "--max-risk", preferences.showHighRisk ? "high" : "medium",
+                        "--recent-days", "\(preferences.recentDays)"]
+            if preferences.includeRecent {
+                args.append("--include-recent")
+            }
+            try await bridge.run(arguments: args) { [weak self] event in
                 self?.handle(event)
             }
         } catch {
@@ -271,27 +341,25 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func presentCleanupPlan(mode: CleanupMode) {
+    /// Every cleanup goes through the review sheet with the exact items that will be processed.
+    func presentCleanup(mode: CleanupMode, items: [BridgeProject]) {
+        let items = items.filter(\.isSelectable)
+        guard !items.isEmpty else { return }
         cleanupMode = mode
-        presentedCleanupMode = mode
+        pendingCleanup = PendingCleanup(mode: mode, items: items)
     }
 
     func runSelectedCleanup(mode: CleanupMode) async {
-        presentedCleanupMode = nil
-        guard !selectedProjects.isEmpty else { return }
-        do {
-            let plan = try writeTemporaryPlan(projects: selectedProjects)
-            try await runApply(plan: plan, mode: mode)
-        } catch {
-            alert = AppAlert(title: "Cleanup Failed", message: error.localizedDescription)
-        }
+        await runCleanup(items: selectedProjects, mode: mode)
     }
 
-    func runRecommendationCleanup(mode: CleanupMode) async {
-        guard let recommendation, !recommendation.projects.isEmpty else { return }
+    func runCleanup(items: [BridgeProject], mode: CleanupMode) async {
+        pendingCleanup = nil
+        guard !items.isEmpty else { return }
         do {
-            let plan = try writeTemporaryPlan(projects: recommendation.projects)
-            try await runApply(plan: plan, mode: mode)
+            let plan = try writeTemporaryPlan(projects: items)
+            defer { try? FileManager.default.removeItem(at: plan) }
+            try await runApply(plan: plan, items: items, mode: mode)
         } catch {
             alert = AppAlert(title: "Cleanup Failed", message: error.localizedDescription)
         }
@@ -353,6 +421,7 @@ final class AppModel: ObservableObject {
         for batch in trashBatches {
             await purge(batch: batch)
         }
+        refreshVolume()
     }
 
     func refreshAudit() async {
@@ -404,23 +473,28 @@ final class AppModel: ObservableObject {
             let data = try JSONEncoder.bridge.encode(snapshot)
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("dev-cleaner-config-\(UUID().uuidString).json")
             try data.write(to: url)
+            defer { try? FileManager.default.removeItem(at: url) }
             try await bridge.run(arguments: ["config", "save", "--input", url.path]) { [weak self] event in
                 self?.handle(event)
             }
-            if !showAlert {
-                alert = nil
+            if showAlert {
+                alert = AppAlert(title: "Settings Saved", message: "Dev Cleaner preferences were updated.")
             }
         } catch {
             alert = AppAlert(title: "Save Failed", message: error.localizedDescription)
         }
     }
 
-    private func runApply(plan: URL, mode: CleanupMode) async throws {
+    private func runApply(plan: URL, items: [BridgeProject], mode: CleanupMode) async throws {
         isCleaning = true
         cleanupMode = mode
         cleanupProgress = 0
         cleanupLog.removeAll()
-        cleanupTotalCount = selectedProjects.count
+        cleanupIDsByCanonicalPath = Dictionary(
+            items.map { (canonicalPath($0.cleanableDir), $0.id) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        cleanupTotalCount = items.count
         cleanupProcessedCount = 0
         cleanupSucceededCount = 0
         cleanupSkippedCount = 0
@@ -453,12 +527,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Declares every active root: items from the second and later roots must not fail verification.
+    var planScanRoot: String {
+        commonAncestorPath(activeScanRoots)
+    }
+
     private func writeTemporaryPlan(projects: [BridgeProject]) throws -> URL {
         let payload: [String: Any] = [
             "schema_version": 3,
             "tool_version": "mac",
             "created_at": ISO8601DateFormatter().string(from: Date()),
-            "scan_root": scanRootPath,
+            "scan_root": planScanRoot,
             "projects": try projects.map { try $0.asJSONObject() }
         ]
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted])
@@ -506,6 +585,10 @@ final class AppModel: ObservableObject {
             cleanupSucceededCount += 1
             advanceCleanupProgress()
             cleanupLog.append("[success] \(DevCleanerFormatters.shortPath(path))")
+            let id = cleanupIDsByCanonicalPath[path] ?? path
+            projects.removeAll { $0.id == id }
+            selectedProjectIDs.remove(id)
+            if focusedProjectID == id { focusedProjectID = nil }
         case .cleanupFailed(let path, let error):
             cleanupFailedCount += 1
             advanceCleanupProgress()
@@ -514,14 +597,17 @@ final class AppModel: ObservableObject {
             cleanupLog.append("> Cleanup cancelled.")
         case .cleanupFinished(let payload):
             cleanupProgress = 1
-            lastSummary = CleanupSummary(payload: payload)
+            lastSummary = CleanupSummary(payload: payload, mode: cleanupMode)
             showCleanupSummary = true
             selectedSection = .dashboard
+            refreshVolume()
             Task {
+                await purgeExpiredTrash()
                 await refreshTrash()
                 await refreshAudit()
             }
         case .trashList(let payload):
+            trashRoot = payload.string(path: ["trash_root"])
             trashBatches = payload.decodePayloadArray(path: ["batches"], as: TrashBatch.self)
             if let selectedTrashBatchID, !trashBatches.contains(where: { $0.batchId == selectedTrashBatchID }) {
                 self.selectedTrashBatchID = trashBatches.first?.batchId
@@ -534,7 +620,7 @@ final class AppModel: ObservableObject {
             configSnapshot = snapshot
             preferences = snapshot.guiPreferences
         case .configSaved:
-            alert = AppAlert(title: "Settings Saved", message: "Dev Cleaner preferences were updated.")
+            break
         case .error(let message):
             alert = AppAlert(title: "Bridge Error", message: message)
         default:
@@ -623,14 +709,22 @@ struct RecommendationPreview {
 }
 
 struct CleanupSummary {
+    var mode: CleanupMode
     var cleanedCount: Int = 0
     var skippedCount: Int = 0
     var failedCount: Int = 0
     var bytesFreed: UInt64 = 0
+    var bytesByCategory: [String: UInt64] = [:]
     var trashBatchID: String?
     var cancelled = false
 
-    init(payload: JSONValue) {
+    init(payload: JSONValue, mode: CleanupMode) {
+        self.mode = mode
+        if case .object(let categories) = payload.value(at: ["bytes_by_category"]) {
+            for (category, value) in categories {
+                if case .number(let bytes) = value { bytesByCategory[category] = UInt64(bytes) }
+            }
+        }
         cleanedCount = payload.int(path: ["cleaned_count"]) ?? 0
         skippedCount = payload.int(path: ["skipped_count"]) ?? 0
         failedCount = payload.int(path: ["failed_count"]) ?? 0
@@ -650,6 +744,45 @@ private final class MockBridgeRunner: BridgeRunning {
     func run(arguments: [String], onEvent: @escaping @MainActor (BridgeEvent) -> Void) async throws {
         await onEvent(.error("Bridge helper is unavailable. Build the Rust helper first."))
     }
+}
+
+struct VolumeInfo: Equatable {
+    var name: String
+    var totalBytes: UInt64
+    var availableBytes: UInt64
+
+    var usedBytes: UInt64 { totalBytes > availableBytes ? totalBytes - availableBytes : 0 }
+
+    static func forPath(_ path: String) -> VolumeInfo? {
+        let keys: Set<URLResourceKey> = [.volumeNameKey, .volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey]
+        guard let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: keys),
+              let total = values.volumeTotalCapacity, total > 0 else { return nil }
+        let available = values.volumeAvailableCapacityForImportantUsage.map { UInt64(max($0, 0)) }
+            ?? UInt64(max(values.volumeAvailableCapacity ?? 0, 0))
+        return VolumeInfo(name: values.volumeName ?? "Disk", totalBytes: UInt64(total), availableBytes: available)
+    }
+}
+
+/// Longest shared directory prefix of absolute paths ("/" when they only share the root).
+func commonAncestorPath(_ paths: [String]) -> String {
+    let split = paths.map { URL(fileURLWithPath: $0).standardizedFileURL.pathComponents }
+    guard var prefix = split.first else { return "/" }
+    for components in split.dropFirst() {
+        var count = 0
+        while count < min(prefix.count, components.count), prefix[count] == components[count] {
+            count += 1
+        }
+        prefix = Array(prefix.prefix(count))
+    }
+    guard prefix.count > 1 else { return "/" }
+    return "/" + prefix.dropFirst().joined(separator: "/")
+}
+
+/// realpath(3) keeps `/private/tmp` (URL.resolvingSymlinksInPath strips it), matching Rust canonicalize.
+private func canonicalPath(_ path: String) -> String {
+    guard let resolved = realpath(path, nil) else { return path }
+    defer { free(resolved) }
+    return String(cString: resolved)
 }
 
 private func normalizedScanRootPath(_ path: String) -> String {

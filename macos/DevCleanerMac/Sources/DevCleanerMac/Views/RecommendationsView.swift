@@ -37,21 +37,25 @@ struct RecommendationsView: View {
                                         .background(DCColor.elevated)
                                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                                         .frame(width: 150)
-                                    Text("Available: 42.8 GB")
-                                        .font(.caption)
-                                        .foregroundStyle(DCColor.tertiary)
+                                    if let volume = model.volume {
+                                        Text("Free now: \(DevCleanerFormatters.bytes(volume.availableBytes))")
+                                            .font(.caption)
+                                            .foregroundStyle(DCColor.tertiary)
+                                    }
                                 }
                             }
 
                             VStack(alignment: .leading, spacing: 12) {
                                 Text("Cleanup Strategy").font(.headline)
-                                Text("Select the aggressiveness of the cleanup algorithm.")
+                                Text(model.preferences.showHighRisk
+                                     ? "How candidates are ranked. High-risk items are included because they are shown in Scan Results."
+                                     : "How candidates are ranked. Only low- and medium-risk items are considered.")
                                     .font(.system(size: 13))
                                     .foregroundStyle(DCColor.secondary)
                                 HStack(spacing: 10) {
-                                    StrategyCard(id: "safe", title: "Safe", subtitle: "Verified safe-to-delete system logs and basic caches.", selection: $strategy)
-                                    StrategyCard(id: "balanced", title: "Balanced", subtitle: "Includes unneeded build artifacts and older derived data.", selection: $strategy)
-                                    StrategyCard(id: "maximum", title: "Maximum", subtitle: "Aggressive cleanup including all local caches and archives.", selection: $strategy)
+                                    StrategyCard(id: "safe", title: "Safe First", subtitle: "Prefers old, low-risk items. May pick more items to reach the target.", selection: $strategy)
+                                    StrategyCard(id: "balanced", title: "Balanced", subtitle: "Weighs size, age, and risk evenly.", selection: $strategy)
+                                    StrategyCard(id: "maximum", title: "Max Space", subtitle: "Largest items first; risk only lightly penalized.", selection: $strategy)
                                 }
                             }
                         }
@@ -89,25 +93,31 @@ struct RecommendationsView: View {
                                             .foregroundStyle(DCColor.secondary)
                                     }
                                 }
+                                if preview.projects.count > 6 {
+                                    Text("and \(preview.projects.count - 6) more")
+                                        .font(.caption)
+                                        .foregroundStyle(DCColor.tertiary)
+                                }
                                 Divider().overlay(DCColor.border)
-                                DrivePreviewBar(fraction: preview.selectedBytes == 0 ? 0 : min(Double(preview.selectedBytes) / Double(512 * 1024 * 1024 * 1024), 0.35))
-                                Text("\(preview.selectedCount) items selected. Highlighted segment represents space to be freed.")
+                                if let volume = model.volume {
+                                    DrivePreviewBar(volume: volume, selectedBytes: preview.selectedBytes)
+                                }
+                                Text("\(preview.selectedCount) items selected. The highlighted segment is the space they occupy.")
                                     .font(.caption)
                                     .foregroundStyle(DCColor.secondary)
                                 HStack {
                                     Spacer()
                                     Button {
-                                        model.recommendation = preview
-                                        Task { await model.runRecommendationCleanup(mode: .trash) }
+                                        model.presentCleanup(mode: .trash, items: preview.projects)
                                     } label: {
-                                        Label("Clean with Trash", systemImage: "trash")
+                                        Label("Review & Move to Trash", systemImage: "trash")
                                     }
                                     .buttonStyle(PrimaryButtonStyle(color: DCColor.purple))
+                                    .disabled(preview.projects.isEmpty)
                                 }
                             } else {
                                 Text("No plan generated yet.")
                                     .foregroundStyle(DCColor.secondary)
-                                DrivePreviewBar(fraction: 0.08)
                             }
                         }
                     }
@@ -154,22 +164,26 @@ private struct StrategyCard: View {
 }
 
 private struct DrivePreviewBar: View {
-    var fraction: Double
+    var volume: VolumeInfo
+    var selectedBytes: UInt64
 
     var body: some View {
+        let total = Double(max(volume.totalBytes, 1))
+        let used = Double(volume.usedBytes) / total
+        let selected = min(Double(selectedBytes) / total, used)
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("DRIVE CAPACITY (512 GB)")
+                Text("\(volume.name.uppercased()) (\(DevCleanerFormatters.bytes(volume.totalBytes)))")
                 Spacer()
-                Text("65% USED")
+                Text("\(Int((used * 100).rounded()))% USED")
             }
             .font(.caption2.bold())
             .foregroundStyle(DCColor.tertiary)
             GeometryReader { proxy in
                 ZStack(alignment: .leading) {
                     Capsule().fill(DCColor.elevated)
-                    Capsule().fill(DCColor.blue.opacity(0.55)).frame(width: proxy.size.width * 0.65)
-                    Capsule().fill(DCColor.indigo).frame(width: proxy.size.width * fraction).offset(x: proxy.size.width * 0.65)
+                    Capsule().fill(DCColor.blue.opacity(0.55)).frame(width: proxy.size.width * used)
+                    Capsule().fill(DCColor.indigo).frame(width: proxy.size.width * selected).offset(x: proxy.size.width * (used - selected))
                 }
             }
             .frame(height: 12)

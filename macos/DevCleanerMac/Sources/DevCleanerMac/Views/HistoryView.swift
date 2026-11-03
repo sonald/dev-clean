@@ -33,6 +33,9 @@ struct HistoryView: View {
             }
 
             HStack {
+                Text("Reclaimed: \(DevCleanerFormatters.bytes(filteredRuns.reduce(0) { $0 + $1.reclaimedBytes }))")
+                    .font(.system(size: 13, weight: .semibold))
+                    .help("Permanent deletes and Trash purges. Dry runs and moves to Trash do not free space.")
                 Picker("Audit Filter", selection: $model.auditFilter) {
                     ForEach(AuditFilter.allCases) { filter in
                         Text(filter.title).tag(filter)
@@ -56,15 +59,16 @@ struct HistoryView: View {
                     }
                 }
                 TableColumn("DATE & TIME") { run in
-                    Text(run.startedAt ?? "--")
+                    Text(run.startedDate.map { DevCleanerFormatters.date($0) } ?? run.startedAt ?? "--")
                         .foregroundStyle(DCColor.secondary)
                 }
-                TableColumn("SIZE RECLAIMED") { run in
-                    Text(DevCleanerFormatters.bytes(run.freedBytes))
+                TableColumn("RESULT") { run in
+                    Text(run.resultLabel)
+                        .foregroundStyle(run.reclaimedBytes > 0 ? DCColor.text : DCColor.secondary)
                 }
                 TableColumn("STATUS") { run in
-                    Text(run.failed > 0 ? "Partial" : "Success")
-                        .foregroundStyle(run.failed > 0 ? DCColor.yellow : DCColor.green)
+                    Text(run.statusLabel)
+                        .foregroundStyle(run.failed > 0 ? DCColor.yellow : run.mode == "dry_run" ? DCColor.secondary : DCColor.green)
                 }
             }
             .scrollContentBackground(.hidden)
@@ -76,5 +80,26 @@ struct HistoryView: View {
         let runs = model.filteredAuditRuns
         guard !query.isEmpty else { return runs }
         return runs.filter { $0.runId.localizedCaseInsensitiveContains(query) || $0.command.localizedCaseInsensitiveContains(query) }
+    }
+}
+
+extension AuditRun {
+    var resultLabel: String {
+        let size = DevCleanerFormatters.bytes(freedBytes)
+        switch mode {
+        case "dry_run": return "Would free \(size)"
+        case "trash": return "Moved \(size) to Trash"
+        case "permanent_delete": return "Freed \(size)"
+        case "purge", "gc": return "Purged \(size) from Trash"
+        case "restore": return "Restored \(cleaned) items"
+        default: return command == "undo" ? "Restored \(cleaned) items" : size
+        }
+    }
+
+    var statusLabel: String {
+        if mode == "dry_run" { return "Dry run" }
+        if failed > 0 { return "Partial" }
+        if finishedAt == nil { return "Incomplete" }
+        return skipped > 0 ? "Done, \(skipped) skipped" : "Success"
     }
 }
