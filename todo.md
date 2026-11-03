@@ -64,9 +64,15 @@
 - [x] 4.7 Settings 统一即时保存。
 
 ### 阶段 5：CLI
-- [ ] 5.1 `scan` 在非 TTY 下也输出结果列表；多根目录不再自动切换成 JSON。
-- [ ] 5.2 `clean` 默认移入回收站（新增 `--permanent`，`--trash` 保留兼容）；新增 `--yes`（只跳过确认）和 `--include-in-use`（只放行 in-use），`--force` 保持原义。
-- [ ] 5.3 只读的 `trash list/show` 不再写审计记录（现在每次都写一条空的 "trash" 运行）。
+- [x] 5.1 `scan` 在非 TTY 下也输出结果列表（结果总是写 stdout，进度条在 stderr）；多根目录逐根列出，不再自动切换成 JSON。
+- [x] 5.2 `clean` 默认移入回收站（新增 `--permanent`，`--trash` 保留兼容）；新增 `--yes`（只跳过确认）和 `--include-in-use`（只放行 in-use），`--force` 保持原义。
+- [x] 5.3 只读的 `trash list/show` 和 gc dry-run 不再写审计记录；purge/gc 记录真实条数、字节数和 mode。
+- [x] 5.4 （评审外，验证中发现）
+  - 扫描根统一转绝对路径：此前 `dev-cleaner clean`（默认 `.`）把相对路径写进回收站日志，换目录 `undo` 会恢复到错误位置；plan、审计同样受影响；`keep_paths` 对相对路径扫描完全不生效。
+  - CLI `clean`/`apply` 审计按每项真实结果写入（completed/failed/skipped+原因/dry_run），不再统一写 "attempted"。
+  - `apply` 同样默认移入回收站，新增 `--permanent`、`--yes`。
+  - TUI 按 Enter 直接清理且无确认：改为移入回收站并写审计，提示文案同步。
+  - dry-run 汇总区分 "Would move to trash" 与 "Would free"。
 
 ### 阶段 6：工程
 - [ ] 6.1 CI：fmt、clippy、`cargo test --workspace`、`swift test`。

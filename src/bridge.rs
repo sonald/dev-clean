@@ -587,7 +587,7 @@ fn bridge_recommend(args: BridgeRecommendArgs, config: &Config) -> Result<()> {
     discovered.projects = service.deduplicate_projects(discovered.projects);
     discovered
         .projects
-        .sort_by(|a, b| b.info.size.cmp(&a.info.size));
+        .sort_by_key(|project| std::cmp::Reverse(project.info.size));
     discovered.resolved.scan_root = derive_scan_root(&discovered.resolved.roots);
     let cleanup_bytes = args.cleanup.as_deref().map(parse_size).transpose()?;
     let free_at_least_bytes = args.free_at_least.as_deref().map(parse_size).transpose()?;
@@ -1092,17 +1092,18 @@ fn bridge_trash(command: BridgeTrashCommands, config: &Config) -> Result<()> {
     Ok(())
 }
 
-struct TrashRunLog {
-    command: &'static str,
-    mode: &'static str,
-    path: PathBuf,
-    done: usize,
-    skipped: usize,
-    failed: usize,
-    bytes: u64,
+/// One audit run for a trash operation that changed the disk (restore, purge, gc).
+pub(crate) struct TrashRunLog {
+    pub(crate) command: &'static str,
+    pub(crate) mode: &'static str,
+    pub(crate) path: PathBuf,
+    pub(crate) done: usize,
+    pub(crate) skipped: usize,
+    pub(crate) failed: usize,
+    pub(crate) bytes: u64,
 }
 
-fn log_trash_run(audit: &AuditLogger, log: TrashRunLog) {
+pub(crate) fn log_trash_run(audit: &AuditLogger, log: TrashRunLog) {
     let Ok(run_id) = audit.start_run_with_mode(log.command, Some(log.mode)) else {
         return;
     };

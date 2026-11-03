@@ -522,6 +522,115 @@ fn recommend_writes_plan_file_and_json_output() {
 }
 
 #[test]
+fn clean_defaults_to_trash_and_undo_works_from_any_directory() {
+    let workspace = TempDir::new().unwrap();
+    let projects = workspace.path().join("projects");
+    let project_root = write_project(&projects, "app", 2048);
+
+    // No path: scans the working directory, the way people usually run it.
+    let output = command(&workspace)
+        .current_dir(&projects)
+        .args(["clean", "--yes", "--include-recent"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("Trash batch:"), "{stdout}");
+    assert!(!project_root.join("target").exists());
+
+    let log = fs::read_to_string(workspace.path().join("trash").join("trash_log.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    assert!(Path::new(entry["original_path"].as_str().unwrap()).is_absolute());
+
+    let audit = fs::read_to_string(audit_log_path(&workspace)).unwrap();
+    assert!(
+        audit.contains(r#""action":"trash","result":"completed""#),
+        "{audit}"
+    );
+
+    // `run` starts in the workspace root, not in the directory `clean` ran from.
+    run(&workspace, &["undo"]);
+    assert!(project_root.join("target").join("artifact.bin").exists());
+}
+
+#[test]
+fn clean_permanent_deletes_without_trash() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "app", 2048);
+
+    let output = run(
+        &workspace,
+        &[
+            "clean",
+            project_root.to_str().unwrap(),
+            "--permanent",
+            "--auto",
+            "--include-recent",
+        ],
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Trash batch:"));
+    assert!(!project_root.join("target").exists());
+    let audit = fs::read_to_string(audit_log_path(&workspace)).unwrap();
+    assert!(
+        audit.contains(r#""action":"remove","result":"completed""#),
+        "{audit}"
+    );
+}
+
+#[test]
+fn scan_lists_every_profile_root_when_output_is_piped() {
+    let workspace = TempDir::new().unwrap();
+    let a = write_project(&workspace.path().join("a"), "app-a", 1024);
+    let b = write_project(&workspace.path().join("b"), "app-b", 1024);
+    let config = workspace.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[scan_profiles.both]\npaths = [{:?}, {:?}]\n",
+            workspace.path().join("a"),
+            workspace.path().join("b")
+        ),
+    )
+    .unwrap();
+
+    let output = run(
+        &workspace,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--profile",
+            "both",
+            "scan",
+            "--include-recent",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim_start().starts_with('['), "{stdout}");
+    assert_eq!(stdout.matches("Root:").count(), 2, "{stdout}");
+    for project in [a, b] {
+        assert!(
+            stdout.contains(project.join("target").to_str().unwrap()),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn apply_yes_skips_the_prompt_and_uses_the_trash() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "app", 2048);
+    let plan = write_apply_plan(&workspace, &project_root, "plan.json");
+
+    let output = run(
+        &workspace,
+        &["apply", plan.to_str().unwrap(), "--yes", "--include-recent"],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Trash batch:"), "{stdout}");
+    assert!(!project_root.join("target").exists());
+}
+
+#[test]
 fn clean_trash_undo_roundtrip_updates_files_and_audit_log() {
     let workspace = TempDir::new().unwrap();
     let project_root = write_project(workspace.path(), "clean-app", 2048);
@@ -603,7 +712,7 @@ fn plan_apply_dry_run_keeps_target() {
 
     assert!(stdout.contains("Applying cleanup plan"));
     assert!(stdout.contains("Dry run completed. Nothing was changed."));
-    assert!(stdout.contains("Would free"));
+    assert!(stdout.contains("Would move to trash"));
     assert!(project_root.join("target").join("artifact.bin").exists());
 }
 

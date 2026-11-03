@@ -1,4 +1,4 @@
-use crate::clean_progress::TerminalCleanObserver;
+use crate::clean_progress::{AuditedCleanObserver, TerminalCleanObserver};
 use anyhow::Result;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
@@ -6,6 +6,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dev_cleaner_core::app::{ScanRequest, ScanService};
+use dev_cleaner_core::audit::AuditLogger;
 use dev_cleaner_core::evaluation::EvaluatedProject;
 use dev_cleaner_core::scanner::RiskLevel;
 use dev_cleaner_core::utils::format_size;
@@ -525,7 +526,7 @@ pub fn run_tui(path: PathBuf) -> Result<()> {
 
 pub fn run_tui_with_config(path: PathBuf, config: &Config) -> Result<()> {
     let (projects, recent_days) = load_tui_projects(path, config)?;
-    run_tui_projects(projects, false, false, recent_days)
+    run_tui_projects(projects, false, false, recent_days, config)
 }
 
 fn load_tui_projects(path: PathBuf, config: &Config) -> Result<(Vec<ProjectInfo>, i64)> {
@@ -549,6 +550,7 @@ pub fn run_tui_projects(
     include_recent: bool,
     include_protected: bool,
     recent_days: i64,
+    config: &Config,
 ) -> Result<()> {
     if projects.is_empty() {
         println!("No cleanable directories found.");
@@ -562,7 +564,7 @@ pub fn run_tui_projects(
     let mut terminal = Terminal::new(backend)?;
 
     let app = AppState::new(projects, include_recent, include_protected, recent_days);
-    let res = run_app(&mut terminal, app);
+    let res = run_app(&mut terminal, app, &AuditLogger::from_config(config));
 
     disable_raw_mode()?;
     execute!(
@@ -578,7 +580,11 @@ pub fn run_tui_projects(
     Ok(())
 }
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: AppState) -> Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut app: AppState,
+    audit: &AuditLogger,
+) -> Result<()> {
     loop {
         terminal.draw(|f| render_ui(f, &mut app))?;
 
@@ -588,10 +594,28 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: AppSt
                 AppOutcome::Quit => return Ok(()),
                 AppOutcome::CleanSelected => {
                     disable_raw_mode()?;
+                    // Enter cleans without a separate prompt, so it must stay undoable.
                     let selected = app.get_selected_projects();
-                    let cleaner = Cleaner::new().verbose(true);
-                    let mut observer = TerminalCleanObserver::new(true);
+                    let run_id = audit.start_run_with_mode("clean", Some("trash")).ok();
+                    let cleaner = Cleaner::new().verbose(true).trash(true);
+                    let mut observer = AuditedCleanObserver {
+                        terminal: TerminalCleanObserver::new(true),
+                        audit,
+                        run_id: run_id.clone(),
+                        command: "clean",
+                        action: "trash",
+                    };
                     let result = cleaner.clean_multiple_with_observer(&selected, &mut observer)?;
+                    if let Some(run_id) = &run_id {
+                        let _ = audit.finish_run(
+                            run_id,
+                            "clean",
+                            result.cleaned_count,
+                            result.skipped_count,
+                            result.failed_count,
+                            result.bytes_freed,
+                        );
+                    }
                     println!("\nCleaning completed!");
                     println!("  Cleaned: {}", result.cleaned_count);
                     println!(
@@ -600,7 +624,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: AppSt
                         format_size(result.bytes_skipped)
                     );
                     println!("  Failed: {}", result.failed_count);
-                    println!("  Space freed: {}", result.size_freed_human());
+                    println!("  Moved to trash: {}", result.size_freed_human());
+                    if let Some(batch_id) = &result.trash_batch_id {
+                        println!("  Undo: dev-cleaner undo --batch {batch_id}");
+                        println!("  Release space: dev-cleaner trash purge --batch {batch_id}");
+                    }
                     return Ok(());
                 }
             }
@@ -756,7 +784,7 @@ fn draw_detail_panel(f: &mut Frame, area: Rect, app: &AppState) {
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
     let shortcut_line = match app.input_mode {
         InputMode::Normal => {
-            "j/k move | space toggle | enter clean | / search | f filters | ? help | q quit"
+            "j/k move | space toggle | enter move to trash | / search | f filters | ? help | q quit"
         }
         InputMode::Search => {
             "Search mode: type to filter list, Backspace delete, Enter/Esc to exit"
@@ -850,7 +878,7 @@ fn draw_help(f: &mut Frame) {
         Line::from("Search: / enters search mode, type to filter, Enter/Esc exits search"),
         Line::from("Filters: f opens panel (j/k choose, h/l change), or s/R/P quick keys"),
         Line::from("Sort: size, age, source"),
-        Line::from("Actions: Enter clean selected, q/Esc quit"),
+        Line::from("Actions: Enter moves selected to Dev Cleaner trash (undo: dev-cleaner undo), q/Esc quit"),
         Line::from(""),
         Line::from("Press any key to close"),
     ];
@@ -1130,6 +1158,6 @@ mod tests {
 
     #[test]
     fn run_tui_projects_returns_early_for_empty_input() {
-        assert!(run_tui_projects(Vec::new(), false, false, 7).is_ok());
+        assert!(run_tui_projects(Vec::new(), false, false, 7, &Config::default()).is_ok());
     }
 }

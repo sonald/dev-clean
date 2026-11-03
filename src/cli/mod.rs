@@ -1,5 +1,7 @@
-use crate::bridge::{run_bridge, BridgeCommands};
-use crate::clean_progress::{TerminalCleanObserver, TerminalRestoreObserver};
+use crate::bridge::{log_trash_run, run_bridge, BridgeCommands, TrashRunLog};
+use crate::clean_progress::{
+    item_action, AuditedCleanObserver, TerminalCleanObserver, TerminalRestoreObserver,
+};
 use crate::interactive::{ProjectSelector, SelectorOptions};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -178,17 +180,25 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Move directories to Dev Cleaner's trash (undoable) instead of deleting
+        /// Move directories to Dev Cleaner's trash (the default; kept for compatibility)
         #[arg(long)]
         trash: bool,
 
-        /// Auto mode - clean all matching without confirmation
-        #[arg(long)]
+        /// Delete permanently instead of moving to Dev Cleaner's trash
+        #[arg(long, alias = "permanent-delete", conflicts_with = "trash")]
+        permanent: bool,
+
+        /// Auto mode - clean all matching without asking
+        #[arg(long, short = 'y', alias = "yes")]
         auto: bool,
 
-        /// Force mode - skip all confirmations
+        /// Force mode - skip all confirmations and clean in-use targets
         #[arg(short, long)]
         force: bool,
+
+        /// Clean targets whose lock files changed recently (in use); still asks first
+        #[arg(long)]
+        include_in_use: bool,
 
         /// Print a copy-friendly share summary after cleaning
         #[arg(long)]
@@ -418,13 +428,21 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Move directories to Dev Cleaner's trash (undoable) instead of deleting
+        /// Move directories to Dev Cleaner's trash (the default; kept for compatibility)
         #[arg(long)]
         trash: bool,
+
+        /// Delete permanently instead of moving to Dev Cleaner's trash
+        #[arg(long, alias = "permanent-delete", conflicts_with = "trash")]
+        permanent: bool,
 
         /// Force mode - skip confirmation and allow in-use cleaning
         #[arg(short, long)]
         force: bool,
+
+        /// Skip the confirmation prompt only (in-use targets stay skipped)
+        #[arg(short = 'y', long)]
+        yes: bool,
 
         /// Disable plan target re-validation before applying
         #[arg(long)]
@@ -667,8 +685,10 @@ impl Cli {
                 older_than,
                 dry_run,
                 trash,
+                permanent,
                 auto,
                 force,
+                include_in_use,
                 share,
                 verbose,
                 gitignore,
@@ -686,9 +706,10 @@ impl Cli {
                     min_size,
                     older_than,
                     dry_run,
-                    trash,
+                    trash || !permanent,
                     auto,
                     force,
+                    include_in_use,
                     share,
                     verbose,
                     gitignore,
@@ -820,7 +841,9 @@ impl Cli {
                 plan,
                 dry_run,
                 trash,
+                permanent,
                 force,
+                yes,
                 no_verify,
                 include_recent,
                 force_protected,
@@ -830,8 +853,9 @@ impl Cli {
                 run_apply(
                     plan,
                     dry_run,
-                    trash,
+                    trash || !permanent,
                     force,
+                    yes,
                     no_verify,
                     include_recent,
                     force_protected,
@@ -950,7 +974,7 @@ fn run_scan(
     );
     let resolved = scan_service.resolve_inputs(config, &request)?;
 
-    if json_output || resolved.roots.len() > 1 {
+    if json_output {
         let projects =
             project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
         println!("{}", serde_json::to_string_pretty(&projects)?);
@@ -958,100 +982,116 @@ fn run_scan(
     }
 
     println!("{}", "Scanning for cleanable directories...".cyan().bold());
-    let root = resolved.roots[0].clone();
-    let scanner = scan_service.build_scanner(&root, config, &resolved);
-    let (total_count, rx) = scanner.scan_with_streaming()?;
-    if total_count == 0 {
+    let mut projects = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut total_size = 0u64;
+    let mut candidates = 0usize;
+    for root in &resolved.roots {
+        let scanner = scan_service.build_scanner(root, config, &resolved);
+        let (total_count, rx) = scanner.scan_with_streaming()?;
+        candidates += total_count;
+        if total_count == 0 {
+            continue;
+        }
+        if resolved.roots.len() > 1 {
+            println!("{} {}", "Root:".bold(), root.display());
+        }
+        println!(
+            "Found {} potential projects, calculating sizes...\n",
+            total_count
+        );
+
+        let pb = ProgressBar::new(total_count as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        // Results go to stdout even when the bar is hidden (piped output, CI): `pb.println`
+        // would print nothing there, or send the list to stderr.
+        let print_line = |line: String| pb.suspend(|| println!("{line}"));
+
+        for project in rx.iter() {
+            pb.inc(1);
+            if !resolved
+                .min_size_bytes
+                .map_or(true, |min_size_bytes| project.size >= min_size_bytes)
+            {
+                continue;
+            }
+
+            let evaluated = scan_service.evaluate_project_with_config(
+                config,
+                project,
+                resolved.visibility.recent_days,
+            );
+            if !resolved.visibility.is_visible(&evaluated) {
+                continue;
+            }
+            let project = evaluated.into_project_info();
+            // Overlapping profile roots report the same target twice.
+            if !seen.insert(project.cleanable_dir.clone()) {
+                continue;
+            }
+
+            total_size += project.size;
+            let dir_display = project.cleanable_dir.display().to_string();
+            let short_path = if dir_display.len() > 50 {
+                format!("...{}", &dir_display[dir_display.len() - 47..])
+            } else {
+                dir_display.clone()
+            };
+            pb.set_message(format!("{}: {}", short_path, project.size_human()));
+            let rule_meta = detection_meta(&project);
+            print_line(format!(
+                "  {} {} {} {} ({}){}{}",
+                "✓".green(),
+                project.project_type_display_name().bright_cyan(),
+                rule_meta.bright_black(),
+                dir_display.bright_white(),
+                project.size_human().yellow(),
+                if project.protected {
+                    " [PROTECTED]".yellow().to_string()
+                } else {
+                    String::new()
+                },
+                if project.recent {
+                    " [RECENT]".bright_black().to_string()
+                } else {
+                    String::new()
+                }
+            ));
+
+            if explain {
+                let reason = ProjectDetector::explain_cleanable_dir(
+                    project.project_type,
+                    &project.root,
+                    &project.cleanable_dir,
+                    &config.custom_patterns,
+                );
+                print_line(format!(
+                    "    {} {}",
+                    "↳".bright_black(),
+                    reason.bright_black()
+                ));
+            }
+
+            projects.push(project);
+        }
+        pb.finish_and_clear();
+    }
+
+    if candidates == 0 {
         println!("{}", "No cleanable directories found.".yellow());
         return Ok(());
     }
-
-    println!(
-        "Found {} potential projects, calculating sizes...\n",
-        total_count
-    );
-
-    let pb = ProgressBar::new(total_count as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
-
-    let mut projects = Vec::new();
-    let mut total_size = 0u64;
-    for project in rx.iter() {
-        pb.inc(1);
-        if !resolved
-            .min_size_bytes
-            .map_or(true, |min_size_bytes| project.size >= min_size_bytes)
-        {
-            continue;
-        }
-
-        let evaluated = scan_service.evaluate_project_with_config(
-            config,
-            project,
-            resolved.visibility.recent_days,
-        );
-        if !resolved.visibility.is_visible(&evaluated) {
-            continue;
-        }
-        let project = evaluated.into_project_info();
-
-        total_size += project.size;
-        let dir_display = project.cleanable_dir.display().to_string();
-        let short_path = if dir_display.len() > 50 {
-            format!("...{}", &dir_display[dir_display.len() - 47..])
-        } else {
-            dir_display.clone()
-        };
-        pb.set_message(format!("{}: {}", short_path, project.size_human()));
-        let rule_meta = detection_meta(&project);
-        pb.println(format!(
-            "  {} {} {} {} ({}){}{}",
-            "✓".green(),
-            project.project_type_display_name().bright_cyan(),
-            rule_meta.bright_black(),
-            dir_display.bright_white(),
-            project.size_human().yellow(),
-            if project.protected {
-                " [PROTECTED]".yellow().to_string()
-            } else {
-                String::new()
-            },
-            if project.recent {
-                " [RECENT]".bright_black().to_string()
-            } else {
-                String::new()
-            }
-        ));
-
-        if explain {
-            let reason = ProjectDetector::explain_cleanable_dir(
-                project.project_type,
-                &project.root,
-                &project.cleanable_dir,
-                &config.custom_patterns,
-            );
-            pb.println(format!(
-                "    {} {}",
-                "↳".bright_black(),
-                reason.bright_black()
-            ));
-        }
-
-        projects.push(project);
-    }
-    pb.finish_and_clear();
 
     if projects.is_empty() {
         println!("\n{}", "No directories match the filter criteria.".yellow());
         return Ok(());
     }
 
-    projects.sort_by(|a, b| b.size.cmp(&a.size));
     println!(
         "\n{} {} cleanable directories found",
         "✓".green().bold(),
@@ -1162,13 +1202,13 @@ fn audit_mode(dry_run: bool, trash: bool) -> &'static str {
 }
 
 /// Trash moves and dry runs do not free disk space; say what actually happened.
+/// Moving to trash frees nothing until the batch is purged, so the label says so.
 fn freed_label(dry_run: bool, trash: bool) -> &'static str {
-    if dry_run {
-        "Would free"
-    } else if trash {
-        "Moved to trash"
-    } else {
-        "Space freed"
+    match (dry_run, trash) {
+        (true, true) => "Would move to trash",
+        (true, false) => "Would free",
+        (false, true) => "Moved to trash",
+        (false, false) => "Space freed",
     }
 }
 
@@ -1263,6 +1303,7 @@ fn run_clean(
     trash: bool,
     auto: bool,
     force: bool,
+    include_in_use: bool,
     share: bool,
     verbose: bool,
     gitignore: bool,
@@ -1312,10 +1353,12 @@ fn run_clean(
         format_size(total_size).green().bold()
     );
 
+    let allow_in_use = force || include_in_use;
+
     // Filter or confirm
     if !auto && !force {
         projects = if is_interactive_tty() {
-            run_keyboard_selector(projects, force, force_protected)?
+            run_keyboard_selector(projects, allow_in_use, force_protected)?
         } else {
             select_projects_interactive(&projects)?
         };
@@ -1326,7 +1369,8 @@ fn run_clean(
         }
     }
 
-    let split = split_selected_projects_for_clean(projects, include_recent, force, force_protected);
+    let split =
+        split_selected_projects_for_clean(projects, include_recent, allow_in_use, force_protected);
     let selected_total_size: u64 = split.selected.iter().map(|p| p.size).sum();
 
     if split.selected.is_empty() {
@@ -1371,7 +1415,7 @@ fn run_clean(
                 run_id,
                 "clean",
                 &project.cleanable_dir,
-                "remove",
+                item_action(trash),
                 "skipped",
                 project.size,
                 project.skip_reason.clone(),
@@ -1383,7 +1427,7 @@ fn run_clean(
     let options = CleanOptions {
         dry_run,
         verbose,
-        force,
+        force: allow_in_use,
         include_recent,
         force_protected,
         trash,
@@ -1392,27 +1436,19 @@ fn run_clean(
     };
 
     let cleaner = Cleaner::with_options(options);
-    let mut observer = TerminalCleanObserver::new(verbose);
+    let mut observer = AuditedCleanObserver {
+        terminal: TerminalCleanObserver::new(verbose),
+        audit: &audit,
+        run_id: run_id.clone(),
+        command: "clean",
+        action: item_action(trash),
+    };
     let mut result = cleaner.clean_multiple_with_observer(&split.selected, &mut observer)?;
     result.skipped_count += split.blocked_summary.total_count();
     result.bytes_skipped = result
         .bytes_skipped
         .saturating_add(split.blocked_summary.total_bytes());
     result.run_id = run_id.clone();
-
-    if let Some(run_id) = &run_id {
-        for project in &split.selected {
-            let _ = audit.log_item(
-                run_id,
-                "clean",
-                &project.cleanable_dir,
-                if dry_run { "dry_run" } else { "remove" },
-                "attempted",
-                project.size,
-                None,
-            );
-        }
-    }
 
     let done_message = if dry_run {
         "Dry run completed. Nothing was changed."
@@ -1951,6 +1987,7 @@ fn run_apply(
     dry_run: bool,
     trash: bool,
     force: bool,
+    yes: bool,
     no_verify: bool,
     include_recent: bool,
     force_protected: bool,
@@ -2020,7 +2057,7 @@ fn run_apply(
         return Ok(());
     }
 
-    if !force {
+    if !force && !yes {
         let should_continue = confirm_execution_summary(
             "apply",
             verified_projects.len(),
@@ -2048,25 +2085,17 @@ fn run_apply(
         trash_root: None,
         cancel_file: None,
     });
-    let mut observer = TerminalCleanObserver::new(verbose);
+    let mut observer = AuditedCleanObserver {
+        terminal: TerminalCleanObserver::new(verbose),
+        audit: &audit,
+        run_id: run_id.clone(),
+        command: "apply",
+        action: item_action(trash),
+    };
     let mut result = cleaner.clean_multiple_with_observer(&verified_projects, &mut observer)?;
     result.skipped_count += skipped_pre;
     result.bytes_skipped = result.bytes_skipped.saturating_add(skipped_pre_bytes);
     result.run_id = run_id.clone();
-
-    if let Some(run_id) = &run_id {
-        for p in &verified_projects {
-            let _ = audit.log_item(
-                run_id,
-                "apply",
-                &p.cleanable_dir,
-                if dry_run { "dry_run" } else { "remove" },
-                "attempted",
-                p.size,
-                None,
-            );
-        }
-    }
 
     let done_message = if dry_run {
         "Dry run completed. Nothing was changed."
@@ -2129,34 +2158,6 @@ fn confirm(prompt: &str) -> Result<bool> {
     let input = input.trim().to_lowercase();
 
     Ok(matches!(input.as_str(), "y" | "yes"))
-}
-
-struct AuditRunGuard<'a> {
-    audit: &'a AuditLogger,
-    run_id: Option<String>,
-    command: &'static str,
-}
-
-impl<'a> AuditRunGuard<'a> {
-    fn new(audit: &'a AuditLogger, command: &'static str) -> Self {
-        Self {
-            audit,
-            run_id: audit.start_run(command).ok(),
-            command,
-        }
-    }
-
-    fn run_id(&self) -> Option<&str> {
-        self.run_id.as_deref()
-    }
-}
-
-impl<'a> Drop for AuditRunGuard<'a> {
-    fn drop(&mut self) {
-        if let Some(run_id) = &self.run_id {
-            let _ = self.audit.finish_run(run_id, self.command, 0, 0, 0, 0);
-        }
-    }
 }
 
 fn run_undo(
@@ -2231,8 +2232,8 @@ fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
 }
 
 fn run_trash_with_root(command: TrashCommands, config: &Config, trash_root: PathBuf) -> Result<()> {
+    // Listing and dry runs change nothing, so they leave no audit record.
     let audit = AuditLogger::from_config(config);
-    let audit_run = AuditRunGuard::new(&audit, "trash");
 
     match command {
         TrashCommands::List { top, json } => {
@@ -2340,17 +2341,18 @@ fn run_trash_with_root(command: TrashCommands, config: &Config, trash_root: Path
                     println!("  {}", error.red());
                 }
             }
-            if let Some(run_id) = audit_run.run_id() {
-                let _ = audit.log_item(
-                    run_id,
-                    "trash",
-                    &trash_root.join(&batch),
-                    "purge_batch",
-                    "completed",
-                    result.removed_bytes,
-                    None,
-                );
-            }
+            log_trash_run(
+                &audit,
+                TrashRunLog {
+                    command: "trash",
+                    mode: "purge",
+                    path: trash_root.join(&batch),
+                    done: result.removed_entries,
+                    skipped: 0,
+                    failed: result.failed_batches,
+                    bytes: result.removed_bytes,
+                },
+            );
         }
         TrashCommands::Gc {
             keep_days,
@@ -2390,17 +2392,6 @@ fn run_trash_with_root(command: TrashCommands, config: &Config, trash_root: Path
 
             if dry_run {
                 println!("{}", "Dry run only; no changes made.".bright_black());
-                if let Some(run_id) = audit_run.run_id() {
-                    let _ = audit.log_item(
-                        run_id,
-                        "trash",
-                        &trash_root,
-                        "gc",
-                        "dry_run",
-                        result.removed_bytes,
-                        None,
-                    );
-                }
                 return Ok(());
             }
 
@@ -2435,17 +2426,18 @@ fn run_trash_with_root(command: TrashCommands, config: &Config, trash_root: Path
                     println!("  {}", error.red());
                 }
             }
-            if let Some(run_id) = audit_run.run_id() {
-                let _ = audit.log_item(
-                    run_id,
-                    "trash",
-                    &trash_root,
-                    "gc",
-                    "completed",
-                    applied.removed_bytes,
-                    None,
-                );
-            }
+            log_trash_run(
+                &audit,
+                TrashRunLog {
+                    command: "trash",
+                    mode: "gc",
+                    path: trash_root.clone(),
+                    done: applied.removed_entries,
+                    skipped: 0,
+                    failed: applied.failed_batches,
+                    bytes: applied.removed_bytes,
+                },
+            );
         }
     }
 
@@ -2629,7 +2621,13 @@ fn run_tui(
     );
     let projects =
         project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
-    crate::tui::run_tui_projects(projects, include_recent, include_protected, recent_days)
+    crate::tui::run_tui_projects(
+        projects,
+        include_recent,
+        include_protected,
+        recent_days,
+        config,
+    )
 }
 
 #[cfg(test)]
@@ -2751,7 +2749,8 @@ mod tests {
 
     #[test]
     fn freed_label_reflects_mode() {
-        assert_eq!(freed_label(true, true), "Would free");
+        assert_eq!(freed_label(true, true), "Would move to trash");
+        assert_eq!(freed_label(true, false), "Would free");
         assert_eq!(freed_label(false, true), "Moved to trash");
         assert_eq!(freed_label(false, false), "Space freed");
         assert_eq!(audit_mode(true, false), "dry_run");
@@ -2905,7 +2904,7 @@ mod tests {
         config.audit.path = Some(audit_path);
 
         run_apply(
-            plan_path, true, false, true, true, true, true, 7, false, &config,
+            plan_path, true, false, true, false, true, true, true, 7, false, &config,
         )
         .unwrap();
 
@@ -2920,7 +2919,7 @@ mod tests {
                 ..
             } = record
             {
-                if action == "dry_run" && result == "attempted" {
+                if action == "dry_run" && result == "dry_run" {
                     has_attempted = true;
                 }
                 if reason.as_deref() == Some("outside_scan_root") {
@@ -2977,7 +2976,7 @@ mod tests {
         config.audit.path = Some(audit_path);
 
         run_apply(
-            plan_path, false, true, false, true, false, false, 7, false, &config,
+            plan_path, false, true, false, false, true, false, false, 7, false, &config,
         )
         .unwrap();
 
@@ -3005,7 +3004,7 @@ mod tests {
     }
 
     #[test]
-    fn run_trash_list_json_finishes_audit_run_on_early_return() {
+    fn read_only_trash_commands_leave_no_audit_record() {
         let temp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.audit.enabled = true;
@@ -3022,23 +3021,6 @@ mod tests {
         .unwrap();
 
         let records = AuditLogger::from_config(&config).read_records().unwrap();
-        let mut started_ids = Vec::new();
-        let mut finished_ids = Vec::new();
-
-        for record in records {
-            match record {
-                AuditRecord::RunStarted {
-                    run_id, command, ..
-                } if command == "trash" => started_ids.push(run_id),
-                AuditRecord::RunFinished {
-                    run_id, command, ..
-                } if command == "trash" => finished_ids.push(run_id),
-                _ => {}
-            }
-        }
-
-        assert_eq!(started_ids.len(), 1);
-        assert_eq!(finished_ids.len(), 1);
-        assert_eq!(started_ids[0], finished_ids[0]);
+        assert!(records.is_empty(), "{records:?}");
     }
 }

@@ -93,7 +93,13 @@ impl ScanService {
         request: &ScanRequest,
     ) -> Result<ResolvedScanInput> {
         let profile = self.resolve_profile(config, request.profile.as_deref())?;
-        let roots = self.resolve_roots(request.path.as_ref(), profile)?;
+        // Absolute (symlinks kept as typed) so scan output, plans, protection rules, the audit
+        // log and the trash log never depend on the directory the command was started from.
+        let roots = self
+            .resolve_roots(request.path.as_ref(), profile)?
+            .into_iter()
+            .map(|root| std::path::absolute(&root).unwrap_or(root))
+            .collect::<Vec<_>>();
         let scan_root = derive_scan_root(&roots);
 
         let depth = request
@@ -474,9 +480,10 @@ mod tests {
         let service = ScanService::new();
         let config = Config::default();
 
+        // Relative roots become absolute so no output depends on the working directory.
         let request = ScanRequest::default();
         let resolved = service.resolve_inputs(&config, &request).unwrap();
-        assert_eq!(resolved.roots, vec![PathBuf::from(".")]);
+        assert_eq!(resolved.roots, vec![std::env::current_dir().unwrap()]);
         assert_eq!(resolved.scan_root, canonicalize_lossy(Path::new(".")));
 
         let mut config = Config::default();
