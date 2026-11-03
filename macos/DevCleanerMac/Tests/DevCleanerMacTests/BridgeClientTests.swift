@@ -40,6 +40,19 @@ final class BridgeClientTests: XCTestCase {
 
     func testGuiPreferencesDefaultScanRootPathUsesHome() {
         XCTAssertEqual(GuiPreferences().scanRootPath, FileManager.default.homeDirectoryForCurrentUser.path)
+        XCTAssertEqual(GuiPreferences().scanRoots, [FileManager.default.homeDirectoryForCurrentUser.path])
+    }
+
+    func testGuiPreferencesDecodesNewSettingsWithDefaults() throws {
+        let json = #"{"scan_root_path":"/tmp/primary","scan_roots":["/tmp/primary","/tmp/secondary"],"follow_symlinks":true,"trash_retention_days":45}"#
+        let preferences = try JSONDecoder.bridge.decode(GuiPreferences.self, from: Data(json.utf8))
+
+        XCTAssertEqual(preferences.scanRootPath, "/tmp/primary")
+        XCTAssertEqual(preferences.scanRoots, ["/tmp/primary", "/tmp/secondary"])
+        XCTAssertTrue(preferences.followSymlinks)
+        XCTAssertEqual(preferences.trashRetentionDays, 45)
+        XCTAssertTrue(preferences.alertBeforeLargeCleanup)
+        XCTAssertTrue(preferences.protectHighRiskItems)
     }
 
     func testBridgeClientRunPropagatesDecodeFailure() async throws {
@@ -158,6 +171,34 @@ final class BridgeClientTests: XCTestCase {
         XCTAssertTrue(didRecordScan)
         let arguments = bridge.recordedArguments.last ?? []
         XCTAssertEqual(Array(arguments.prefix(2)), ["scan", "/tmp/dev-clean-root"])
+    }
+
+    func testSmartScanRunsAllConfiguredRoots() async {
+        let bridge = RecordingBridgeRunner()
+        let model = await AppModel(bridge: bridge)
+
+        await MainActor.run {
+            model.preferences.scanRoots = ["/tmp/dev-clean-a", "/tmp/dev-clean-b"]
+            model.startSmartScan()
+        }
+
+        let didRecordScans = await waitUntil { bridge.recordedArguments.count == 2 }
+        XCTAssertTrue(didRecordScans)
+        XCTAssertEqual(bridge.recordedArguments.map { Array($0.prefix(2)) }, [
+            ["scan", "/tmp/dev-clean-a"],
+            ["scan", "/tmp/dev-clean-b"]
+        ])
+    }
+
+    func testProtectionRulesMutateConfigSnapshot() async {
+        let model = await AppModel(bridge: RecordingBridgeRunner())
+
+        await MainActor.run {
+            model.configSnapshot = ConfigSnapshot(configPath: "/tmp/config.toml", config: .object(["keep_paths": .array([.string("/tmp/a")])]), guiPreferences: GuiPreferences())
+            XCTAssertEqual(model.protectedPaths, ["/tmp/a"])
+            model.removeProtectedPath("/tmp/a")
+            XCTAssertEqual(model.protectedPaths, [])
+        }
     }
 
     func testRecommendationUsesSelectedRoot() async {

@@ -7,17 +7,17 @@ struct SidebarView: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Dev Cleaner")
-                    .font(.system(size: 22, weight: .bold))
+                    .font(.system(size: 18, weight: .bold))
                     .foregroundStyle(.white)
-                Text("SYSTEM MAINTENANCE")
+                Text("System Maintenance")
                     .font(.caption)
                     .foregroundStyle(DCColor.secondary)
             }
-            .padding(.horizontal, 18)
-            .padding(.top, 20)
-            .padding(.bottom, 18)
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+            .padding(.bottom, 26)
 
-            ForEach(AppSection.allCases) { section in
+            ForEach(AppSection.sidebarSections) { section in
                 Button {
                     withAnimation(.easeInOut(duration: 0.16)) {
                         model.selectedSection = section
@@ -31,24 +31,36 @@ struct SidebarView: View {
                         Spacer()
                     }
                     .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+                    .padding(.vertical, 9)
                     .foregroundStyle(model.selectedSection == section ? DCColor.blue : DCColor.secondary)
-                    .background(model.selectedSection == section ? DCColor.blue.opacity(0.18) : .clear)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .background(model.selectedSection == section ? DCColor.blue.opacity(0.14) : .clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 1)
+                .padding(.horizontal, 12)
             }
 
             Spacer()
 
             if model.isScanning || model.isCleaning {
-                ProgressView(value: model.isScanning ? model.scanProgress : model.cleanupProgress)
-                    .tint(DCColor.blue)
-                    .padding()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(model.isScanning ? "Scanning" : "Cleaning")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(DCColor.secondary)
+                    ProgressView(value: model.isScanning ? model.scanProgress : model.cleanupProgress)
+                        .tint(DCColor.blue)
+                    Text(model.isScanning ? model.scanStatusMessage : "\(model.cleanupProcessedCount)/\(max(model.cleanupTotalCount, 1)) processed")
+                        .font(.caption2)
+                        .foregroundStyle(DCColor.tertiary)
+                        .lineLimit(1)
+                }
+                .padding(14)
+                .background(DCColor.panel.opacity(0.65))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .padding(.horizontal, 14)
+                .padding(.bottom, 14)
             }
         }
-        .background(.ultraThinMaterial)
+        .background(DCColor.sidebar.opacity(0.92))
     }
 }

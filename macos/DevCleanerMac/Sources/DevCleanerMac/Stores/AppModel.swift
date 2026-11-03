@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -18,11 +19,20 @@ final class AppModel: ObservableObject {
     @Published var cleanupMode: CleanupMode = .trash
     @Published var cleanupLog: [String] = []
     @Published var cleanupProgress: Double = 0
+    @Published var cleanupTotalCount = 0
+    @Published var cleanupProcessedCount = 0
+    @Published var cleanupSucceededCount = 0
+    @Published var cleanupSkippedCount = 0
+    @Published var cleanupFailedCount = 0
+    @Published var cleanupCurrentPath: String?
+    @Published var showCleanupSummary = false
     @Published var lastSummary: CleanupSummary?
     @Published var recommendation: RecommendationPreview?
     @Published var trashBatches: [TrashBatch] = []
     @Published var trashEntries: [TrashEntry] = []
+    @Published var selectedTrashBatchID: String?
     @Published var auditRuns: [AuditRun] = []
+    @Published var auditFilter: AuditFilter = .all
     @Published var preferences = GuiPreferences()
     @Published var configSnapshot: ConfigSnapshot?
     @Published var presentedCleanupMode: CleanupMode?
@@ -68,12 +78,50 @@ final class AppModel: ObservableObject {
         selectedProjects.reduce(0) { $0 + $1.size }
     }
 
+    var activeScanRoots: [String] {
+        let roots = preferences.scanRoots.isEmpty ? [preferences.scanRootPath] : preferences.scanRoots
+        let normalized = roots
+            .map(normalizedScanRootPath)
+            .filter { !$0.isEmpty }
+        var seen = Set<String>()
+        return normalized.filter { seen.insert($0).inserted }
+    }
+
     var scanRootPath: String {
-        normalizedScanRootPath(preferences.scanRootPath)
+        normalizedScanRootPath(activeScanRoots.first ?? preferences.scanRootPath)
     }
 
     var scanRootDisplayName: String {
-        DevCleanerFormatters.shortPath(scanRootPath)
+        if activeScanRoots.count > 1 {
+            return "\(activeScanRoots.count) roots"
+        }
+        return DevCleanerFormatters.shortPath(scanRootPath)
+    }
+
+    var trashTotalBytes: UInt64 {
+        trashBatches.reduce(0) { $0 + $1.totalSize }
+    }
+
+    var selectedTrashBatch: TrashBatch? {
+        guard let selectedTrashBatchID else { return trashBatches.first }
+        return trashBatches.first { $0.batchId == selectedTrashBatchID }
+    }
+
+    var filteredAuditRuns: [AuditRun] {
+        switch auditFilter {
+        case .all:
+            return auditRuns
+        case .last30Days:
+            return Array(auditRuns.prefix(30))
+        case .cleanup:
+            return auditRuns.filter { $0.command.localizedCaseInsensitiveContains("clean") || $0.command.localizedCaseInsensitiveContains("apply") }
+        case .restore:
+            return auditRuns.filter { $0.command.localizedCaseInsensitiveContains("restore") }
+        }
+    }
+
+    var protectedPaths: [String] {
+        configArray(key: "keep_paths")
     }
 
     func bootstrap() async {
@@ -118,11 +166,64 @@ final class AppModel: ObservableObject {
     }
 
     func setScanRoot(path: String, persist: Bool = true) {
-        preferences.scanRootPath = normalizedScanRootPath(path)
+        let normalized = normalizedScanRootPath(path)
+        preferences.scanRootPath = normalized
+        if preferences.scanRoots.isEmpty {
+            preferences.scanRoots = [normalized]
+        } else {
+            preferences.scanRoots[0] = normalized
+        }
         scanStatusMessage = "Ready to scan \(scanRootDisplayName)."
         if persist {
             Task { await saveConfig(showAlert: false) }
         }
+    }
+
+    func addScanRoot() {
+        let panel = NSOpenPanel()
+        panel.title = "Add Scan Root"
+        panel.prompt = "Add Path"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let path = normalizedScanRootPath(url.path)
+        if !activeScanRoots.contains(path) {
+            preferences.scanRoots.append(path)
+            preferences.scanRootPath = activeScanRoots.first ?? path
+            Task { await saveConfig(showAlert: false) }
+        }
+    }
+
+    func removeScanRoot(_ path: String) {
+        let normalized = normalizedScanRootPath(path)
+        preferences.scanRoots = activeScanRoots.filter { $0 != normalized }
+        if preferences.scanRoots.isEmpty {
+            preferences.scanRoots = [FileManager.default.homeDirectoryForCurrentUser.path]
+        }
+        preferences.scanRootPath = preferences.scanRoots[0]
+        Task { await saveConfig(showAlert: false) }
+    }
+
+    func addProtectedFolder() {
+        let panel = NSOpenPanel()
+        panel.title = "Add Protection Rule"
+        panel.prompt = "Protect Folder"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        appendConfigValue(url.path, toArrayKey: "keep_paths")
+        Task { await saveConfig(showAlert: false) }
+    }
+
+    func removeProtectedPath(_ path: String) {
+        removeConfigValue(path, fromArrayKey: "keep_paths")
+        Task { await saveConfig(showAlert: false) }
     }
 
     func smartScan() async {
@@ -137,8 +238,15 @@ final class AppModel: ObservableObject {
         selectedSection = .scanResults
 
         do {
-            try await bridge.run(arguments: ["scan", root, "--depth", "4", "--max-risk", "all"]) { [weak self] event in
-                self?.handle(event)
+            let roots = activeScanRoots
+            for (index, root) in roots.enumerated() {
+                guard !Task.isCancelled else { throw CancellationError() }
+                scanStatusMessage = roots.count > 1
+                    ? "Scanning \(DevCleanerFormatters.shortPath(root)) (\(index + 1)/\(roots.count))..."
+                    : "Scanning \(DevCleanerFormatters.shortPath(root))..."
+                try await bridge.run(arguments: ["scan", root, "--depth", "4", "--max-risk", "all"]) { [weak self] event in
+                    self?.handle(event)
+                }
             }
             scanStatusMessage = "Scan complete."
         } catch is CancellationError {
@@ -200,8 +308,22 @@ final class AppModel: ObservableObject {
             try await bridge.run(arguments: ["trash", "list"]) { [weak self] event in
                 self?.handle(event)
             }
+            if selectedTrashBatchID == nil {
+                selectedTrashBatchID = trashBatches.first?.batchId
+            }
         } catch {
             alert = AppAlert(title: "Trash Refresh Failed", message: error.localizedDescription)
+        }
+    }
+
+    func showTrashEntries(batch: TrashBatch) async {
+        selectedTrashBatchID = batch.batchId
+        do {
+            try await bridge.run(arguments: ["trash", "show", "--batch", batch.batchId]) { [weak self] event in
+                self?.handle(event)
+            }
+        } catch {
+            alert = AppAlert(title: "Trash Details Failed", message: error.localizedDescription)
         }
     }
 
@@ -227,6 +349,12 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func emptyTrash() async {
+        for batch in trashBatches {
+            await purge(batch: batch)
+        }
+    }
+
     func refreshAudit() async {
         do {
             try await bridge.run(arguments: ["audit", "list"]) { [weak self] event in
@@ -234,6 +362,28 @@ final class AppModel: ObservableObject {
             }
         } catch {
             alert = AppAlert(title: "Audit Refresh Failed", message: error.localizedDescription)
+        }
+    }
+
+    func exportAuditCSV() async {
+        let panel = NSSavePanel()
+        panel.title = "Export Audit CSV"
+        panel.nameFieldStringValue = "dev-cleaner-audit.csv"
+        panel.allowedContentTypes = [.commaSeparatedText]
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            var csv = ""
+            try await bridge.run(arguments: ["audit", "export", "--format", "csv"]) { event in
+                if case .auditExport(let payload) = event {
+                    csv = payload.string(path: ["content"]) ?? ""
+                }
+            }
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+            alert = AppAlert(title: "Audit Exported", message: url.path)
+        } catch {
+            alert = AppAlert(title: "Export Failed", message: error.localizedDescription)
         }
     }
 
@@ -270,6 +420,13 @@ final class AppModel: ObservableObject {
         cleanupMode = mode
         cleanupProgress = 0
         cleanupLog.removeAll()
+        cleanupTotalCount = selectedProjects.count
+        cleanupProcessedCount = 0
+        cleanupSucceededCount = 0
+        cleanupSkippedCount = 0
+        cleanupFailedCount = 0
+        cleanupCurrentPath = nil
+        showCleanupSummary = false
         lastSummary = nil
         selectedSection = .scanResults
         let cancel = FileManager.default.temporaryDirectory.appendingPathComponent("dev-cleaner-cancel-\(UUID().uuidString)")
@@ -327,23 +484,38 @@ final class AppModel: ObservableObject {
         case .recommendation(let payload):
             recommendation = RecommendationPreview(payload: payload)
         case .cleanupStarted(let totalCount, let totalBytes, let mode):
+            cleanupTotalCount = totalCount
+            cleanupProcessedCount = 0
+            cleanupSucceededCount = 0
+            cleanupSkippedCount = 0
+            cleanupFailedCount = 0
             cleanupProgress = 0
             cleanupLog.append("> \(mode) started for \(totalCount) items, \(DevCleanerFormatters.bytes(totalBytes))")
         case .cleanupProject(let path, _):
+            cleanupCurrentPath = path
             cleanupLog.append("> Processing \(DevCleanerFormatters.shortPath(path))")
         case .cleanupDryRun(let path, let action, _):
+            cleanupSucceededCount += 1
+            advanceCleanupProgress()
             cleanupLog.append("[dry-run] \(action) \(DevCleanerFormatters.shortPath(path))")
         case .cleanupSkipped(let path, let reason, _):
+            cleanupSkippedCount += 1
+            advanceCleanupProgress()
             cleanupLog.append("[skipped:\(reason)] \(DevCleanerFormatters.shortPath(path))")
         case .cleanupCompleted(let path, _):
+            cleanupSucceededCount += 1
+            advanceCleanupProgress()
             cleanupLog.append("[success] \(DevCleanerFormatters.shortPath(path))")
         case .cleanupFailed(let path, let error):
+            cleanupFailedCount += 1
+            advanceCleanupProgress()
             cleanupLog.append("[failed] \(DevCleanerFormatters.shortPath(path)): \(error)")
         case .cleanupCancelled:
             cleanupLog.append("> Cleanup cancelled.")
         case .cleanupFinished(let payload):
             cleanupProgress = 1
             lastSummary = CleanupSummary(payload: payload)
+            showCleanupSummary = true
             selectedSection = .dashboard
             Task {
                 await refreshTrash()
@@ -351,6 +523,9 @@ final class AppModel: ObservableObject {
             }
         case .trashList(let payload):
             trashBatches = payload.decodePayloadArray(path: ["batches"], as: TrashBatch.self)
+            if let selectedTrashBatchID, !trashBatches.contains(where: { $0.batchId == selectedTrashBatchID }) {
+                self.selectedTrashBatchID = trashBatches.first?.batchId
+            }
         case .trashEntries(let payload):
             trashEntries = payload.decodePayloadArray(path: ["entries"], as: TrashEntry.self)
         case .auditList(let payload):
@@ -364,6 +539,69 @@ final class AppModel: ObservableObject {
             alert = AppAlert(title: "Bridge Error", message: message)
         default:
             break
+        }
+    }
+
+    private func advanceCleanupProgress() {
+        cleanupProcessedCount = cleanupSucceededCount + cleanupSkippedCount + cleanupFailedCount
+        cleanupProgress = cleanupTotalCount == 0 ? 0 : min(Double(cleanupProcessedCount) / Double(cleanupTotalCount), 1)
+    }
+
+    private func configArray(key: String) -> [String] {
+        guard let value = configSnapshot?.config.value(at: [key]),
+              case .array(let values) = value else {
+            return []
+        }
+        return values.compactMap { value in
+            if case .string(let string) = value { return string }
+            return nil
+        }
+    }
+
+    private func appendConfigValue(_ value: String, toArrayKey key: String) {
+        guard var snapshot = configSnapshot else { return }
+        var object: [String: JSONValue]
+        if case .object(let existing) = snapshot.config {
+            object = existing
+        } else {
+            object = [:]
+        }
+        var values = configArray(key: key)
+        if !values.contains(value) {
+            values.append(value)
+        }
+        object[key] = .array(values.map(JSONValue.string))
+        snapshot.config = .object(object)
+        configSnapshot = snapshot
+    }
+
+    private func removeConfigValue(_ value: String, fromArrayKey key: String) {
+        guard var snapshot = configSnapshot else { return }
+        var object: [String: JSONValue]
+        if case .object(let existing) = snapshot.config {
+            object = existing
+        } else {
+            object = [:]
+        }
+        object[key] = .array(configArray(key: key).filter { $0 != value }.map(JSONValue.string))
+        snapshot.config = .object(object)
+        configSnapshot = snapshot
+    }
+}
+
+enum AuditFilter: String, CaseIterable, Identifiable {
+    case all
+    case last30Days
+    case cleanup
+    case restore
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: "All Actions"
+        case .last30Days: "Last 30 Days"
+        case .cleanup: "Cleanup"
+        case .restore: "Restore"
         }
     }
 }

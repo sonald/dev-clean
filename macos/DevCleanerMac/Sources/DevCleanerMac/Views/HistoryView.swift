@@ -6,9 +6,10 @@ struct HistoryView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            DCTopBar {
                 Text("History & Audit")
-                    .font(.title2.bold())
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(DCColor.secondary)
                 Spacer()
                 TextField("Search by batch ID or type...", text: $query)
                     .textFieldStyle(.plain)
@@ -18,13 +19,34 @@ struct HistoryView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     .frame(width: 260)
                 Button {
+                    Task { await model.exportAuditCSV() }
+                } label: {
+                    Label("Export CSV", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(SecondaryButtonStyle())
+                Button {
                     Task { await model.refreshAudit() }
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(SecondaryButtonStyle())
             }
-            .padding(20)
+
+            HStack {
+                Picker("Audit Filter", selection: $model.auditFilter) {
+                    ForEach(AuditFilter.allCases) { filter in
+                        Text(filter.title).tag(filter)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 360)
+                Spacer()
+                Text("Showing \(filteredRuns.count) entries")
+                    .font(.caption)
+                    .foregroundStyle(DCColor.tertiary)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
 
             Table(filteredRuns) {
                 TableColumn("BATCH ID / TYPE") { run in
@@ -51,7 +73,8 @@ struct HistoryView: View {
     }
 
     private var filteredRuns: [AuditRun] {
-        guard !query.isEmpty else { return model.auditRuns }
-        return model.auditRuns.filter { $0.runId.localizedCaseInsensitiveContains(query) || $0.command.localizedCaseInsensitiveContains(query) }
+        let runs = model.filteredAuditRuns
+        guard !query.isEmpty else { return runs }
+        return runs.filter { $0.runId.localizedCaseInsensitiveContains(query) || $0.command.localizedCaseInsensitiveContains(query) }
     }
 }

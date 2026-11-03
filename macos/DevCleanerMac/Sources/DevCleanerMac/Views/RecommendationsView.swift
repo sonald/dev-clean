@@ -7,15 +7,11 @@ struct RecommendationsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Smart Recommendations")
-                            .font(.title2.bold())
-                        Text("Configure cleanup parameters to generate a targeted optimization plan.")
-                            .foregroundStyle(DCColor.secondary)
-                    }
-                    Spacer()
+            VStack(alignment: .leading, spacing: 22) {
+                DCPageHeader(
+                    title: "Smart Recommendations",
+                    subtitle: "Configure your cleanup parameters to generate a targeted optimization plan."
+                ) {
                     Button {
                         Task { await model.generateRecommendation(strategy: strategy, target: target) }
                     } label: {
@@ -24,46 +20,80 @@ struct RecommendationsView: View {
                     .buttonStyle(PrimaryButtonStyle())
                 }
 
-                HStack(alignment: .top, spacing: 18) {
+                HStack(alignment: .top, spacing: 20) {
                     DCCard {
-                        VStack(alignment: .leading, spacing: 14) {
-                            Text("Target Space to Release").font(.headline)
-                            TextField("10GB", text: $target)
-                                .textFieldStyle(.roundedBorder)
-                            Text("Cleanup Strategy").font(.headline)
-                            Picker("Strategy", selection: $strategy) {
-                                Text("Safe").tag("safe")
-                                Text("Balanced").tag("balanced")
-                                Text("Maximum").tag("maximum")
+                        VStack(alignment: .leading, spacing: 28) {
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Target Space to Release").font(.headline)
+                                Text("Set the minimum amount of disk space you wish to recover.")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(DCColor.secondary)
+                                HStack(spacing: 8) {
+                                    TextField("10GB", text: $target)
+                                        .textFieldStyle(.plain)
+                                        .font(.system(size: 26, weight: .bold, design: .monospaced))
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 10)
+                                        .background(DCColor.elevated)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                        .frame(width: 150)
+                                    Text("Available: 42.8 GB")
+                                        .font(.caption)
+                                        .foregroundStyle(DCColor.tertiary)
+                                }
                             }
-                            .pickerStyle(.segmented)
-                            StrategyDescription(strategy: strategy)
+
+                            VStack(alignment: .leading, spacing: 12) {
+                                Text("Cleanup Strategy").font(.headline)
+                                Text("Select the aggressiveness of the cleanup algorithm.")
+                                    .font(.system(size: 13))
+                                    .foregroundStyle(DCColor.secondary)
+                                HStack(spacing: 10) {
+                                    StrategyCard(id: "safe", title: "Safe", subtitle: "Verified safe-to-delete system logs and basic caches.", selection: $strategy)
+                                    StrategyCard(id: "balanced", title: "Balanced", subtitle: "Includes unneeded build artifacts and older derived data.", selection: $strategy)
+                                    StrategyCard(id: "maximum", title: "Maximum", subtitle: "Aggressive cleanup including all local caches and archives.", selection: $strategy)
+                                }
+                            }
                         }
                     }
-                    .frame(width: 360)
+                    .frame(minWidth: 520)
 
                     DCCard {
-                        VStack(alignment: .leading, spacing: 16) {
-                            Text("Plan Preview")
-                                .font(.headline)
+                        VStack(alignment: .leading, spacing: 18) {
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Plan Preview")
+                                        .font(.headline)
+                                    Text("BASED ON '\(strategy.uppercased())' STRATEGY")
+                                        .font(.caption.bold())
+                                        .foregroundStyle(DCColor.secondary)
+                                }
+                                Spacer()
+                                VStack(alignment: .trailing, spacing: 3) {
+                                    Text(DevCleanerFormatters.bytes(model.recommendation?.selectedBytes ?? 0))
+                                        .font(.system(size: 13, design: .monospaced))
+                                        .foregroundStyle(DCColor.indigo)
+                                    Text("EST. RECOVERY")
+                                        .font(.caption2)
+                                        .foregroundStyle(DCColor.tertiary)
+                                }
+                            }
                             if let preview = model.recommendation {
-                                Text("BASED ON '\(preview.strategy.uppercased())' STRATEGY")
-                                    .font(.caption.bold())
-                                    .foregroundStyle(DCColor.secondary)
-                                Text(DevCleanerFormatters.bytes(preview.selectedBytes))
-                                    .font(.system(size: 36, weight: .bold))
-                                    .foregroundStyle(DCColor.green)
-                                Text("\(preview.selectedCount) selected items")
-                                    .foregroundStyle(DCColor.secondary)
-                                Divider().overlay(DCColor.border)
                                 ForEach(preview.projects.prefix(6)) { project in
                                     HStack {
                                         Text(project.displayName)
+                                            .foregroundStyle(project.skipReason == nil ? DCColor.text : DCColor.tertiary)
                                         Spacer()
                                         Text(DevCleanerFormatters.bytes(project.size))
+                                            .font(.system(size: 12, design: .monospaced))
                                             .foregroundStyle(DCColor.secondary)
                                     }
                                 }
+                                Divider().overlay(DCColor.border)
+                                DrivePreviewBar(fraction: preview.selectedBytes == 0 ? 0 : min(Double(preview.selectedBytes) / Double(512 * 1024 * 1024 * 1024), 0.35))
+                                Text("\(preview.selectedCount) items selected. Highlighted segment represents space to be freed.")
+                                    .font(.caption)
+                                    .foregroundStyle(DCColor.secondary)
                                 HStack {
                                     Spacer()
                                     Button {
@@ -77,9 +107,11 @@ struct RecommendationsView: View {
                             } else {
                                 Text("No plan generated yet.")
                                     .foregroundStyle(DCColor.secondary)
+                                DrivePreviewBar(fraction: 0.08)
                             }
                         }
                     }
+                    .frame(width: 420)
                 }
             }
             .padding(24)
@@ -88,16 +120,59 @@ struct RecommendationsView: View {
     }
 }
 
-private struct StrategyDescription: View {
-    var strategy: String
+private struct StrategyCard: View {
+    var id: String
+    var title: String
+    var subtitle: String
+    @Binding var selection: String
+
     var body: some View {
-        let copy = switch strategy {
-        case "safe": "Verified safe-to-delete caches and low-risk build products."
-        case "maximum": "Aggressive cleanup including larger local caches and archives."
-        default: "Includes unneeded build artifacts and older dependency directories."
+        let selected = selection == id
+        Button {
+            selection = id
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title)
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(selected ? DCColor.text : DCColor.secondary)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(selected ? DCColor.indigo.opacity(0.8) : DCColor.tertiary)
+                    .lineLimit(3)
+            }
+            .frame(maxWidth: .infinity, minHeight: 86, alignment: .topLeading)
+            .padding(12)
+            .background(selected ? DCColor.blue.opacity(0.16) : DCColor.elevated)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(selected ? DCColor.blue.opacity(0.55) : DCColor.border)
+            )
         }
-        Text(copy)
-            .font(.callout)
-            .foregroundStyle(DCColor.secondary)
+        .buttonStyle(.plain)
+    }
+}
+
+private struct DrivePreviewBar: View {
+    var fraction: Double
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("DRIVE CAPACITY (512 GB)")
+                Spacer()
+                Text("65% USED")
+            }
+            .font(.caption2.bold())
+            .foregroundStyle(DCColor.tertiary)
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(DCColor.elevated)
+                    Capsule().fill(DCColor.blue.opacity(0.55)).frame(width: proxy.size.width * 0.65)
+                    Capsule().fill(DCColor.indigo).frame(width: proxy.size.width * fraction).offset(x: proxy.size.width * 0.65)
+                }
+            }
+            .frame(height: 12)
+        }
     }
 }

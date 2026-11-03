@@ -118,22 +118,48 @@ struct AuditRun: Codable, Identifiable, Hashable {
 struct GuiPreferences: Codable, Equatable {
     var appearance: String = "dark"
     var scanRootPath: String = FileManager.default.homeDirectoryForCurrentUser.path
+    var scanRoots: [String] = [FileManager.default.homeDirectoryForCurrentUser.path]
+    var followSymlinks: Bool = false
+    var ignoreHiddenDirs: Bool = false
     var launchAtLogin: Bool = false
     var showMenubarIcon: Bool = true
     var alertsEnabled: Bool = false
+    var alertBeforeLargeCleanup: Bool = true
+    var alertAfterCleanup: Bool = true
+    var alertForProtectedSkips: Bool = true
     var notificationThresholdGb: UInt64 = 1
     var trashRetentionDays: Int = 30
     var trashLimitGb: UInt64 = 10
+    var autoGcTrash: Bool = true
+    var protectRecentFiles: Bool = false
+    var protectRecentDays: Int = 7
+    var protectLargeFiles: Bool = false
+    var protectLargeFileGb: UInt64 = 1
+    var protectHighRiskItems: Bool = true
+    var verifyFileSignatures: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case appearance
         case scanRootPath = "scan_root_path"
+        case scanRoots = "scan_roots"
+        case followSymlinks = "follow_symlinks"
+        case ignoreHiddenDirs = "ignore_hidden_dirs"
         case launchAtLogin = "launch_at_login"
         case showMenubarIcon = "show_menubar_icon"
         case alertsEnabled = "alerts_enabled"
+        case alertBeforeLargeCleanup = "alert_before_large_cleanup"
+        case alertAfterCleanup = "alert_after_cleanup"
+        case alertForProtectedSkips = "alert_for_protected_skips"
         case notificationThresholdGb = "notification_threshold_gb"
         case trashRetentionDays = "trash_retention_days"
         case trashLimitGb = "trash_limit_gb"
+        case autoGcTrash = "auto_gc_trash"
+        case protectRecentFiles = "protect_recent_files"
+        case protectRecentDays = "protect_recent_days"
+        case protectLargeFiles = "protect_large_files"
+        case protectLargeFileGb = "protect_large_file_gb"
+        case protectHighRiskItems = "protect_high_risk_items"
+        case verifyFileSignatures = "verify_file_signatures"
     }
 
     init() {}
@@ -143,12 +169,28 @@ struct GuiPreferences: Codable, Equatable {
         appearance = try container.decodeIfPresent(String.self, forKey: .appearance) ?? "dark"
         scanRootPath = try container.decodeIfPresent(String.self, forKey: .scanRootPath)
             ?? FileManager.default.homeDirectoryForCurrentUser.path
+        scanRoots = try container.decodeIfPresent([String].self, forKey: .scanRoots) ?? [scanRootPath]
+        if scanRoots.isEmpty {
+            scanRoots = [scanRootPath]
+        }
+        followSymlinks = try container.decodeIfPresent(Bool.self, forKey: .followSymlinks) ?? false
+        ignoreHiddenDirs = try container.decodeIfPresent(Bool.self, forKey: .ignoreHiddenDirs) ?? false
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         showMenubarIcon = try container.decodeIfPresent(Bool.self, forKey: .showMenubarIcon) ?? true
         alertsEnabled = try container.decodeIfPresent(Bool.self, forKey: .alertsEnabled) ?? false
+        alertBeforeLargeCleanup = try container.decodeIfPresent(Bool.self, forKey: .alertBeforeLargeCleanup) ?? true
+        alertAfterCleanup = try container.decodeIfPresent(Bool.self, forKey: .alertAfterCleanup) ?? true
+        alertForProtectedSkips = try container.decodeIfPresent(Bool.self, forKey: .alertForProtectedSkips) ?? true
         notificationThresholdGb = try container.decodeIfPresent(UInt64.self, forKey: .notificationThresholdGb) ?? 1
         trashRetentionDays = try container.decodeIfPresent(Int.self, forKey: .trashRetentionDays) ?? 30
         trashLimitGb = try container.decodeIfPresent(UInt64.self, forKey: .trashLimitGb) ?? 10
+        autoGcTrash = try container.decodeIfPresent(Bool.self, forKey: .autoGcTrash) ?? true
+        protectRecentFiles = try container.decodeIfPresent(Bool.self, forKey: .protectRecentFiles) ?? false
+        protectRecentDays = try container.decodeIfPresent(Int.self, forKey: .protectRecentDays) ?? 7
+        protectLargeFiles = try container.decodeIfPresent(Bool.self, forKey: .protectLargeFiles) ?? false
+        protectLargeFileGb = try container.decodeIfPresent(UInt64.self, forKey: .protectLargeFileGb) ?? 1
+        protectHighRiskItems = try container.decodeIfPresent(Bool.self, forKey: .protectHighRiskItems) ?? true
+        verifyFileSignatures = try container.decodeIfPresent(Bool.self, forKey: .verifyFileSignatures) ?? true
     }
 }
 
@@ -187,6 +229,10 @@ enum AppSection: String, CaseIterable, Identifiable {
     case settings
 
     var id: String { rawValue }
+    static var sidebarSections: [AppSection] {
+        [.dashboard, .scanResults, .trash, .history, .settings]
+    }
+
     var title: String {
         switch self {
         case .dashboard: "Dashboard"

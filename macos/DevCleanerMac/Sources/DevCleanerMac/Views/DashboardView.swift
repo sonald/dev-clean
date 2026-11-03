@@ -5,15 +5,11 @@ struct DashboardView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("System Overview")
-                            .font(.system(size: 22, weight: .bold))
-                        Text("Your development environment has \(DevCleanerFormatters.bytes(model.totalCleanableBytes)) of cleanable space.")
-                            .foregroundStyle(DCColor.secondary)
-                    }
-                    Spacer()
+            VStack(alignment: .leading, spacing: 22) {
+                DCPageHeader(
+                    title: "System Overview",
+                    subtitle: "Your development environment has \(DevCleanerFormatters.bytes(model.totalCleanableBytes)) of cleanable space."
+                ) {
                     Button {
                         if model.isScanning {
                             model.stopScan()
@@ -25,7 +21,6 @@ struct DashboardView: View {
                     }
                     .buttonStyle(PrimaryButtonStyle(color: model.isScanning ? DCColor.red : DCColor.blue))
                 }
-                .foregroundStyle(DCColor.text)
 
                 DCCard {
                     HStack(spacing: 12) {
@@ -61,23 +56,22 @@ struct DashboardView: View {
 
                 HStack(spacing: 16) {
                     DCCard {
-                        VStack(alignment: .leading, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 18) {
                             HStack {
                                 Text("Macintosh HD")
-                                    .font(.headline)
+                                    .font(.system(size: 18, weight: .semibold))
                                 Spacer()
-                                Text("Cleanable")
-                                    .foregroundStyle(DCColor.secondary)
+                                Text("500 GB Total")
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(DCColor.tertiary)
                             }
-                            ProgressView(value: min(Double(model.totalCleanableBytes) / Double(500 * 1024 * 1024 * 1024), 1))
-                                .tint(DCColor.green)
+                            StorageBar(cleanableBytes: model.totalCleanableBytes)
                             HStack {
-                                Label("Scanned items \(model.projects.count)", systemImage: "folder")
+                                LegendDot(title: "Used", color: DCColor.blue)
+                                LegendDot(title: "Cleanable", color: DCColor.green)
+                                LegendDot(title: "Free", color: DCColor.tertiary)
                                 Spacer()
-                                Label("Selected \(DevCleanerFormatters.bytes(model.selectedBytes))", systemImage: "checkmark.circle")
                             }
-                            .font(.caption)
-                            .foregroundStyle(DCColor.secondary)
                         }
                     }
                     DCCard {
@@ -94,6 +88,29 @@ struct DashboardView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .frame(width: 280)
+                }
+
+                DCCard {
+                    HStack(spacing: 18) {
+                        Image(systemName: "sparkles")
+                            .foregroundStyle(DCColor.indigo)
+                            .frame(width: 38, height: 38)
+                            .background(DCColor.indigo.opacity(0.16))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Smart Recommendations")
+                                .font(.headline)
+                            Text("Generate a targeted cleanup plan from the current scan root and safety policy.")
+                                .foregroundStyle(DCColor.secondary)
+                        }
+                        Spacer()
+                        Button {
+                            model.selectedSection = .recommendations
+                        } label: {
+                            Label("Configure Plan", systemImage: "arrow.right")
+                        }
+                        .buttonStyle(SecondaryButtonStyle())
+                    }
                 }
 
                 if let summary = model.lastSummary {
@@ -113,6 +130,43 @@ struct DashboardView: View {
             .padding(24)
         }
         .foregroundStyle(DCColor.text)
+    }
+}
+
+private struct StorageBar: View {
+    var cleanableBytes: UInt64
+
+    var body: some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            ZStack(alignment: .leading) {
+                Capsule().fill(DCColor.tertiary.opacity(0.30))
+                Capsule()
+                    .fill(DCColor.blue)
+                    .frame(width: width * 0.55)
+                Capsule()
+                    .fill(DCColor.green)
+                    .frame(width: max(10, width * min(Double(cleanableBytes) / Double(500 * 1024 * 1024 * 1024), 0.25)))
+                    .offset(x: width * 0.55)
+            }
+        }
+        .frame(height: 16)
+    }
+}
+
+private struct LegendDot: View {
+    var title: String
+    var color: Color
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(title)
+                .font(.system(size: 13))
+                .foregroundStyle(DCColor.secondary)
+        }
     }
 }
 

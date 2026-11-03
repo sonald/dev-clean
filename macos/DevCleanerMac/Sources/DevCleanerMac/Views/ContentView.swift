@@ -11,6 +11,14 @@ struct ContentView: View {
             ZStack {
                 DCColor.window.ignoresSafeArea()
                 currentSection
+                if model.isCleaning {
+                    CleanupProgressOverlay()
+                        .environmentObject(model)
+                }
+                if model.showCleanupSummary, let summary = model.lastSummary {
+                    CleanupSummaryOverlay(summary: summary)
+                        .environmentObject(model)
+                }
             }
         }
         .background(DCColor.window)

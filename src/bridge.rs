@@ -381,18 +381,44 @@ pub struct GuiPreferences {
     pub appearance: String,
     #[serde(default = "default_scan_root_path")]
     pub scan_root_path: String,
+    #[serde(default = "default_scan_roots")]
+    pub scan_roots: Vec<String>,
+    #[serde(default)]
+    pub follow_symlinks: bool,
+    #[serde(default)]
+    pub ignore_hidden_dirs: bool,
     #[serde(default)]
     pub launch_at_login: bool,
     #[serde(default = "default_true")]
     pub show_menubar_icon: bool,
     #[serde(default)]
     pub alerts_enabled: bool,
+    #[serde(default = "default_true")]
+    pub alert_before_large_cleanup: bool,
+    #[serde(default = "default_true")]
+    pub alert_after_cleanup: bool,
+    #[serde(default = "default_true")]
+    pub alert_for_protected_skips: bool,
     #[serde(default)]
     pub notification_threshold_gb: u64,
     #[serde(default = "default_trash_retention_days")]
     pub trash_retention_days: i64,
     #[serde(default = "default_trash_limit_gb")]
     pub trash_limit_gb: u64,
+    #[serde(default = "default_true")]
+    pub auto_gc_trash: bool,
+    #[serde(default)]
+    pub protect_recent_files: bool,
+    #[serde(default = "default_recent_protection_days")]
+    pub protect_recent_days: i64,
+    #[serde(default)]
+    pub protect_large_files: bool,
+    #[serde(default = "default_large_file_gb")]
+    pub protect_large_file_gb: u64,
+    #[serde(default = "default_true")]
+    pub protect_high_risk_items: bool,
+    #[serde(default = "default_true")]
+    pub verify_file_signatures: bool,
 }
 
 impl Default for GuiPreferences {
@@ -400,12 +426,25 @@ impl Default for GuiPreferences {
         Self {
             appearance: default_appearance(),
             scan_root_path: default_scan_root_path(),
+            scan_roots: default_scan_roots(),
+            follow_symlinks: false,
+            ignore_hidden_dirs: false,
             launch_at_login: false,
             show_menubar_icon: true,
             alerts_enabled: false,
+            alert_before_large_cleanup: true,
+            alert_after_cleanup: true,
+            alert_for_protected_skips: true,
             notification_threshold_gb: 1,
             trash_retention_days: default_trash_retention_days(),
             trash_limit_gb: default_trash_limit_gb(),
+            auto_gc_trash: true,
+            protect_recent_files: false,
+            protect_recent_days: default_recent_protection_days(),
+            protect_large_files: false,
+            protect_large_file_gb: default_large_file_gb(),
+            protect_high_risk_items: true,
+            verify_file_signatures: true,
         }
     }
 }
@@ -421,6 +460,10 @@ fn default_scan_root_path() -> String {
         .to_string()
 }
 
+fn default_scan_roots() -> Vec<String> {
+    vec![default_scan_root_path()]
+}
+
 fn default_true() -> bool {
     true
 }
@@ -431,6 +474,14 @@ fn default_trash_retention_days() -> i64 {
 
 fn default_trash_limit_gb() -> u64 {
     10
+}
+
+fn default_recent_protection_days() -> i64 {
+    7
+}
+
+fn default_large_file_gb() -> u64 {
+    1
 }
 
 pub fn run_bridge(command: BridgeCommands, config: &Config, config_path: PathBuf) -> Result<()> {
