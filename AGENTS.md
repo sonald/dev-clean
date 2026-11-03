@@ -9,8 +9,9 @@ Dev Cleaner (`dev-cleaner`) is a Rust-based CLI/TUI tool for scanning and cleani
 - Intelligent deduplication (only report top-level cleanable targets)
 - Streaming scan mode (fast discovery + parallel size calculation)
 - Rule attribution (`--explain`) with category/risk/confidence metadata
-- Undoable trash batches (`--trash`, `undo`, `trash ...`)
+- Undoable trash batches: `clean`/`apply`/TUI move targets into Dev Cleaner's trash by default (`--permanent` deletes); `undo`, `trash ...`
 - Plan/recommend/apply workflow for machine-readable cleanups
+- A SwiftUI macOS app (`macos/DevCleanerMac`) that drives the same core through `dev-cleaner bridge` (JSONL events)
 
 ## Build & Development Commands
 
@@ -26,8 +27,9 @@ cargo run -- scan . --depth 2
 # Run (release artifact)
 ./target/release/dev-cleaner --help
 
-# Tests
-cargo test
+# Tests (plain `cargo test` only runs the root package and skips dev-cleaner-core)
+cargo test --workspace
+(cd macos/DevCleanerMac && swift test)
 
 # Optional hygiene
 cargo fmt
@@ -35,6 +37,14 @@ cargo clippy --all-targets --all-features
 ```
 
 ## Quick Manual Testing (Local)
+
+Commands below write to the real trash, audit log and config. Isolate experiments the way
+`tests/cli_flows.rs` does (Linux reads the XDG variables before `HOME`):
+
+```bash
+T=$(mktemp -d)
+HOME=$T XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data DEV_CLEANER_TRASH_DIR=$T/trash cargo run -- ...
+```
 
 ```bash
 # Scan with streaming progress (default risk filter is --max-risk medium)
@@ -46,8 +56,8 @@ cargo run -- scan . --depth 2 --max-risk high
 # Dry-run clean (never deletes)
 cargo run -- clean . --depth 2 --dry-run
 
-# Trash mode (undoable) + show latest batch
-cargo run -- clean . --depth 2 --trash --auto
+# Clean moves to trash by default (undoable) + show latest batch
+cargo run -- clean . --depth 2 --auto
 cargo run -- trash list --top 5
 
 # Plan -> Apply workflow
@@ -56,7 +66,7 @@ cargo run -- apply plan.json --dry-run
 
 # Goal-based recommendation (does not delete), then apply
 cargo run -- recommend . --cleanup 1GB --output-plan plan.json
-cargo run -- apply plan.json --trash
+cargo run -- apply plan.json
 
 # Undo last trash batch (if any)
 cargo run -- undo
@@ -77,13 +87,21 @@ cargo run -- undo
 - `crates/dev-cleaner-core/src/stats/mod.rs`: aggregates scan results and JSON export data
 - `crates/dev-cleaner-core/src/app/`: reusable Rust service layer for scan, cleanup selection, and plan application
 - `src/cli/mod.rs`: clap CLI wiring and terminal rendering for all commands/subcommands
+- `src/bridge.rs`: `dev-cleaner bridge ...` JSONL protocol and GUI preferences used by the macOS app
+- `macos/DevCleanerMac/`: SwiftUI app (`Stores/AppModel.swift` state, `Services/BridgeClient.swift` process bridge)
 - `src/tui/`: ratatui interactive UI
 - `src/stats/mod.rs`: terminal table/chart rendering for statistics
-- `src/clean_progress.rs`: terminal observers for cleanup/restore progress
+- `src/clean_progress.rs`: terminal observers for cleanup/restore progress, plus `AuditedCleanObserver` (per-item audit results)
 - `crates/dev-cleaner-core/src/utils.rs`: formatting and parsing utilities (e.g., human sizes like `10GB`)
 - `crates/dev-cleaner-core/src/config/mod.rs`: TOML config (`exclude_dirs`, `custom_patterns`, defaults)
 
 ### Scan Pipeline (Regular vs Streaming)
+
+Both pipelines share these rules:
+- Scan roots are made absolute first (`ScanService::resolve_inputs`), so every path in output, plans, the trash log and the audit log is cwd-independent.
+- Traversal does not descend into hidden directories (except the scan root itself and hidden components named by `custom_patterns`, e.g. `.yarn`) or into `node_modules`.
+- A target that contains git-tracked files is treated as source and dropped (`ProjectDetector::contains_tracked_files`).
+- Sizes are allocated blocks (`st_blocks * 512`); hard links count only when every link is inside the target.
 
 `Scanner::scan()` (used by commands that need full results like `stats`):
 1. Traverse candidates via `ignore::WalkBuilder` (Ripgrep-style)
@@ -126,15 +144,16 @@ The CLI defaults to filtering at `--max-risk medium`, so deps and `.gitignore` d
 ### In-use Protection
 
 `ProjectDetector::is_in_use` flags projects as `in_use` by checking whether lock files were modified recently (within 7 days).
-- `clean`/`apply` skip `in_use` targets unless `--force` is provided.
+- `clean`/`apply` skip `in_use` targets unless `--include-in-use` (still asks) or `--force` (also skips confirmation) is provided.
 
 ### Trash System (Undoable Clean)
 
-When `--trash` is enabled (and not `--dry-run`), clean/apply moves directories into a per-run trash batch:
+Unless `--permanent` (or `--dry-run`) is given, clean/apply/TUI move directories into a per-run trash batch:
 - Root: `default_trash_root()` (override via `DEV_CLEANER_TRASH_DIR`)
+- Items on another volume go to `<mount point>/.dev-cleaner-trash/<batch>/`: trashing is always a same-volume rename, never a copy. purge/gc delete those folders too and fail (keeping the log) while the volume is unmounted
 - Each move appends a JSONL entry to `trash_log.jsonl`
-- `undo` restores a batch (defaults to latest)
-- `trash list/show/purge/gc` provides maintenance and cleanup
+- `undo` restores a batch (defaults to latest) and drops restored entries from the log
+- `trash list/show/purge/gc` provides maintenance and cleanup; read-only commands write no audit records
 
 ## Adding / Changing Detection Rules
 
@@ -158,3 +177,5 @@ Custom patterns allow naming a rule and scoping it via marker files (see `Custom
 - `.gitignore`-discovered candidates are intentionally `high` risk + `low` confidence; they won’t show up with the default `--max-risk medium`.
 - Deduplication must run before reporting results; without it you’ll get noisy nested matches (e.g., `.venv/.../__pycache__`).
 - `apply` is plan-driven: updating the plan schema requires bumping `CleanupPlan.schema_version` (`crates/dev-cleaner-core/src/plan.rs`).
+- Audit records must describe what happened: log per-item results from a `CleanObserver` (see `AuditedCleanObserver`), not a blanket status after the run.
+- The macOS app passes the same `--recent-days`/`--include-recent` to `apply` as to `scan`; otherwise items the user saw are skipped as recent.

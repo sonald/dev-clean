@@ -75,8 +75,9 @@
   - dry-run 汇总区分 "Would move to trash" 与 "Would free"。
 
 ### 阶段 6：工程
-- [ ] 6.1 CI：fmt、clippy、`cargo test --workspace`、`swift test`。
-- [ ] 6.2 AGENTS.md / README / spec 同步（测试命令、占位符、默认行为变更）。
+- [x] 6.1 CI：`.github/workflows/ci.yml`，Ubuntu + macOS 跑 fmt、clippy（暂不 `-D warnings`，存量 45 条）、`cargo test --workspace --locked`，macOS 跑 `swift test`。修复了只在 macOS 通过的 metrics 测试（写死 `Library/Application Support`，Linux 走 `XDG_CONFIG_HOME`）。已在 Linux 容器验证并模拟 runner 的共享 XDG 目录，无泄漏。
+- [x] 6.2 AGENTS.md / README / QUICKSTART / spec 同步（测试命令改为 `--workspace`、克隆地址占位符、默认移入回收站与新参数、剪枝/git 保护/占用块、按卷回收站、macOS App 与 bridge、过时的模块路径、最低 Rust 版本 1.85）。
 
 ### 阶段 7（可选）：全局开发缓存模块
 - [ ] 7.1 独立、默认关闭；覆盖 Xcode DerivedData、包管理器缓存等，优先调用官方清理命令。
+  - 本轮未做：需要先定范围（哪些缓存、是否只调官方命令），作为后续独立功能。

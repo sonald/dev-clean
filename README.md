@@ -13,13 +13,14 @@ Project homepage: <https://sonald.me/dev-clean/>
 - **.gitignore Discovery (Conservative)**: Reads project `.gitignore` to discover extra candidates, but treats them as high-risk by default unless explicitly included
 - **Intelligent Deduplication**: Automatically detects only top-level cleanable directories (e.g., reports `.venv` instead of hundreds of nested `__pycache__` directories)
 - **Two Modes**: CLI for quick operations, TUI for interactive selection
-- **Safe by Default**: Dry-run mode, confirmation prompts, in-use detection, and risk filtering (default: `--max-risk medium`)
+- **Safe by Default**: Moves to Dev Cleaner's undoable trash unless you pass `--permanent`; dry-run mode, confirmation prompts, in-use detection, risk filtering (default: `--max-risk medium`), and folders containing git-tracked files are never treated as targets
 - **Fast & Parallel**: Leverages Rust's performance and parallel processing with streaming
 - **Configurable**: Custom rules, filters, and exclusions
 - **Profiles**: Named scan profiles via `--profile` + `profile list/show/add/remove`
 - **Keep/Protect**: `.dev-cleaner-keep`, `.dev-cleaner-keep-patterns`, and config keep rules
 - **Audit Log**: JSONL operation audit + `audit list/show/export`
-- **Trash & GC**: Undoable trash batches + `trash list/show/purge/gc`
+- **Trash & GC**: Undoable trash batches (the default for `clean`, `apply` and the TUI) + `trash list/show/purge/gc`; items on other volumes stay on their own volume
+- **macOS App**: SwiftUI app in `macos/DevCleanerMac` built on the same core through `dev-cleaner bridge`
 - **Goal-based Recommend**: `recommend --cleanup 10GB` / `recommend --free-at-least 50GB` with optional `--output-plan`
 
 ## Supported Project Types
@@ -48,8 +49,8 @@ Project homepage: <https://sonald.me/dev-clean/>
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/dev-cleaner
-cd dev-cleaner
+git clone https://github.com/sonald/dev-clean
+cd dev-clean
 cargo build --release
 sudo cp target/release/dev-cleaner /usr/local/bin/
 ```
@@ -118,9 +119,9 @@ dev-cleaner clean --dry-run --share
 dev-cleaner scan --max-risk high
 dev-cleaner clean --max-risk high --auto
 
-# Recommend a cleanup plan (does not delete), then apply it
+# Recommend a cleanup plan (does not delete), then apply it (moves to trash)
 dev-cleaner recommend ~/projects --cleanup 10GB --output-plan plan.json
-dev-cleaner apply plan.json --trash
+dev-cleaner apply plan.json
 
 # Audit recent runs
 dev-cleaner audit list --top 10
@@ -161,11 +162,13 @@ Options:
   -d, --depth <DEPTH>           Maximum scan depth
   --min-size <MIN_SIZE>         Minimum size in MB
   --older-than <OLDER_THAN>     Older than N days
-  --dry-run                     Preview without deleting
-  --trash                       Move directories to Dev Cleaner's trash (undoable)
+  --dry-run                     Preview without changing anything
+  --permanent                   Delete permanently instead of moving to Dev Cleaner's trash (the default)
+  --trash                       Move to Dev Cleaner's trash (already the default; kept for compatibility)
   --share                       Print a copy-friendly share summary and log local share_generated event
-  --auto                        Skip interactive selection
-  -f, --force                   Skip all confirmations
+  -y, --auto, --yes             Skip selection and confirmation (in-use targets stay skipped)
+  --include-in-use              Also clean targets whose lock files changed recently (still asks)
+  -f, --force                   Skip all confirmations and clean in-use targets
   -v, --verbose                 Verbose output
   --gitignore                   Respect .gitignore files (default: false)
   --category <CATEGORY>         Filter by category (cache/build/deps/all)
@@ -202,16 +205,16 @@ Generate a machine-readable cleanup plan and apply it later:
 # Create a plan file
 dev-cleaner plan ~/projects --older-than 60 --min-size 500 -o plan.json
 
-# Apply the plan (with confirmation)
+# Apply the plan (with confirmation; moves to Dev Cleaner trash)
 dev-cleaner apply plan.json
 
-# Apply the plan but move to Dev Cleaner trash (undoable)
-dev-cleaner apply plan.json --trash
+# Delete permanently instead, without the prompt
+dev-cleaner apply plan.json --permanent --yes
 
 # Skip re-validation (not recommended)
 dev-cleaner apply plan.json --no-verify
 
-# Undo a trash batch (printed after clean/apply with --trash)
+# Undo a trash batch (the batch id is printed after clean/apply)
 dev-cleaner undo --batch <BATCH_ID>
 ```
 
@@ -253,7 +256,7 @@ Use a profile from any scan-like command:
 
 ```bash
 dev-cleaner scan --profile work
-dev-cleaner clean --profile work --auto --trash
+dev-cleaner clean --profile work --auto
 dev-cleaner recommend --profile work --cleanup 10GB --strategy balanced
 ```
 
@@ -460,11 +463,13 @@ The new streaming architecture provides:
 
 ## Safety Features
 
-1. **Dry Run**: Test commands with `--dry-run` before actual deletion
-2. **In-Use Detection**: Checks lock files to avoid cleaning active projects
-3. **Confirmation Prompts**: Interactive selection unless `--auto` is specified
-4. **Smart Scanning**: By default scans build directories even if gitignored (use `--gitignore` to respect .gitignore)
-5. **VCS Protection**: Never scans `.git`, `.svn`, `.hg` directories
+1. **Trash by Default**: `clean`, `apply` and the TUI move targets into Dev Cleaner's trash; `undo` restores them and `trash purge` frees the space. Use `--permanent` to delete directly
+2. **Dry Run**: Test commands with `--dry-run` before changing anything
+3. **In-Use Detection**: Checks lock files to avoid cleaning active projects
+4. **Confirmation Prompts**: Interactive selection unless `--auto`/`--yes` is specified
+5. **Source Protection**: Folders that contain git-tracked files are never treated as cleanable, and hidden folders or `node_modules` are not searched for nested projects
+6. **Smart Scanning**: By default scans build directories even if gitignored (use `--gitignore` to respect .gitignore)
+7. **VCS Protection**: Never scans `.git`, `.svn`, `.hg` directories
 
 > **Note**: By default, the tool does NOT respect `.gitignore` files, because the directories we want to clean (like `node_modules`, `target`) are typically gitignored. Use `--gitignore` flag if you want to skip gitignored directories.
 
@@ -472,21 +477,22 @@ The new streaming architecture provides:
 
 ### Requirements
 
-- Rust 1.70+
+- Rust 1.85+
 - Cargo
+- Swift 5.9+ (macOS app only)
 
 ### Build
 
 ```bash
 cargo build
-cargo test
 cargo run -- scan
 ```
 
 ### Run Tests
 
 ```bash
-cargo test
+cargo test --workspace                    # plain `cargo test` skips the dev-cleaner-core tests
+(cd macos/DevCleanerMac && swift test)    # macOS app
 ```
 
 ## License

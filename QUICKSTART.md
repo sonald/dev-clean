@@ -4,8 +4,8 @@
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
-cd dev-cleaner
+git clone https://github.com/sonald/dev-clean
+cd dev-clean
 
 # Build the project
 cargo build --release
@@ -59,8 +59,11 @@ dev-cleaner clean --dry-run
 # Preview and print a copy-friendly share summary
 dev-cleaner clean --dry-run --share
 
-# Move directories to Dev Cleaner trash (undoable)
-dev-cleaner clean --trash
+# Clean moves directories to Dev Cleaner trash (undoable) by default
+dev-cleaner clean
+
+# Delete permanently instead
+dev-cleaner clean --permanent
 
 # Interactive selection
 dev-cleaner clean
@@ -84,8 +87,8 @@ dev-cleaner plan ~/projects --older-than 60 --min-size 500 -o plan.json
 # Apply the plan later
 dev-cleaner apply plan.json
 
-# Apply but move to Dev Cleaner trash (undoable)
-dev-cleaner apply plan.json --trash
+# Apply and delete permanently instead of using the trash
+dev-cleaner apply plan.json --permanent
 
 # Skip plan re-validation (not recommended)
 dev-cleaner apply plan.json --no-verify
@@ -106,8 +109,8 @@ dev-cleaner recommend ~/projects --cleanup 10GB --strategy balanced
 # Or: ensure at least 50GB free
 dev-cleaner recommend ~/projects --free-at-least 50GB --output-plan plan.json
 
-# Apply the plan (optionally with trash)
-dev-cleaner apply plan.json --trash
+# Apply the plan (moves to Dev Cleaner trash)
+dev-cleaner apply plan.json
 ```
 
 ### 6. Trash management

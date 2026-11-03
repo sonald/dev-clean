@@ -10,6 +10,7 @@
 - 适用版本：`dev-cleaner` 当前代码基线（plan schema v3）
 - 目标平台：Linux、macOS（Windows 代码层面部分路径逻辑可兼容，但不是当前优先验证平台）
 - 核心场景：扫描、解释、选择、清理、推荐、计划执行、trash 回滚、审计
+- 形态：CLI/TUI（`dev-cleaner`）与 macOS SwiftUI App（`macos/DevCleanerMac`，通过 `dev-cleaner bridge` 调用同一套核心逻辑）
 
 ---
 
@@ -21,8 +22,8 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 - 准：通过项目 marker files、内置规则、用户自定义规则、`.gitignore` 保守发现和 CMake 启发式识别可清理目标。
 - 稳：默认 `--max-risk medium`，隐藏高风险依赖目录和 `.gitignore` 发现项；默认阻止 protected/recent/in-use 目标。
 - 可解释：每个 `ProjectInfo` 可携带 category、risk、confidence、matched_rule、protected/recent/selection/skip reason。
-- 可回滚：`--trash` 将删除变成可恢复批次，支持 `undo` 和 `trash list/show/purge/gc`。
-- 可审计：clean/apply 记录本地 JSONL audit log，可查询和导出。
+- 可回滚：clean/apply/TUI/macOS App 默认把目标移入 Dev Cleaner 回收站（可恢复批次），`--permanent` 才直接删除；支持 `undo` 和 `trash list/show/purge/gc`。
+- 可审计：clean/apply/TUI 以及 restore/purge/gc 记录本地 JSONL audit log（逐项真实结果），可查询和导出。
 
 ---
 
@@ -55,10 +56,12 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 - 元数据过滤：`--category cache|build|deps|all`，默认 `all`。
 - 风险过滤：`--max-risk low|medium|high|all`，别名 `--risk`，默认 `medium`。
 - 可见性：`--include-protected`、`--include-recent`、`--recent-days <DAYS>`。
-- 输出：普通表格、`--json`、`--explain`。
+- 输出：普通表格、`--json`、`--explain`。结果列表总是写 stdout（进度条在 stderr），管道/重定向/CI 下同样完整。
+- `--profile` 多根时逐根列出（重叠根去重）；只有 `--json` 才输出 JSON。
 
 实现要点：
 
+- 扫描根先转为绝对路径（不解析 symlink），结果、plan、trash log、audit 中的路径与当前工作目录无关。
 - CLI 路径走 `Scanner::scan_with_streaming()`，先发现候选，再并行计算 size 并流式输出。
 - size threshold 在 size 计算完成后由 CLI 过滤。
 - `--gitignore` 只控制 traversal 是否尊重 `.gitignore`；`.gitignore` 发现候选是独立能力。
@@ -68,15 +71,15 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 扫描后清理目标：
 
 - 支持 scan 同类过滤：`--depth`、`--min-size`、`--older-than`、`--gitignore`、`--category`、`--max-risk`。
-- 执行模式：`--dry-run`、`--trash`、`--auto`、`--force`、`--verbose`、`--share`。
-- 安全覆盖：`--include-recent`、`--include-protected`、`--force-protected`、`--recent-days`。
+- 执行模式：默认移入 Dev Cleaner 回收站；`--permanent`（别名 `--permanent-delete`）直接删除；`--trash` 保留兼容，与 `--permanent` 互斥；另有 `--dry-run`、`--auto`（别名 `--yes`/`-y`）、`--force`、`--verbose`、`--share`。
+- 安全覆盖：`--include-in-use`、`--include-recent`、`--include-protected`、`--force-protected`、`--recent-days`。
 
 行为：
 
 - 默认不会清理 in-use、protected、recent 目标。
-- `--force` 允许 in-use 并跳过确认；`--force-protected` 才允许 protected 目标进入删除。
+- `--auto`/`--yes` 跳过选择与确认，但仍跳过 in-use；`--include-in-use` 只放行 in-use，仍需确认；`--force` 放行 in-use 并跳过确认；`--force-protected` 才允许 protected 目标进入删除。
 - TTY 且未 `--auto/--force` 时使用键盘选择器；非 TTY 时退化为传统 prompt。
-- `--trash` 使用 Dev Cleaner 自有 trash root，而不是系统 Trash。
+- 回收站是 Dev Cleaner 自有 trash root，而不是系统 Trash；dry-run 汇总区分 "Would move to trash" 与 "Would free"。
 - `--share` 输出可复制摘要，并写入本地 metrics event。
 
 ### 3.3 `tui [PATH]`
@@ -85,6 +88,7 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 
 - 支持 `--include-recent`、`--include-protected`、`--recent-days`。
 - 展示目标列表、详情、risk/source/protection 信息，并使用相同 safety 语义。
+- Enter 没有二次确认，因此把选中项移入 Dev Cleaner 回收站（可 `undo`），并写入 audit；结束时打印 undo/purge 命令。
 - 相比 `scan`/`clean`，TUI 的命令行过滤面较窄；仍是后续体验增强点。
 
 ### 3.4 `stats [PATH]`
@@ -126,7 +130,8 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 
 执行 plan JSON：
 
-- 支持 `--dry-run`、`--trash`、`--force`、`--no-verify`、`--include-recent`、`--force-protected`、`--recent-days`、`--verbose`。
+- 默认移入 Dev Cleaner 回收站；`--permanent` 直接删除（`--trash` 保留兼容）。
+- 支持 `--dry-run`、`--force`（跳过确认并放行 in-use）、`-y/--yes`（只跳过确认）、`--no-verify`、`--include-recent`、`--force-protected`、`--recent-days`、`--verbose`。
 - 接受 schema v1/v2/v3；当前生成 v3。
 - 默认会重新验证 plan 目标：
   - cleanable_dir 必须位于 project root 下。
@@ -142,6 +147,7 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 - `undo --batch <ID>`；未指定 batch 时恢复最新 batch。
 - 支持 `--dry-run`、`--force`、`--verbose`。
 - restore 时更深路径优先，目标已存在时默认跳过，`--force` 会覆盖。
+- 恢复成功的条目从 trash log 移除，不再计入 `trash list` 和回收站大小；批次全部恢复后删除空的批次目录。
 
 ### 3.9 `trash`
 
@@ -156,8 +162,10 @@ Trash root：
 
 - 默认：`dirs::data_dir()/dev-cleaner/trash`，fallback 到 home/current-dir 风格路径。
 - 可通过 `DEV_CLEANER_TRASH_DIR` 覆盖。
-- move 使用 EXDEV fallback，跨设备时 copy 后删除源。
+- 移入回收站只做同卷 rename：与 trash root 不在同一卷的目标放进该卷根目录的 `.dev-cleaner-trash/<batch>/`，不会跨卷复制（复制既不释放空间又会占满系统盘）。restore 仍允许跨卷复制，以兼容旧批次。
+- purge/gc 同时删除各卷上的批次目录；卷未挂载（挂载点不存在或为空）时 purge 失败并保留记录，重新挂载后可再次 purge。
 - purge/gc 拒绝清理 symlink batch path。
+- `trash list/show` 与 `gc --dry-run` 是只读操作，不写 audit。
 
 ### 3.10 `profile`
 
@@ -178,7 +186,19 @@ Profile 存储在 config 的 `[scan_profiles.<name>]` 下。使用 `--profile` �
 - `audit show --run <RUN_ID> [--json]`
 - `audit export [--run <RUN_ID>] [--format json|csv] [-o <PATH>]`
 
-Audit 默认开启，记录 clean/apply 的 run start、item action、run finish。日志会按大小轮转。
+Audit 默认开启，日志会按大小轮转：
+
+- clean/apply/TUI：run start（含 `mode`：`dry_run`/`trash`/`permanent_delete`）、每个目标的真实结果（`completed`/`failed`/`skipped`+原因/`dry_run`）、run finish。
+- restore（`undo`）、purge、gc 各记一条 run（`mode` 为 `restore`/`purge`/`gc`），带真实条数与字节数。
+
+### 3.12 `bridge` 与 macOS App
+
+`dev-cleaner bridge <scan|recommend|clean|apply|trash|audit|config>` 输出 JSONL 事件，供 `macos/DevCleanerMac` 使用：
+
+- App 偏好（扫描根、深度、recent 天数、是否显示高风险、回收站保留天数/提醒阈值、自动清理过期批次）保存在 bridge 的 GUI preferences 文件中，修改即保存。
+- App 的所有清理都先展示确认表单，列出将处理的条目，并且只移入回收站（可先 Dry Run）。执行时传入与扫描一致的 `--recent-days`/`--include-recent`。
+- 多扫描根：plan 的 `scan_root` 取各根的公共父目录；`bridge recommend` 接受多个路径并去重。
+- 启动时按保留天数自动清理过期批次（只按天数，不按大小，避免刚移入的批次被清掉）。
 
 ---
 
@@ -270,7 +290,13 @@ Confidence：
 - `gitignore` = low
 - 未归因 = unknown
 
-### 4.6 Dedup
+### 4.6 遍历剪枝与安全护栏
+
+- 不进入隐藏目录（扫描根本身除外）和 `node_modules` 内部继续寻找项目，避免把依赖包或工具缓存里的 `dist/`、`build/` 当成目标；`custom_patterns` 中以 `.` 开头的路径组件（如 `.yarn/cache` 的 `.yarn`）仍会进入。
+- 目标目录内若有 git 跟踪的文件（`git ls-files` 非空），视为源码，不作为 cleanable target。
+- size 为实际占用的磁盘块（`st_blocks * 512`），稀疏文件不会被高估；硬链接只有在所有链接都位于目标内时才计入。
+
+### 4.7 Dedup
 
 扫描会去重 nested cleanable dirs：
 
@@ -286,16 +312,19 @@ Confidence：
 
 `ProjectDetector::is_in_use` 基于 lock files 最近 7 天修改判断：
 
-- Node.js：`package-lock.json`、`yarn.lock`、`pnpm-lock.yaml`
+- Node.js：`package-lock.json`、`npm-shrinkwrap.json`、`yarn.lock`、`pnpm-lock.yaml`、`bun.lock`、`bun.lockb`
 - Rust：`Cargo.lock`
-- Python：`Pipfile.lock`、`poetry.lock`
+- Python：`Pipfile.lock`、`poetry.lock`、`uv.lock`、`pdm.lock`
 - Dart：`pubspec.lock`
 - Haskell：`stack.yaml.lock`
 - Go：`go.sum`
 - Ruby：`Gemfile.lock`
 - PHP：`composer.lock`
+- Swift：`Package.resolved`
+- Elixir：`mix.lock`
+- .NET：`packages.lock.json`
 
-clean/apply 默认跳过 in-use，`--force` 才允许。
+clean/apply 默认跳过 in-use；`--include-in-use` 或 `--force` 才允许。
 
 ### 5.2 Recent
 
@@ -380,14 +409,14 @@ Trash JSONL entry：
 - `size`
 - `tool_version`
 
-`trash list` 会按 batch 聚合 `entries_count` 和 `total_size`。
+`trash list` 会按 batch 聚合 `entries_count` 和 `total_size`。`original_path` 总是绝对路径；`trashed_path` 可能位于其他卷的 `.dev-cleaner-trash/` 下。恢复成功的条目会从 log 中移除。
 
 ### 6.4 Audit Log
 
 Audit record 是 tagged JSONL：
 
-- `run_started`
-- `item_action`
+- `run_started`（可选 `mode`）
+- `item_action`（`path`、`action`、`result`、`bytes`、`reason`）
 - `run_finished`
 
 默认路径为 `dirs::data_dir()/dev-cleaner/operations.jsonl`，可通过 config `[audit]` 覆盖：
@@ -458,6 +487,8 @@ Profile 字段：
 - 默认 exclude VCS 目录：`.git`、`.svn`、`.hg`。
 - 扫描不 follow symlink；size 计算也不 follow symlink。
 - apply 会校验 cleanable_dir 位于 project root 和 scan root 内。
+- clean/apply/TUI 默认移入回收站，永久删除需要显式 `--permanent`；App 只提供移入回收站，释放空间通过回收站页的 purge/清空（需确认）。
+- 含 git 跟踪文件的目录不会被当作清理目标。
 - trash purge/gc 拒绝 symlink batch path。
 - 删除失败继续处理其他目标并汇总错误。
 
@@ -469,32 +500,42 @@ Profile 字段：
 可维护性：
 
 - CLI 编排在 `src/cli/mod.rs`。
-- 可测试业务逻辑集中在 `src/app/*`、`src/recommend.rs`、`src/policy/*`、`src/trash.rs`。
+- 可测试业务逻辑集中在 `crates/dev-cleaner-core/src/{app,policy}/*`、`recommend.rs`、`trash.rs`。
 - Scanner 仍是核心发现引擎，配置和 safety 由 app service 统一拼接。
 
 ---
 
 ## 9. 模块地图
 
-- `src/cli/mod.rs`：clap 命令、输出、交互确认、命令编排。
-- `src/app/scan.rs`：profile/config/path/filter 解析，scanner 构建，keep/recent 评估，跨 root dedup。
-- `src/app/cleanup.rs`：clean/apply 前的 selected vs blocked 分流。
-- `src/app/apply_plan.rs`：plan schema 校验、目标重验、apply safety 校验。
-- `src/app/evaluated.rs`：`EvaluatedProject`、`SafetyFlags`、skip/selection reason。
-- `src/scanner/walker.rs`：遍历、候选发现、规则归因、streaming scan、dedup、risk/category/confidence。
-- `src/scanner/detector.rs`：project type detection、内置 cleanable patterns、`.gitignore` discovery、in-use lock 检测。
-- `src/scanner/size_calculator.rs`：并行/流式 size 计算。
-- `src/policy/keep.rs`：keep/protect policy。
-- `src/recommend.rs`：goal-based recommendation。
-- `src/cleaner/mod.rs`：实际 remove/trash 执行、progress、结果汇总。
-- `src/trash.rs`：trash batch、undo、list/show/purge/gc、EXDEV fallback。
-- `src/plan.rs`：CleanupPlan schema v3。
-- `src/audit.rs`：本地 JSONL audit log。
-- `src/metrics.rs`：本地 metrics event log。
-- `src/stats/mod.rs`：统计聚合与展示。
-- `src/tui/`：ratatui 全屏 UI。
-- `src/interactive/select.rs`：TTY keyboard selector。
-- `src/config/mod.rs`：TOML config、profiles、custom patterns、audit config。
+核心库 `crates/dev-cleaner-core/src/`：
+
+- `app/scan.rs`：profile/config/path/filter 解析（根转绝对路径），scanner 构建，keep/recent 评估，跨 root dedup。
+- `app/cleanup.rs`：clean/apply 前的 selected vs blocked 分流。
+- `app/apply_plan.rs`：plan schema 校验、目标重验、apply safety 校验。
+- `evaluation.rs`：`EvaluatedProject`、`SafetyFlags`、skip/selection reason。
+- `scanner/walker.rs`：遍历与剪枝、候选发现、规则归因、streaming scan、dedup、risk/category/confidence。
+- `scanner/detector.rs`：project type detection、内置 cleanable patterns、`.gitignore` discovery、in-use lock 检测、git 跟踪文件检测。
+- `scanner/size_calculator.rs`：并行/流式 size 计算（占用块、硬链接）。
+- `policy/keep.rs`：keep/protect policy。
+- `recommend.rs`：goal-based recommendation。
+- `cleaner/mod.rs`：实际 remove/trash 执行、progress、结果汇总。
+- `trash.rs`：trash batch（含按卷存放）、undo、list/show/purge/gc。
+- `plan.rs`：CleanupPlan schema v3。
+- `audit.rs`：本地 JSONL audit log。
+- `stats/mod.rs`：统计聚合。
+- `config/mod.rs`：TOML config、profiles、custom patterns、audit config。
+
+应用 `src/`：
+
+- `cli/mod.rs`：clap 命令、输出、交互确认、命令编排。
+- `bridge.rs`：macOS App 使用的 JSONL bridge 与 GUI preferences。
+- `clean_progress.rs`：终端进度 observer，以及逐项写 audit 的 observer。
+- `tui/`：ratatui 全屏 UI。
+- `interactive/select.rs`：TTY keyboard selector。
+- `stats/mod.rs`：统计的终端展示。
+- `metrics.rs`：本地 metrics event log。
+
+macOS App `macos/DevCleanerMac/`：SwiftUI 界面、`AppModel` 状态与 `BridgeClient`。
 
 ---
 
@@ -502,7 +543,7 @@ Profile 字段：
 
 新增内置项目类型：
 
-1. 在 `src/scanner/detector.rs` 增加 `ProjectType` variant。
+1. 在 `crates/dev-cleaner-core/src/scanner/detector.rs` 增加 `ProjectType` variant。
 2. 更新 `ProjectType::name()` 和 `ProjectType::color()`。
 3. 更新 `ProjectDetector::detect()` marker checks。
 4. 更新 `ProjectDetector::cleanable_dirs()`。
@@ -525,6 +566,7 @@ Profile 字段：
 5. 还没有 ncdu/treemap 风格空间地图。
 6. `.gitignore` discovery 仍刻意保守，复杂 pattern 不会全部转成候选。
 7. Plan schema v3 已有 params 和 metadata，但未来如果加入更强 audit/replay 语义，需要继续 bump schema。
+8. APFS clone（`cp -c` 等）共享的数据块仍按完整大小计入，删除克隆体实际释放的空间可能更少；可用 `getattrlist(ATTR_CMNEXT_PRIVATESIZE)` 改进。
 
 建议路线：
 
@@ -539,7 +581,8 @@ Profile 字段：
 ## 12. 快速验证命令
 
 ```bash
-cargo test
+cargo test --workspace            # 根包 + dev-cleaner-core；单独 `cargo test` 不会跑核心库测试
+(cd macos/DevCleanerMac && swift test)
 cargo run -- scan . --depth 2 --explain
 cargo run -- scan . --depth 2 --max-risk high
 cargo run -- clean . --depth 2 --dry-run

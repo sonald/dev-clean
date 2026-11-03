@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      # ponytail: warnings are not denied yet (pre-existing ones remain); add `-- -D warnings` once they are fixed.
+      - run: cargo clippy --workspace --all-targets --locked
+      # --workspace: plain `cargo test` skips the dev-cleaner-core crate.
+      - run: cargo test --workspace --locked
+
+  macos-app:
+    name: macOS app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift test
+        working-directory: macos/DevCleanerMac
+        run: swift test

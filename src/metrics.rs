@@ -118,25 +118,30 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = TempDir::new().unwrap();
-        let primary_base = temp.path().join("Library").join("Application Support");
-        fs::create_dir_all(primary_base.parent().unwrap()).unwrap();
-        fs::write(&primary_base, "not a directory").unwrap();
-
         let cwd = temp.path().join("work");
         fs::create_dir(&cwd).unwrap();
 
         let old_home = std::env::var_os("HOME");
+        let old_xdg_config = std::env::var_os("XDG_CONFIG_HOME");
         let old_dir = std::env::current_dir().unwrap();
 
+        // HOME drives macOS; Linux reads XDG_CONFIG_HOME first.
         std::env::set_var("HOME", temp.path());
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let primary_base = dirs::config_dir().unwrap();
+        assert!(primary_base.starts_with(temp.path()));
+        fs::create_dir_all(primary_base.parent().unwrap()).unwrap();
+        fs::write(&primary_base, "not a directory").unwrap();
         std::env::set_current_dir(&cwd).unwrap();
 
         let result = log_event("share_generated", json!({ "bytes_freed": 123 }));
 
         std::env::set_current_dir(old_dir).unwrap();
-        match old_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+        for (key, value) in [("HOME", old_home), ("XDG_CONFIG_HOME", old_xdg_config)] {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
 
         assert!(result.is_ok());
