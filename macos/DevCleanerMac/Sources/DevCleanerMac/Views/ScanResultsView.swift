@@ -26,7 +26,7 @@ struct ScanResultsView: View {
                 .padding(.vertical, 7)
                 .background(DCColor.panel2)
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .frame(width: 260)
+                .frame(minWidth: 120, maxWidth: 260)
             Picker("Category", selection: $model.categoryFilter) {
                 Text("Category: All").tag("all")
                 Text("Cache").tag("cache")
@@ -46,6 +46,7 @@ struct ScanResultsView: View {
                     .font(.caption)
             }
             .toggleStyle(.checkbox)
+            .fixedSize()
             .help("Dependencies and .gitignore-only matches are high risk and hidden by default.")
             .onChange(of: model.preferences.showHighRisk) { _ in
                 model.schedulePreferencesSave()
@@ -64,12 +65,14 @@ struct ScanResultsView: View {
                 }
             } label: {
                 Label(model.isScanning ? "Stop Scan" : "Scan", systemImage: model.isScanning ? "stop.circle" : "scope")
+                    .fixedSize()
             }
             .buttonStyle(model.isScanning ? PrimaryButtonStyle(color: DCColor.red) : PrimaryButtonStyle())
             Button {
                 model.presentCleanup(mode: .trash, items: model.selectedProjects)
             } label: {
                 Label("Move \(model.selectedProjects.count) to Trash", systemImage: "trash")
+                    .fixedSize()
             }
             .buttonStyle(PrimaryButtonStyle(color: DCColor.red))
             .disabled(model.selectedProjects.isEmpty)
@@ -92,7 +95,15 @@ struct ScanResultsView: View {
                     .foregroundStyle(DCColor.secondary)
                     .lineLimit(1)
                 Spacer()
+                let selectable = model.visibleProjects.filter(\.isSelectable).count
+                Button("Select All Shown (\(selectable))") { model.selectVisible() }
+                    .disabled(selectable == 0)
+                    .help("Selects what the current search and filters show. In-use and protected items are never selected.")
+                Button("Clear Selection") { model.clearSelection() }
+                    .disabled(model.selectedProjectIDs.isEmpty)
             }
+            .buttonStyle(GhostButtonStyle())
+            .font(.caption)
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
             List(model.visibleProjects, selection: $model.focusedProjectID) { project in
@@ -137,6 +148,10 @@ struct ProjectRow: View {
                 HStack {
                     Tag(project.categoryLabel)
                     RiskTag(project.riskLevel ?? "medium")
+                    Text(metadata)
+                        .font(.caption2)
+                        .foregroundStyle(DCColor.tertiary)
+                        .lineLimit(1)
                 }
             }
             Spacer()
@@ -153,6 +168,11 @@ struct ProjectRow: View {
         .padding(10)
         .background(selected ? DCColor.blue.opacity(0.18) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var metadata: String {
+        let modified = project.lastModified.map { "Modified \(DevCleanerFormatters.relative($0))" }
+        return [modified, project.ruleLabel].compactMap { $0 }.joined(separator: " · ")
     }
 
     private var icon: String {
@@ -188,6 +208,12 @@ struct ProjectDetailView: View {
                 Divider().overlay(DCColor.border)
                 DetailCard(title: "IDENTIFICATION ANALYSIS", icon: "magnifyingglass") {
                     Text("Detected as \(project.categoryLabel.lowercased()). Source is \(project.confidence ?? "unknown") confidence and risk is \(project.riskLabel.lowercased()).")
+                    if let rule = project.ruleLabel {
+                        Text("Matched by \(rule).")
+                    }
+                    if let modified = project.lastModified {
+                        Text("Last modified \(DevCleanerFormatters.relative(modified)).")
+                    }
                     Text("Path: \(DevCleanerFormatters.shortPath(project.cleanableDir))")
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(DCColor.secondary)
@@ -256,6 +282,8 @@ struct Tag: View {
     var body: some View {
         Text(text)
             .font(.caption2)
+            .lineLimit(1)
+            .fixedSize()
             .foregroundStyle(DCColor.secondary)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)

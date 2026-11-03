@@ -10,14 +10,18 @@ struct RecommendationsView: View {
             VStack(alignment: .leading, spacing: 22) {
                 DCPageHeader(
                     title: "Smart Recommendations",
-                    subtitle: "Configure your cleanup parameters to generate a targeted optimization plan."
+                    subtitle: "Rescans \(model.scanRootDisplayName) and picks items until the target is reached. Nothing is moved until you review the plan."
                 ) {
+                    if model.isRecommending {
+                        ProgressView().controlSize(.small)
+                    }
                     Button {
                         Task { await model.generateRecommendation(strategy: strategy, target: target) }
                     } label: {
-                        Label("Generate Cleanup Plan", systemImage: "sparkles")
+                        Label(model.isRecommending ? "Scanning..." : "Generate Cleanup Plan", systemImage: "sparkles")
                     }
                     .buttonStyle(PrimaryButtonStyle())
+                    .disabled(model.isRecommending || model.isScanning)
                 }
 
                 HStack(alignment: .top, spacing: 20) {

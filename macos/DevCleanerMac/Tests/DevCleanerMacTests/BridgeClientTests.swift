@@ -404,6 +404,141 @@ final class BridgeClientTests: XCTestCase {
         XCTAssertFalse(arguments.contains("--force"))
     }
 
+    func testRecommendationCoversEveryScanRoot() async {
+        let bridge = RecordingBridgeRunner()
+        let model = await AppModel(bridge: bridge)
+        await MainActor.run {
+            model.preferences.scanRoots = ["/tmp/dev-clean-a", "/tmp/dev-clean-b"]
+            model.preferences.scanDepth = 6
+        }
+        await model.generateRecommendation()
+
+        let arguments = bridge.recordedArguments.last ?? []
+        XCTAssertEqual(Array(arguments.prefix(3)), ["recommend", "/tmp/dev-clean-a", "/tmp/dev-clean-b"])
+        XCTAssertEqual(arguments.firstIndex(of: "--depth").map { arguments[$0 + 1] }, "6")
+        let finished = await MainActor.run { !model.isRecommending }
+        XCTAssertTrue(finished)
+    }
+
+    func testScanKeepsDiscoveryOrderUntilItEnds() async {
+        let small = makeProject(dir: "/tmp/a/target", size: 1)
+        let big = makeProject(dir: "/tmp/b/target", size: 99)
+        let bridge = RecordingBridgeRunner(events: [.scanItem(small), .scanItem(big)], waitUntilCancelled: true)
+        let model = await AppModel(bridge: bridge)
+        await MainActor.run { model.startSmartScan() }
+
+        let streamed = await waitUntil { await MainActor.run { model.projects.count == 2 } }
+        XCTAssertTrue(streamed)
+        await MainActor.run {
+            XCTAssertEqual(model.projects.map(\.size), [1, 99], "rows must not jump while the scan runs")
+            model.stopScan()
+        }
+        let sorted = await waitUntil { await MainActor.run { !model.isScanning && model.projects.first?.size == 99 } }
+        XCTAssertTrue(sorted)
+    }
+
+    func testApplyUsesTheRecencyRulesOfTheScan() async {
+        let bridge = RecordingBridgeRunner()
+        let model = await AppModel(bridge: bridge)
+        await MainActor.run {
+            model.preferences.recentDays = 3
+            model.preferences.includeRecent = true
+        }
+        await model.runCleanup(items: [makeProject()], mode: .trash)
+
+        let arguments = bridge.recordedArguments.first { $0.first == "apply" } ?? []
+        XCTAssertEqual(arguments.firstIndex(of: "--recent-days").map { arguments[$0 + 1] }, "3")
+        XCTAssertTrue(arguments.contains("--include-recent"))
+    }
+
+    func testCleanupDoesNotSwitchSections() async {
+        let project = makeProject()
+        let bridge = RecordingBridgeRunner(events: [
+            .cleanupStarted(totalCount: 1, totalBytes: 42, mode: "trash"),
+            .cleanupFinished(.object(["cleaned_count": .number(1)]))
+        ])
+        let model = await AppModel(bridge: bridge)
+        await MainActor.run { model.selectedSection = .recommendations }
+        await model.runCleanup(items: [project], mode: .trash)
+
+        await MainActor.run {
+            XCTAssertEqual(model.selectedSection, .recommendations)
+            XCTAssertTrue(model.showCleanupSummary)
+        }
+    }
+
+    func testSelectVisibleFollowsFiltersAndSkipsBlockedItems() async {
+        let model = await AppModel(bridge: RecordingBridgeRunner())
+        let cache = { var project = makeProject(dir: "/tmp/c/cache"); project.category = "cache"; return project }()
+        let build = makeProject(dir: "/tmp/a/target")
+        let inUse = makeProject(dir: "/tmp/b/target", inUse: true)
+        let hidden = makeProject(dir: "/tmp/d/target", risk: "high")
+
+        await MainActor.run {
+            model.projects = [cache, build, inUse, hidden]
+            model.categoryFilter = "build"
+            model.selectVisible()
+            XCTAssertEqual(model.selectedProjectIDs, [build.id])
+            model.clearSelection()
+            XCTAssertTrue(model.selectedProjectIDs.isEmpty)
+        }
+    }
+
+    func testRestoreAndPurgeReportTheirOutcome() async {
+        let batch = TrashBatch(batchId: "b1", createdAt: Date(), entriesCount: 2, totalSize: 10)
+        let restore = JSONValue.object([
+            "operation": .string("restore"),
+            "result": .object([
+                "restored_count": .number(1), "skipped_count": .number(1), "failed_count": .number(0),
+                "errors": .array([.string("Restore target already exists (use --force to override): /tmp/x")])
+            ])
+        ])
+        let bridge = RecordingBridgeRunner(events: [.trashOperationFinished(restore)])
+        let model = await AppModel(bridge: bridge)
+        await model.restore(batch: batch)
+        await MainActor.run {
+            XCTAssertEqual(model.alert?.title, "Restored 1 of 2 Items")
+            XCTAssertTrue(model.alert?.message.contains("already exists") == true)
+            model.alert = nil
+        }
+
+        bridge.events = [.trashOperationFinished(.object([
+            "operation": .string("purge"),
+            "result": .object(["failed_batches": .number(1), "errors": .array([.string("Volume is not mounted: /Volumes/X")])])
+        ]))]
+        await model.purge(batch: batch)
+        let purgeAlert = await MainActor.run { model.alert }
+        XCTAssertEqual(purgeAlert?.title, "Purge Incomplete")
+        XCTAssertTrue(purgeAlert?.message.contains("not mounted") == true)
+    }
+
+    func testAuditDetailsListOnlyItemActions() async {
+        let records = JSONValue.object(["run": .string("r1"), "records": .array([
+            .object(["type": .string("run_started"), "run_id": .string("r1"), "command": .string("apply")]),
+            .object(["type": .string("item_action"), "run_id": .string("r1"), "command": .string("apply"),
+                     "path": .string("/tmp/a/target"), "action": .string("trash"), "result": .string("completed"),
+                     "bytes": .number(42), "reason": .null, "ts": .string("2026-11-03T04:16:48Z")]),
+            .object(["type": .string("run_finished"), "run_id": .string("r1"), "cleaned": .number(1)])
+        ])])
+        let bridge = RecordingBridgeRunner(events: [.auditRecords(records)])
+        let model = await AppModel(bridge: bridge)
+        await model.loadAuditRecords(runID: "r1")
+
+        XCTAssertEqual(bridge.recordedArguments.last, ["audit", "show", "--run", "r1"])
+        await MainActor.run {
+            XCTAssertEqual(model.auditItems.map(\.path), ["/tmp/a/target"])
+            XCTAssertEqual(model.auditItems.first?.bytes, 42)
+        }
+    }
+
+    func testMatchedRuleSurvivesPlanEncoding() throws {
+        let json = #"{"root":"/tmp/llm","project_type":"Python","cleanable_dir":"/tmp/llm/gpt2","size":1,"in_use":false,"matched_rule":{"source":"gitignore","pattern":"gpt2"}}"#
+        let project = try JSONDecoder.bridge.decode(BridgeProject.self, from: Data(json.utf8))
+        XCTAssertEqual(project.ruleLabel, ".gitignore pattern “gpt2”")
+        let encoded = String(decoding: try JSONEncoder.bridge.encode(project), as: UTF8.self)
+        XCTAssertTrue(encoded.contains(#""matched_rule":{"#), encoded)
+    }
+
     private func makeProject(dir: String = "/tmp/app/target", size: UInt64 = 42, risk: String = "medium", inUse: Bool = false) -> BridgeProject {
         BridgeProject(
             root: (dir as NSString).deletingLastPathComponent,

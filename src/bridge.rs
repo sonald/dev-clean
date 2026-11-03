@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
 use dev_cleaner_core::app::{
-    ApplyPlanRequest, ApplyPlanService, ScanRequest, ScanService, VisibilityOptions,
+    derive_scan_root, ApplyPlanRequest, ApplyPlanService, DiscoveredProjects, ScanRequest,
+    ScanService, VisibilityOptions,
 };
 use dev_cleaner_core::audit::AuditLogger;
 use dev_cleaner_core::cleaner::{CleanAction, CleanObserver, CleanOptions};
@@ -72,7 +73,8 @@ pub struct BridgeScanArgs {
 
 #[derive(clap::Args)]
 pub struct BridgeRecommendArgs {
-    pub path: Option<PathBuf>,
+    /// One or more scan roots; the GUI passes every configured root.
+    pub paths: Vec<PathBuf>,
     #[arg(long)]
     pub depth: Option<usize>,
     #[arg(long)]
@@ -551,21 +553,42 @@ fn bridge_scan(args: BridgeScanArgs, config: &Config) -> Result<()> {
 }
 
 fn bridge_recommend(args: BridgeRecommendArgs, config: &Config) -> Result<()> {
-    let scan_args = BridgeScanArgs {
-        path: args.path.clone(),
-        depth: args.depth,
-        min_size: args.min_size,
-        older_than: args.older_than,
-        gitignore: args.gitignore,
-        category: args.category,
-        max_risk: args.max_risk,
-        include_protected: true,
-        include_recent: true,
-        recent_days: args.recent_days,
-    };
     let service = ScanService::new();
-    let request = build_scan_request(&scan_args);
-    let discovered = service.discover(config, &request)?;
+    let paths = if args.paths.is_empty() {
+        vec![None]
+    } else {
+        args.paths.iter().cloned().map(Some).collect()
+    };
+    let mut merged: Option<DiscoveredProjects> = None;
+    for path in paths {
+        let request = build_scan_request(&BridgeScanArgs {
+            path,
+            depth: args.depth,
+            min_size: args.min_size,
+            older_than: args.older_than,
+            gitignore: args.gitignore,
+            category: args.category,
+            max_risk: args.max_risk,
+            include_protected: true,
+            include_recent: true,
+            recent_days: args.recent_days,
+        });
+        let mut next = service.discover(config, &request)?;
+        match merged.as_mut() {
+            None => merged = Some(next),
+            Some(all) => {
+                all.resolved.roots.append(&mut next.resolved.roots);
+                all.projects.append(&mut next.projects);
+            }
+        }
+    }
+    let mut discovered = merged.expect("at least one scan root");
+    // Roots may overlap (a root inside another); keep each target once, largest first.
+    discovered.projects = service.deduplicate_projects(discovered.projects);
+    discovered
+        .projects
+        .sort_by(|a, b| b.info.size.cmp(&a.info.size));
+    discovered.resolved.scan_root = derive_scan_root(&discovered.resolved.roots);
     let cleanup_bytes = args.cleanup.as_deref().map(parse_size).transpose()?;
     let free_at_least_bytes = args.free_at_least.as_deref().map(parse_size).transpose()?;
     let target_bytes = match (cleanup_bytes, free_at_least_bytes) {

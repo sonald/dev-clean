@@ -37,6 +37,7 @@ struct DCCard<Content: View>: View {
 
 struct PrimaryButtonStyle: ButtonStyle {
     var color: Color = DCColor.blue
+    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -46,10 +47,13 @@ struct PrimaryButtonStyle: ButtonStyle {
             .padding(.vertical, 10)
             .background(color.opacity(configuration.isPressed ? 0.75 : 1))
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(isEnabled ? 1 : 0.4)
     }
 }
 
 struct SecondaryButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
@@ -62,10 +66,13 @@ struct SecondaryButtonStyle: ButtonStyle {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .stroke(DCColor.border)
             )
+            .opacity(isEnabled ? 1 : 0.4)
     }
 }
 
 struct GhostButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
@@ -73,6 +80,7 @@ struct GhostButtonStyle: ButtonStyle {
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .opacity(isEnabled ? 1 : 0.4)
     }
 }
 

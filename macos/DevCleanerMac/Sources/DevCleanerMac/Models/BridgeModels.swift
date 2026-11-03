@@ -17,6 +17,8 @@ struct BridgeProject: Codable, Identifiable, Hashable {
     var recent: Bool?
     var selectionReason: String?
     var skipReason: String?
+    /// Kept so plans written by the app carry the same rule the helper reported.
+    var matchedRule: MatchedRule? = nil
 
     var id: String { cleanableDir }
     var displayName: String {
@@ -37,6 +39,15 @@ struct BridgeProject: Codable, Identifiable, Hashable {
         (riskLevel ?? "medium").capitalized + " Risk"
     }
     var isHighRisk: Bool { riskLevel == "high" }
+    var ruleLabel: String? {
+        guard let rule = matchedRule else { return nil }
+        switch rule.source {
+        case "gitignore": return ".gitignore pattern “\(rule.pattern)”"
+        case "custom": return "custom rule “\(rule.name ?? rule.pattern)”"
+        case "heuristic": return "heuristic “\(rule.pattern)”"
+        default: return "built-in rule “\(rule.pattern)”"
+        }
+    }
     /// In-use items are always skipped by the helper unless forced, so the GUI never offers them.
     var isSelectable: Bool { !inUse && protected != true }
 
@@ -57,7 +68,26 @@ struct BridgeProject: Codable, Identifiable, Hashable {
         case recent
         case selectionReason = "selection_reason"
         case skipReason = "skip_reason"
+        case matchedRule = "matched_rule"
     }
+}
+
+struct MatchedRule: Codable, Hashable {
+    var source: String
+    var pattern: String
+    var name: String?
+}
+
+/// One `item_action` line of an audit run.
+struct AuditItemRecord: Decodable, Identifiable, Hashable {
+    var path: String
+    var action: String
+    var result: String
+    var bytes: UInt64?
+    var reason: String?
+    var ts: String?
+
+    var id: String { path + action + (ts ?? "") }
 }
 
 struct TrashBatch: Codable, Identifiable, Hashable {
@@ -239,7 +269,7 @@ enum AppSection: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
     static var sidebarSections: [AppSection] {
-        [.dashboard, .scanResults, .trash, .history, .settings]
+        [.dashboard, .scanResults, .recommendations, .trash, .history, .settings]
     }
 
     var title: String {

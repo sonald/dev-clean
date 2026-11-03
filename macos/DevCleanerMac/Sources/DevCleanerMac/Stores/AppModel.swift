@@ -32,6 +32,8 @@ final class AppModel: ObservableObject {
     @Published var trashEntries: [TrashEntry] = []
     @Published var selectedTrashBatchID: String?
     @Published var auditRuns: [AuditRun] = []
+    @Published var auditItems: [AuditItemRecord] = []
+    @Published var isRecommending = false
     @Published var auditFilter: AuditFilter = .all
     @Published var preferences = GuiPreferences()
     @Published var configSnapshot: ConfigSnapshot?
@@ -75,6 +77,15 @@ final class AppModel: ObservableObject {
         } else {
             selectedProjectIDs.insert(project.id)
         }
+    }
+
+    /// Selects what the current search and filters show; never hidden, in-use or protected items.
+    func selectVisible() {
+        selectedProjectIDs.formUnion(visibleProjects.filter(\.isSelectable).map(\.id))
+    }
+
+    func clearSelection() {
+        selectedProjectIDs.removeAll()
     }
 
     var focusedProject: BridgeProject? {
@@ -319,17 +330,22 @@ final class AppModel: ObservableObject {
             alert = AppAlert(title: "Scan Failed", message: error.localizedDescription)
             scanStatusMessage = "Scan failed."
         }
+        // Sorted once at the end: re-sorting per item made rows jump under the cursor.
+        projects.sort { $0.size > $1.size }
         isScanning = false
         scanTask = nil
     }
 
     func generateRecommendation(strategy: String = "balanced", target: String = "10GB") async {
-        guard !isScanning else { return }
-        selectedSection = .recommendations
+        guard !isScanning, !isRecommending else { return }
+        isRecommending = true
+        defer { isRecommending = false }
         do {
-            var args = ["recommend", scanRootPath, "--cleanup", target, "--strategy", strategy,
-                        "--max-risk", preferences.showHighRisk ? "high" : "medium",
-                        "--recent-days", "\(preferences.recentDays)"]
+            var args = ["recommend"] + activeScanRoots + [
+                "--cleanup", target, "--strategy", strategy,
+                "--depth", "\(preferences.scanDepth)",
+                "--max-risk", preferences.showHighRisk ? "high" : "medium",
+                "--recent-days", "\(preferences.recentDays)"]
             if preferences.includeRecent {
                 args.append("--include-recent")
             }
@@ -434,6 +450,18 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func loadAuditRecords(runID: String?) async {
+        auditItems = []
+        guard let runID else { return }
+        do {
+            try await bridge.run(arguments: ["audit", "show", "--run", runID]) { [weak self] event in
+                self?.handle(event)
+            }
+        } catch {
+            alert = AppAlert(title: "Audit Details Failed", message: error.localizedDescription)
+        }
+    }
+
     func exportAuditCSV() async {
         let panel = NSSavePanel()
         panel.title = "Export Audit CSV"
@@ -502,11 +530,14 @@ final class AppModel: ObservableObject {
         cleanupCurrentPath = nil
         showCleanupSummary = false
         lastSummary = nil
-        selectedSection = .scanResults
         let cancel = FileManager.default.temporaryDirectory.appendingPathComponent("dev-cleaner-cancel-\(UUID().uuidString)")
         cancelFile = cancel
 
-        var args = ["apply", plan.path, "--cancel-file", cancel.path]
+        // Same recency rules as the scan that showed these items, or apply would skip them as recent.
+        var args = ["apply", plan.path, "--cancel-file", cancel.path, "--recent-days", "\(preferences.recentDays)"]
+        if preferences.includeRecent {
+            args.append("--include-recent")
+        }
         switch mode {
         case .dryRun:
             args.append("--dry-run")
@@ -551,11 +582,8 @@ final class AppModel: ObservableObject {
         case .scanStarted(_, let total):
             scanProgress = total == 0 ? 0 : scanProgress
         case .scanItem(let project):
-            withAnimation(.easeOut(duration: 0.18)) {
-                projects.append(project)
-                projects.sort { $0.size > $1.size }
-                if focusedProjectID == nil { focusedProjectID = project.id }
-            }
+            projects.append(project)
+            if focusedProjectID == nil { focusedProjectID = project.id }
         case .scanProgress(let completed, let total):
             scanProgress = total == 0 ? 0 : Double(completed) / Double(total)
         case .scanFinished:
@@ -599,7 +627,6 @@ final class AppModel: ObservableObject {
             cleanupProgress = 1
             lastSummary = CleanupSummary(payload: payload, mode: cleanupMode)
             showCleanupSummary = true
-            selectedSection = .dashboard
             refreshVolume()
             Task {
                 await purgeExpiredTrash()
@@ -614,8 +641,15 @@ final class AppModel: ObservableObject {
             }
         case .trashEntries(let payload):
             trashEntries = payload.decodePayloadArray(path: ["entries"], as: TrashEntry.self)
+        case .trashOperationFinished(let payload):
+            reportTrashOperation(payload)
         case .auditList(let payload):
             auditRuns = payload.decodePayloadArray(path: ["runs"], as: AuditRun.self)
+        case .auditRecords(let payload):
+            if case .array(let records) = payload.value(at: ["records"]) {
+                auditItems = JSONValue.array(records.filter { $0.string(path: ["type"]) == "item_action" })
+                    .decodePayloadArray(path: [], as: AuditItemRecord.self)
+            }
         case .configSnapshot(let snapshot):
             configSnapshot = snapshot
             preferences = snapshot.guiPreferences
@@ -623,6 +657,33 @@ final class AppModel: ObservableObject {
             break
         case .error(let message):
             alert = AppAlert(title: "Bridge Error", message: message)
+        default:
+            break
+        }
+    }
+
+    /// Restores always report back; purges only when something could not be deleted.
+    private func reportTrashOperation(_ payload: JSONValue) {
+        var errors: [String] = []
+        if case .array(let values) = payload.value(at: ["result", "errors"]) {
+            errors = values.compactMap { if case .string(let text) = $0 { text } else { nil } }
+        }
+        switch payload.string(path: ["operation"]) {
+        case "restore":
+            let restored = payload.int(path: ["result", "restored_count"]) ?? 0
+            let missed = (payload.int(path: ["result", "skipped_count"]) ?? 0) + (payload.int(path: ["result", "failed_count"]) ?? 0)
+            if restored > 0, missed == 0 {
+                alert = AppAlert(title: "Restored \(restored) Items", message: "Everything is back in its original folder. Scan again to see the items in Scan Results.")
+            } else {
+                alert = AppAlert(
+                    title: restored + missed == 0 ? "Nothing Restored" : "Restored \(restored) of \(restored + missed) Items",
+                    message: errors.isEmpty ? "Some items were no longer in the Trash." : errors.joined(separator: "\n")
+                )
+            }
+        case "purge":
+            if (payload.int(path: ["result", "failed_batches"]) ?? 0) > 0 {
+                alert = AppAlert(title: "Purge Incomplete", message: errors.joined(separator: "\n"))
+            }
         default:
             break
         }

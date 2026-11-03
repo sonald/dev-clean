@@ -108,11 +108,13 @@ private struct TrashBatchCard: View {
                 }
                 if isExpanded {
                     VStack(spacing: 0) {
-                        ForEach(model.trashEntries.prefix(8)) { entry in
+                        ForEach(model.trashEntries) { entry in
                             HStack {
                                 Text(DevCleanerFormatters.shortPath(entry.originalPath))
                                     .font(.system(size: 12, design: .monospaced))
                                     .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .help(entry.originalPath)
                                 Spacer()
                                 Text(DevCleanerFormatters.bytes(entry.size))
                                     .font(.system(size: 12, design: .monospaced))

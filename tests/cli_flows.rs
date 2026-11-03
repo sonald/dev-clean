@@ -437,6 +437,58 @@ fn stats_json_reports_aggregates() {
 }
 
 #[test]
+fn bridge_recommend_covers_every_root_once() {
+    let workspace = TempDir::new().unwrap();
+    let root_a = workspace.path().join("a");
+    let root_b = workspace.path().join("b");
+    write_project(&root_a, "app-a", 1024);
+    write_project(&root_b, "app-b", 2048);
+    let plan = workspace.path().join("plan.json");
+    let (a, b) = (root_a.to_str().unwrap(), root_b.to_str().unwrap());
+
+    // `a` twice: overlapping roots must not duplicate items.
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "recommend",
+            a,
+            b,
+            a,
+            "--cleanup",
+            "1GB",
+            "--include-recent",
+            "--output-plan",
+            plan.to_str().unwrap(),
+        ],
+    );
+    let events = parse_json_lines(&output.stdout);
+    let payload = &events
+        .iter()
+        .find(|event| event["type"] == "recommendation_ready")
+        .unwrap()["payload"];
+    assert_eq!(payload["selected_count"], 2);
+
+    // The plan root must cover both roots: applying it may not skip anything.
+    let output = run(
+        &workspace,
+        &[
+            "bridge",
+            "apply",
+            plan.to_str().unwrap(),
+            "--dry-run",
+            "--include-recent",
+        ],
+    );
+    let types = parse_json_lines(&output.stdout)
+        .into_iter()
+        .filter_map(|event| event["type"].as_str().map(str::to_string))
+        .filter(|kind| kind.starts_with("cleanup_dry_run") || kind == "cleanup_skipped")
+        .collect::<Vec<_>>();
+    assert_eq!(types, ["cleanup_dry_run", "cleanup_dry_run"]);
+}
+
+#[test]
 fn recommend_writes_plan_file_and_json_output() {
     let workspace = TempDir::new().unwrap();
     let project_root = write_project(workspace.path(), "recommend-app", 4096);

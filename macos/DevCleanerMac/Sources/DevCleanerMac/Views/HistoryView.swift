@@ -3,6 +3,7 @@ import SwiftUI
 struct HistoryView: View {
     @EnvironmentObject private var model: AppModel
     @State private var query = ""
+    @State private var selectedRunID: AuditRun.ID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -42,16 +43,17 @@ struct HistoryView: View {
                     }
                 }
                 .pickerStyle(.segmented)
+                .labelsHidden()
                 .frame(width: 360)
                 Spacer()
-                Text("Showing \(filteredRuns.count) entries")
+                Text("Showing \(filteredRuns.count) \(filteredRuns.count == 1 ? "entry" : "entries")")
                     .font(.caption)
                     .foregroundStyle(DCColor.tertiary)
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 16)
 
-            Table(filteredRuns) {
+            Table(filteredRuns, selection: $selectedRunID) {
                 TableColumn("BATCH ID / TYPE") { run in
                     VStack(alignment: .leading) {
                         Text(run.runId).font(.system(.body, design: .monospaced))
@@ -72,6 +74,13 @@ struct HistoryView: View {
                 }
             }
             .scrollContentBackground(.hidden)
+            .onChange(of: selectedRunID) { id in
+                Task { await model.loadAuditRecords(runID: id) }
+            }
+
+            if let run = model.auditRuns.first(where: { $0.id == selectedRunID }) {
+                RunDetailPanel(run: run, items: model.auditItems)
+            }
         }
         .foregroundStyle(DCColor.text)
     }
@@ -101,5 +110,54 @@ extension AuditRun {
         if failed > 0 { return "Partial" }
         if finishedAt == nil { return "Incomplete" }
         return skipped > 0 ? "Done, \(skipped) skipped" : "Success"
+    }
+}
+
+private struct RunDetailPanel: View {
+    var run: AuditRun
+    var items: [AuditItemRecord]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("\(run.command.capitalized) · \(run.resultLabel)")
+                    .font(.headline)
+                Spacer()
+                Text(run.runId)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(DCColor.tertiary)
+                    .textSelection(.enabled)
+            }
+            if items.isEmpty {
+                Text("No item records for this run.")
+                    .font(.caption)
+                    .foregroundStyle(DCColor.secondary)
+            }
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(items) { item in
+                        HStack(spacing: 12) {
+                            Text(DevCleanerFormatters.shortPath(item.path))
+                                .font(.system(size: 12, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(item.path)
+                            Spacer()
+                            Text(item.reason.map { "\(item.result) (\($0))" } ?? item.result)
+                                .font(.caption)
+                                .foregroundStyle(item.result == "failed" ? DCColor.yellow : DCColor.secondary)
+                            Text(DevCleanerFormatters.bytes(item.bytes ?? 0))
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(DCColor.tertiary)
+                                .frame(width: 80, alignment: .trailing)
+                        }
+                        .padding(.vertical, 5)
+                    }
+                }
+            }
+            .frame(maxHeight: 200)
+        }
+        .padding(16)
+        .background(DCColor.panel)
     }
 }
