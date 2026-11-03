@@ -7,6 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 const TRASH_LOG_FILENAME: &str = "trash_log.jsonl";
+/// Per-volume trash folder, created at the mount point of a volume other than the trash root's.
+const VOLUME_TRASH_DIRNAME: &str = ".dev-cleaner-trash";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrashEntry {
@@ -62,7 +64,7 @@ impl TrashManager {
     }
 
     pub fn trash_dir(&self, original: &Path, size: u64) -> Result<TrashEntry> {
-        let batch_dir = self.root.join(&self.batch_id);
+        let batch_dir = self.batch_dir_for(original)?;
         let rel = path_to_trash_relpath(original);
         let trashed_path = batch_dir.join(rel);
 
@@ -75,7 +77,8 @@ impl TrashManager {
             })?;
         }
 
-        move_path_with_exdev_fallback(original, &trashed_path).with_context(|| {
+        // Never copy across volumes when trashing: that frees nothing and fills the trash volume.
+        move_path(original, &trashed_path, false).with_context(|| {
             format!(
                 "Failed to move to trash: {} -> {}",
                 original.display(),
@@ -94,6 +97,23 @@ impl TrashManager {
         self.append_log(&entry)?;
 
         Ok(entry)
+    }
+
+    /// Items on another volume go to that volume's own trash folder: moving stays a rename,
+    /// nothing is copied onto the trash volume (usually the system disk), and purging frees
+    /// space on the volume the item came from.
+    fn batch_dir_for(&self, original: &Path) -> Result<PathBuf> {
+        let Some(mount) = foreign_volume_root(original, &self.root) else {
+            return Ok(self.root.join(&self.batch_id));
+        };
+        let dir = mount.join(VOLUME_TRASH_DIRNAME).join(&self.batch_id);
+        fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "Cannot create a trash folder on the volume at {}; delete this item permanently instead",
+                mount.display()
+            )
+        })?;
+        Ok(dir)
     }
 
     fn append_log(&self, entry: &TrashEntry) -> Result<()> {
@@ -241,10 +261,14 @@ pub fn restore_batch_with_observer<O: RestoreObserver>(
     observer: &mut O,
 ) -> Result<RestoreResult> {
     let log_path = root.join(TRASH_LOG_FILENAME);
-    let mut entries: Vec<TrashEntry> = load_trash_log(&log_path)?
-        .into_iter()
+    let all_entries = load_trash_log(&log_path)?;
+    let mut entries: Vec<TrashEntry> = all_entries
+        .iter()
         .filter(|e| e.batch_id == batch_id)
+        .cloned()
         .collect();
+    let batch_dirs = batch_dirs(root, batch_id, &entries);
+    let mut restored = std::collections::HashSet::new();
 
     // Restore deeper paths first just in case.
     entries.sort_by_key(|e| std::cmp::Reverse(e.original_path.components().count()));
@@ -312,9 +336,11 @@ pub fn restore_batch_with_observer<O: RestoreObserver>(
             })?;
         }
 
-        match move_path_with_exdev_fallback(&entry.trashed_path, &entry.original_path) {
+        // Entries trashed by older versions may sit on another volume; copying back is fine.
+        match move_path(&entry.trashed_path, &entry.original_path, true) {
             Ok(_) => {
                 restored_count += 1;
+                restored.insert(entry.trashed_path.clone());
                 observer.on_restored(&entry);
             }
             Err(err) => {
@@ -324,6 +350,21 @@ pub fn restore_batch_with_observer<O: RestoreObserver>(
                     entry.original_path.display(),
                     err
                 ));
+            }
+        }
+    }
+
+    // Restored items no longer occupy the Trash: drop them from the log so listings and
+    // automatic purges stop counting them.
+    if !restored.is_empty() {
+        let kept = all_entries
+            .into_iter()
+            .filter(|e| !(e.batch_id == batch_id && restored.contains(&e.trashed_path)))
+            .collect::<Vec<_>>();
+        save_trash_log(&log_path, &kept)?;
+        if !kept.iter().any(|e| e.batch_id == batch_id) {
+            for dir in &batch_dirs {
+                remove_dir_without_files(dir);
             }
         }
     }
@@ -382,6 +423,12 @@ pub fn purge_trash_batch(root: &Path, batch_id: &str, dry_run: bool) -> Result<P
                 batch_dir.display(),
                 err
             ));
+        }
+    }
+    if failed_batches == 0 {
+        if let Err(err) = remove_volume_batch_dirs(&volume_batch_dirs(root, batch_id, &removed)) {
+            failed_batches += 1;
+            errors.push(err);
         }
     }
 
@@ -513,6 +560,18 @@ pub fn gc_trash(
                 continue;
             }
         }
+        let batch_entries = entries
+            .iter()
+            .filter(|e| e.batch_id == summary.batch_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Err(err) =
+            remove_volume_batch_dirs(&volume_batch_dirs(root, &summary.batch_id, &batch_entries))
+        {
+            failed_batches += 1;
+            errors.push(err);
+            continue;
+        }
         removed_ok_ids.insert(summary.batch_id.clone());
     }
 
@@ -632,14 +691,109 @@ fn is_symlink_path(path: &Path) -> Result<bool> {
         .is_symlink())
 }
 
-fn move_path_with_exdev_fallback(src: &Path, dst: &Path) -> Result<()> {
+/// Mount point of `path` when it lives on a different device than `root`.
+#[cfg(unix)]
+fn foreign_volume_root(path: &Path, root: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let device = fs::symlink_metadata(path).ok()?.dev();
+    if fs::metadata(root).ok()?.dev() == device {
+        return None;
+    }
+    let mut mount = path.to_path_buf();
+    while let Some(parent) = mount.parent() {
+        if fs::metadata(parent).map(|m| m.dev()).ok() != Some(device) {
+            break;
+        }
+        mount = parent.to_path_buf();
+    }
+    Some(mount)
+}
+
+#[cfg(not(unix))]
+fn foreign_volume_root(_path: &Path, _root: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// The main batch folder plus any per-volume batch folders holding `entries`.
+fn batch_dirs(root: &Path, batch_id: &str, entries: &[TrashEntry]) -> Vec<PathBuf> {
+    std::iter::once(root.join(batch_id))
+        .chain(volume_batch_dirs(root, batch_id, entries))
+        .collect()
+}
+
+/// `<mount>/.dev-cleaner-trash/<batch>` folders that hold entries outside the trash root.
+fn volume_batch_dirs(root: &Path, batch_id: &str, entries: &[TrashEntry]) -> Vec<PathBuf> {
+    let mut dirs = entries
+        .iter()
+        .filter(|e| e.batch_id == batch_id && !e.trashed_path.starts_with(root))
+        .filter_map(|e| {
+            e.trashed_path
+                .ancestors()
+                .find(|dir| {
+                    dir.file_name() == Some(std::ffi::OsStr::new(batch_id))
+                        && dir.parent().and_then(Path::file_name)
+                            == Some(std::ffi::OsStr::new(VOLUME_TRASH_DIRNAME))
+                })
+                .map(Path::to_path_buf)
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Deletes per-volume batch folders. An ejected volume must fail the purge so the log
+/// keeps its entries and a later purge can finish once the volume is back.
+fn remove_volume_batch_dirs(dirs: &[PathBuf]) -> std::result::Result<(), String> {
+    for dir in dirs {
+        let mounted = dir
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(volume_looks_mounted);
+        if !mounted {
+            return Err(format!("Volume is not mounted: {}", dir.display()));
+        }
+        if !dir.exists() {
+            continue;
+        }
+        if is_symlink_path(dir).map_err(|e| e.to_string())? {
+            return Err(format!("Refusing to purge symlink path: {}", dir.display()));
+        }
+        fs::remove_dir_all(dir)
+            .map_err(|e| format!("Failed to remove batch dir {}: {}", dir.display(), e))?;
+    }
+    Ok(())
+}
+
+/// A mounted volume root holds at least our `.dev-cleaner-trash` folder; an unmounted mount
+/// point is missing or left behind as an empty folder (custom or stale `/Volumes/X` points).
+// ponytail: emptiness, not st_dev, so tests can model volumes; a mount point that something
+// wrote into while unmounted reads as mounted and its batch folder as already deleted.
+fn volume_looks_mounted(mount: &Path) -> bool {
+    fs::read_dir(mount).is_ok_and(|mut entries| entries.next().is_some())
+}
+
+/// Removes `dir` if only (empty) folders are left in it, e.g. the mirrored parents of
+/// restored items. Anything else is left alone.
+fn remove_dir_without_files(dir: &Path) {
+    let has_files = walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .any(|e| !e.file_type().is_dir());
+    if dir.is_dir() && !has_files {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+fn move_path(src: &Path, dst: &Path, copy_across_devices: bool) -> Result<()> {
     if is_symlink_path(src)? {
         anyhow::bail!("Refusing to move symlink path: {}", src.display());
     }
 
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+        Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices && copy_across_devices => {
             copy_dir_recursive(src, dst).with_context(|| {
                 format!(
                     "Failed to copy across devices: {} -> {}",
@@ -815,6 +969,115 @@ mod tests {
     }
 
     #[test]
+    fn test_restored_batch_leaves_trash_listing() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let manager = TrashManager::new_with_root(trash_root.clone()).unwrap();
+        let dir = temp.path().join("src").join("target");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("x"), "y").unwrap();
+        manager.trash_dir(&dir, 5).unwrap();
+        assert_eq!(list_trash_batches(&trash_root).unwrap().len(), 1);
+
+        restore_batch(&trash_root, &manager.batch_id, false, false).unwrap();
+
+        // Restored items no longer occupy the Trash, so they must not be listed or counted.
+        assert!(list_trash_batches(&trash_root).unwrap().is_empty());
+        assert!(!trash_root.join(&manager.batch_id).exists());
+    }
+
+    #[test]
+    fn test_partial_restore_keeps_unrestored_entries_listed() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let manager = TrashManager::new_with_root(trash_root.clone()).unwrap();
+        let a = temp.path().join("a").join("target");
+        let b = temp.path().join("b").join("target");
+        for dir in [&a, &b] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("x"), "y").unwrap();
+            manager.trash_dir(dir, 3).unwrap();
+        }
+        fs::create_dir_all(&b).unwrap(); // b's destination is taken again: not restored
+
+        let result = restore_batch(&trash_root, &manager.batch_id, false, false).unwrap();
+        assert_eq!((result.restored_count, result.skipped_count), (1, 1));
+        let batches = list_trash_batches(&trash_root).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].entries_count, 1);
+        assert!(trash_root.join(&manager.batch_id).exists());
+    }
+
+    /// Simulates an entry trashed onto another volume's `.dev-cleaner-trash` folder.
+    fn volume_entry(temp: &Path, volume: &str, batch: &str, days_old: i64) -> TrashEntry {
+        let trashed = temp
+            .join(volume)
+            .join(VOLUME_TRASH_DIRNAME)
+            .join(batch)
+            .join("proj/target");
+        if temp.join(volume).exists() {
+            fs::create_dir_all(&trashed).unwrap();
+            fs::write(trashed.join("blob"), "z").unwrap();
+        }
+        make_entry(
+            batch,
+            Utc::now() - Duration::days(days_old),
+            temp.join(volume).join("proj/target"),
+            trashed,
+            9,
+        )
+    }
+
+    #[test]
+    fn test_purge_and_gc_remove_batches_on_other_volumes() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        fs::create_dir_all(temp.path().join("ssd")).unwrap();
+        let log = trash_root.join(TRASH_LOG_FILENAME);
+        let fresh = volume_entry(temp.path(), "ssd", "batch-new", 0);
+        let old = volume_entry(temp.path(), "ssd", "batch-old", 40);
+        write_entries(&log, &[fresh, old]);
+
+        let gc = gc_trash(&trash_root, Some(30), None, false).unwrap();
+        assert_eq!((gc.removed_batches, gc.failed_batches), (1, 0));
+        let volume_trash = temp.path().join("ssd").join(VOLUME_TRASH_DIRNAME);
+        assert!(!volume_trash.join("batch-old").exists());
+        assert!(volume_trash.join("batch-new").exists());
+
+        let purge = purge_trash_batch(&trash_root, "batch-new", false).unwrap();
+        assert_eq!(purge.failed_batches, 0);
+        assert!(!volume_trash.join("batch-new").exists());
+        assert!(list_trash_batches(&trash_root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_purge_keeps_log_when_volume_is_not_mounted() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log = trash_root.join(TRASH_LOG_FILENAME);
+        write_entries(&log, &[volume_entry(temp.path(), "ejected", "batch-1", 0)]);
+
+        let purge = purge_trash_batch(&trash_root, "batch-1", false).unwrap();
+        assert_eq!(purge.failed_batches, 1);
+        assert!(purge.errors[0].contains("not mounted"));
+        assert_eq!(list_trash_batches(&trash_root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_same_volume_items_use_the_main_trash_root() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let manager = TrashManager::new_with_root(trash_root.clone()).unwrap();
+        let dir = temp.path().join("proj").join("target");
+        fs::create_dir_all(&dir).unwrap();
+        assert!(foreign_volume_root(&dir, &trash_root).is_none());
+        let entry = manager.trash_dir(&dir, 1).unwrap();
+        assert!(entry
+            .trashed_path
+            .starts_with(trash_root.join(&manager.batch_id)));
+    }
+
+    #[test]
     fn test_list_and_purge_trash_batch() {
         let temp = TempDir::new().unwrap();
         let trash_root = temp.path().join("trash");
@@ -920,7 +1183,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_move_path_with_exdev_fallback_rejects_symlinks() {
+    fn test_move_path_rejects_symlinks() {
         use std::os::unix::fs::symlink;
 
         let temp = TempDir::new().unwrap();
@@ -929,7 +1192,7 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         symlink(&src, temp.path().join("src-link")).unwrap();
 
-        let err = move_path_with_exdev_fallback(&temp.path().join("src-link"), &dst)
+        let err = move_path(&temp.path().join("src-link"), &dst, true)
             .expect_err("symlink sources must be rejected");
         assert!(err.to_string().contains("Refusing to move symlink path"));
     }

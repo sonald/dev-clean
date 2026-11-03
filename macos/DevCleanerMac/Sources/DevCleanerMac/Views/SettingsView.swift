@@ -109,6 +109,9 @@ struct SettingsView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(DCColor.elevated)
                             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        Text("Items on other volumes stay on that volume, in a hidden `.dev-cleaner-trash` folder, so trashing never copies data onto this disk.")
+                            .font(.caption)
+                            .foregroundStyle(DCColor.tertiary)
                         ToggleStepperRow(
                             title: "Purge old batches automatically",
                             subtitle: "Runs at launch and after each cleanup. Batches older than this are deleted permanently.",

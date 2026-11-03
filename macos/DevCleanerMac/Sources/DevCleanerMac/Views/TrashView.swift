@@ -19,6 +19,16 @@ struct TrashView: View {
                     .buttonStyle(SecondaryButtonStyle())
                 }
 
+                if model.trashOverLimit {
+                    Label("Trash holds \(DevCleanerFormatters.bytes(model.trashTotalBytes)), over your \(model.preferences.trashLimitGb) GB warning limit. Trashed items still use disk space until purged.", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(DCColor.yellow)
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(DCColor.yellow.opacity(0.10))
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+
                 HStack(alignment: .top, spacing: 20) {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
