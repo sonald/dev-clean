@@ -160,7 +160,8 @@ Unless `--permanent` (or `--dry-run`) is given, clean/apply/TUI move directories
 ### Add a New Built-in Project Type
 
 1. Add a variant to `ProjectType` in `crates/dev-cleaner-core/src/scanner/detector.rs`.
-2. Update `ProjectDetector::detect()` with marker-file checks.
+2. Add a marker-file check to `ProjectDetector::detect_all()` (a root can match several types; order is priority).
+   Also add the variant to both `ALL_PROJECT_TYPES` arrays in `walker.rs`.
 3. Add built-in cleanable patterns in `ProjectDetector::cleanable_dirs()`.
 4. If new patterns don’t classify correctly, extend `classify_category()` in `crates/dev-cleaner-core/src/scanner/walker.rs`.
 5. If applicable, add lock-file checks in `ProjectDetector::is_in_use()`.

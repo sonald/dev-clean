@@ -27,9 +27,9 @@ Project homepage: <https://sonald.me/dev-clean/>
 
 | Language/Framework | Cleanable Directories |
 |-------------------|----------------------|
-| **Node.js** | `node_modules`, `.next`, `.nuxt`, `dist`, `build`, `.cache`, `.turbo`, `.parcel-cache` |
+| **Node.js** | `node_modules`, `.next`, `.nuxt`, `dist`, `build`, `.cache`, `.turbo`, `.parcel-cache`, `.vite`, `.nyc_output`, `storybook-static` |
 | **Rust** | `target` |
-| **Python** | `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.tox`, `*.egg-info`, `.eggs`, `build`, `dist` |
+| **Python** | `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.tox`, `.hypothesis`, `*.egg-info`, `.eggs`, `build`, `dist` |
 | **Java/Maven** | `target`, `out` |
 | **Kotlin/Gradle** | `build`, `.gradle`, `out` |
 | **Scala (sbt)** | `target`, `project/target` |
@@ -43,6 +43,11 @@ Project homepage: <https://sonald.me/dev-clean/>
 | **PHP** | `vendor` |
 | **Elixir** | `_build`, `deps` |
 | **.NET** | `bin`, `obj` |
+| **Terraform** | `.terraform` |
+| **Elm** | `elm-stuff` |
+| **Unity** | `Library`, `Temp`, `obj` |
+
+A root with markers for several ecosystems (e.g. `package.json` + `pyproject.toml`) gets the patterns of all of them.
 
 ## Installation
 

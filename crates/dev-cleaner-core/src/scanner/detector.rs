@@ -28,6 +28,9 @@ pub enum ProjectType {
     DotNet,
     Maven,
     Gradle,
+    Terraform,
+    Elm,
+    Unity,
     Generic,
 }
 
@@ -49,6 +52,8 @@ impl ProjectType {
             Self::Php => "magenta",
             Self::Elixir => "magenta",
             Self::DotNet => "blue",
+            Self::Terraform => "magenta",
+            Self::Elm => "cyan",
             _ => "white",
         }
     }
@@ -75,6 +80,9 @@ impl ProjectType {
             Self::DotNet => ".NET",
             Self::Maven => "Maven",
             Self::Gradle => "Gradle",
+            Self::Terraform => "Terraform",
+            Self::Elm => "Elm",
+            Self::Unity => "Unity",
             Self::Generic => "Generic",
         }
     }
@@ -84,78 +92,67 @@ impl ProjectType {
 pub struct ProjectDetector;
 
 impl ProjectDetector {
-    /// Detect project type by checking marker files
+    /// Detect the primary project type (the first of `detect_all`).
     pub fn detect(dir: &Path) -> Option<ProjectType> {
-        if dir.join("package.json").exists() || dir.join("package-lock.json").exists() {
-            return Some(ProjectType::NodeJs);
-        }
+        Self::detect_all(dir).first().copied()
+    }
 
-        if dir.join("Cargo.toml").exists() {
-            return Some(ProjectType::Rust);
-        }
+    /// Detect every project type whose marker files are present, in priority order.
+    ///
+    /// Mixed roots (e.g. `package.json` + `pyproject.toml`) need the cleanable patterns of
+    /// every ecosystem; picking only the first one hid `.venv` in Node+Python projects.
+    pub fn detect_all(dir: &Path) -> Vec<ProjectType> {
+        let has = |name: &str| dir.join(name).exists();
+        let exts = dir_extensions(dir);
+        let has_ext = |ext: &str| exts.iter().any(|e| e.eq_ignore_ascii_case(ext));
 
-        if dir.join("requirements.txt").exists()
-            || dir.join("setup.py").exists()
-            || dir.join("pyproject.toml").exists()
-            || dir.join("Pipfile").exists()
-        {
-            return Some(ProjectType::Python);
-        }
+        let checks = [
+            (
+                has("package.json") || has("package-lock.json"),
+                ProjectType::NodeJs,
+            ),
+            (has("Cargo.toml"), ProjectType::Rust),
+            (
+                has("requirements.txt")
+                    || has("setup.py")
+                    || has("pyproject.toml")
+                    || has("Pipfile"),
+                ProjectType::Python,
+            ),
+            (has("pom.xml"), ProjectType::Maven),
+            (
+                has("build.gradle") || has("build.gradle.kts"),
+                ProjectType::Gradle,
+            ),
+            (has("build.sbt"), ProjectType::Scala),
+            (has("project.clj") || has("deps.edn"), ProjectType::Clojure),
+            (has("pubspec.yaml"), ProjectType::Dart),
+            (has("stack.yaml") || has_ext("cabal"), ProjectType::Haskell),
+            (has("go.mod"), ProjectType::Go),
+            (has("Gemfile"), ProjectType::Ruby),
+            (has("Package.swift"), ProjectType::Swift),
+            (has("composer.json"), ProjectType::Php),
+            (has("mix.exs"), ProjectType::Elixir),
+            (has_ext("csproj") || has_ext("sln"), ProjectType::DotNet),
+            (has_ext("tf"), ProjectType::Terraform),
+            (has("elm.json"), ProjectType::Elm),
+            (
+                has("ProjectSettings/ProjectVersion.txt"),
+                ProjectType::Unity,
+            ),
+            (has("CMakeLists.txt"), ProjectType::Cpp),
+        ];
+        let mut types: Vec<ProjectType> = checks
+            .into_iter()
+            .filter_map(|(hit, project_type)| hit.then_some(project_type))
+            .collect();
 
-        if dir.join("pom.xml").exists() {
-            return Some(ProjectType::Maven);
+        // A bare Makefile is too common (Go/Python/Node repos ship one) to add C++ patterns
+        // like `out/` to a project already identified by a stronger marker.
+        if types.is_empty() && has("Makefile") {
+            types.push(ProjectType::Cpp);
         }
-
-        if dir.join("build.gradle").exists() || dir.join("build.gradle.kts").exists() {
-            return Some(ProjectType::Gradle);
-        }
-
-        if dir.join("build.sbt").exists() {
-            return Some(ProjectType::Scala);
-        }
-
-        if dir.join("project.clj").exists() || dir.join("deps.edn").exists() {
-            return Some(ProjectType::Clojure);
-        }
-
-        if dir.join("pubspec.yaml").exists() {
-            return Some(ProjectType::Dart);
-        }
-
-        if dir.join("stack.yaml").exists() || dir_contains_extension(dir, &["cabal"]) {
-            return Some(ProjectType::Haskell);
-        }
-
-        if dir.join("go.mod").exists() {
-            return Some(ProjectType::Go);
-        }
-
-        if dir.join("Gemfile").exists() {
-            return Some(ProjectType::Ruby);
-        }
-
-        if dir.join("Package.swift").exists() {
-            return Some(ProjectType::Swift);
-        }
-
-        if dir.join("composer.json").exists() {
-            return Some(ProjectType::Php);
-        }
-
-        if dir.join("mix.exs").exists() {
-            return Some(ProjectType::Elixir);
-        }
-
-        if dir_contains_extension(dir, &["csproj", "sln"]) {
-            return Some(ProjectType::DotNet);
-        }
-
-        if dir.join("CMakeLists.txt").exists() || dir.join("Makefile").exists() {
-            // Could be C or C++, default to C++
-            return Some(ProjectType::Cpp);
-        }
-
-        None
+        types
     }
 
     /// Check if a directory is a CMake build directory (out-of-source build)
@@ -195,6 +192,9 @@ impl ProjectDetector {
                 ".cache",
                 ".turbo",
                 ".parcel-cache",
+                ".vite",
+                ".nyc_output",
+                "storybook-static",
             ],
             ProjectType::Rust => vec!["target"],
             ProjectType::Python => vec![
@@ -204,6 +204,7 @@ impl ProjectDetector {
                 ".pytest_cache",
                 ".mypy_cache",
                 ".tox",
+                ".hypothesis",
                 "*.egg-info",
                 ".eggs",
                 "build",
@@ -224,6 +225,9 @@ impl ProjectDetector {
             ProjectType::Php => vec!["vendor"],
             ProjectType::Elixir => vec!["_build", "deps"],
             ProjectType::DotNet => vec!["bin", "obj"],
+            ProjectType::Terraform => vec![".terraform"],
+            ProjectType::Elm => vec!["elm-stuff"],
+            ProjectType::Unity => vec!["Library", "Temp", "obj"],
             ProjectType::Generic => vec![],
         }
     }
@@ -290,6 +294,11 @@ impl ProjectDetector {
             ProjectType::DotNet => {
                 Self::check_recent_lock_files(project_dir, &["packages.lock.json"])
             }
+            ProjectType::Terraform => {
+                Self::check_recent_lock_files(project_dir, &[".terraform.lock.hcl"])
+            }
+            // The editor holds this file for as long as the project is open.
+            ProjectType::Unity => project_dir.join("Temp/UnityLockfile").exists(),
             _ => false,
         }
     }
@@ -528,29 +537,20 @@ fn custom_root_matches(project_root: &Path, custom: &CustomPattern) -> bool {
     }
 }
 
-fn dir_contains_extension(dir: &Path, extensions: &[&str]) -> bool {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return false,
+fn dir_extensions(dir: &Path) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
     };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        if extensions
-            .iter()
-            .any(|candidate| ext.eq_ignore_ascii_case(candidate))
-        {
-            return true;
-        }
-    }
-
-    false
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_file()))
+        .filter_map(|entry| {
+            Path::new(&entry.file_name())
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_string)
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -208,21 +208,23 @@ Audit 默认开启，日志会按大小轮转：
 
 当前内置项目类型：
 
-- Node.js、Rust、Python、Java、Kotlin、Scala、Clojure、Dart、Haskell、Go、C、C++、Ruby、Swift、PHP、Elixir、.NET、Maven、Gradle、Generic。
+- Node.js、Rust、Python、Java、Kotlin、Scala、Clojure、Dart、Haskell、Go、C、C++、Ruby、Swift、PHP、Elixir、.NET、Maven、Gradle、Terraform、Elm、Unity、Generic。
 
 检测方式：
 
 - marker file 优先，例如 `package.json`、`Cargo.toml`、`pyproject.toml`、`pom.xml`、`build.gradle`、`go.mod`、`Package.swift`、`composer.json`、`mix.exs` 等。
-- C/C++ 使用 `CMakeLists.txt` 或 `Makefile`，默认归为 C++。
+- 一个目录可同时命中多个类型（`ProjectDetector::detect_all`），匹配时依次尝试每个类型的规则；in-use 检查所有命中类型的锁文件。
+- Terraform 用 `*.tf`，Elm 用 `elm.json`，Unity 用 `ProjectSettings/ProjectVersion.txt`（in-use：`Temp/UnityLockfile` 存在即编辑器打开中）。
+- C/C++ 使用 `CMakeLists.txt`；单独的 `Makefile` 只在没有其他类型命中时才归为 C++（避免给 Go/Python 等项目加上 `out` 规则）。
 - Generic 主要用于 `.gitignore` 发现项等没有明确项目类型的目标。
 
 ### 4.2 Cleanable Patterns
 
 当前主要内置规则：
 
-- Node.js：`node_modules`、`.next`、`.nuxt`、`dist`、`build`、`.cache`、`.turbo`、`.parcel-cache`
+- Node.js：`node_modules`、`.next`、`.nuxt`、`dist`、`build`、`.cache`、`.turbo`、`.parcel-cache`、`.vite`、`.nyc_output`、`storybook-static`
 - Rust：`target`
-- Python：`.venv`、`venv`、`__pycache__`、`.pytest_cache`、`.mypy_cache`、`.tox`、`*.egg-info`、`.eggs`、`build`、`dist`
+- Python：`.venv`、`venv`、`__pycache__`、`.pytest_cache`、`.mypy_cache`、`.tox`、`.hypothesis`、`*.egg-info`、`.eggs`、`build`、`dist`
 - Java/Maven：`target`、`out`
 - Kotlin/Gradle：`build`、`.gradle`、`out`
 - Scala：`target`、`project/target`
@@ -236,6 +238,11 @@ Audit 默认开启，日志会按大小轮转：
 - PHP：`vendor`
 - Elixir：`_build`、`deps`
 - .NET：`bin`、`obj`
+- Terraform：`.terraform`（deps，high risk）
+- Elm：`elm-stuff`
+- Unity：`Library`、`Temp`、`obj`
+
+范围说明：本项目定位为 Mole（`mo clean` / `mo purge`）的补充，Mole 已覆盖的全局缓存和项目产物规则不重复实现。`bazel-*`、Nix `result` 是符号链接，删除不释放空间，不纳入。
 
 ### 4.3 `.gitignore` 的两种语义
 
@@ -562,7 +569,7 @@ macOS App `macos/DevCleanerMac/`：SwiftUI 界面、`AppModel` 状态与 `Bridge
 1. TUI 的过滤、搜索、排序、流式增量更新能力仍不如 CLI 完整。
 2. Recent/in-use 主要是启发式；还没有 git activity、lsof/fuser、procfs/libproc provider。
 3. Audit 已覆盖 clean/apply，但没有完整 scan/stats/recommend 历史趋势和 top-growth。
-4. 还没有全局开发缓存模块，例如 npm/pip/cargo/docker cache。
+4. 全局开发缓存不做：由 Mole `mo clean` 覆盖。
 5. 还没有 ncdu/treemap 风格空间地图。
 6. `.gitignore` discovery 仍刻意保守，复杂 pattern 不会全部转成候选。
 7. Plan schema v3 已有 params 和 metadata，但未来如果加入更强 audit/replay 语义，需要继续 bump schema。
@@ -573,7 +580,7 @@ macOS App `macos/DevCleanerMac/`：SwiftUI 界面、`AppModel` 状态与 `Bridge
 1. TUI 与 selector 统一更多过滤/详情能力。
 2. 增强 activity/in-use providers，并把来源展示为 heuristic/verified。
 3. 将 audit 扩展为 history/top-growth。
-4. 增加 cache module，默认关闭且独立于项目产物清理。
+4. （已取消）cache module 由 Mole 覆盖。
 5. 增加空间地图或 HTML report。
 
 ---

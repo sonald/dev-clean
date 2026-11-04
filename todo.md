@@ -78,6 +78,11 @@
 - [x] 6.1 CI：`.github/workflows/ci.yml`，Ubuntu + macOS 跑 fmt、clippy（暂不 `-D warnings`，存量 45 条）、`cargo test --workspace --locked`，macOS 跑 `swift test`。修复了只在 macOS 通过的 metrics 测试（写死 `Library/Application Support`，Linux 走 `XDG_CONFIG_HOME`）。已在 Linux 容器验证并模拟 runner 的共享 XDG 目录，无泄漏。
 - [x] 6.2 AGENTS.md / README / QUICKSTART / spec 同步（测试命令改为 `--workspace`、克隆地址占位符、默认移入回收站与新参数、剪枝/git 保护/占用块、按卷回收站、macOS App 与 bridge、过时的模块路径、最低 Rust 版本 1.85）。
 
-### 阶段 7（可选）：全局开发缓存模块
-- [ ] 7.1 独立、默认关闭；覆盖 Xcode DerivedData、包管理器缓存等，优先调用官方清理命令。
-  - 本轮未做：需要先定范围（哪些缓存、是否只调官方命令），作为后续独立功能。
+### 阶段 7（取消）：全局开发缓存模块
+- [-] 7.1 独立、默认关闭；覆盖 Xcode DerivedData、包管理器缓存等，优先调用官方清理命令。
+  - 取消（2026-11-04）：本项目定位为 Mole 的补充，`mo clean` 已覆盖全局缓存。
+
+### 阶段 8：Mole 之外的检测补齐（2026-11-04）
+- [x] 8.1 多类型检测：`detect_all` 返回所有命中类型，混合根目录（如 Node+Python）每个生态的规则都生效；in-use 检查所有类型；裸 `Makefile` 只在无其他类型时归为 C++。实测 `~/work` 多发现 1 项（Node+Python 项目的 `.venv`）。
+- [x] 8.2 补 Mole 也没有的规则：Node `.vite`/`.nyc_output`/`storybook-static`，Python `.hypothesis`，Terraform `.terraform`，Elm `elm-stuff`，Unity `Library`/`Temp`/`obj`。不做：`bazel-*`、Nix `result`（符号链接）、`.vercel`/`.netlify`（含项目链接配置）、`.ipynb_checkpoints`（笔记本备份）。
+- [ ] 8.3 废弃 git worktree 清理（Mole 明确不删 worktree），需先定"废弃"标准。

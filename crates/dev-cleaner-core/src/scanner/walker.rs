@@ -158,7 +158,7 @@ pub struct Scanner {
     gitignore_cache: Mutex<HashMap<PathBuf, Arc<Gitignore>>>,
 
     /// Cache of project type detection per traversed directory
-    project_type_cache: Mutex<HashMap<PathBuf, Option<ProjectType>>>,
+    project_type_cache: Mutex<HashMap<PathBuf, Arc<[ProjectType]>>>,
 
     /// Cache of custom root marker checks per project root and custom pattern index
     custom_root_cache: Mutex<HashMap<(PathBuf, usize), bool>>,
@@ -583,14 +583,26 @@ impl Scanner {
                 }
             }
 
-            if let Some(project_type) = self.project_type_for(parent) {
-                // Check if current directory is a cleanable dir for this project type
+            let project_types = self.project_types_for(parent);
+            if !project_types.is_empty() {
+                // Check if current directory is a cleanable dir for any detected project type.
                 // This includes both default patterns AND patterns from `.gitignore` discovery.
-                let matchers = self.matchers_for(project_type, parent);
-                let gitignore_rule = self.gitignore_rule_for(parent, dir, dir_name.as_ref());
-                let builtin_rule = matchers.matched_rule(dir_name.as_ref(), &relative_path);
+                let builtin_match = project_types.iter().find_map(|&project_type| {
+                    self.matchers_for(project_type, parent)
+                        .matched_rule(dir_name.as_ref(), &relative_path)
+                        .map(|rule| (project_type, rule))
+                });
+                let gitignore_rule = if builtin_match.is_none() {
+                    self.gitignore_rule_for(parent, dir, dir_name.as_ref())
+                } else {
+                    None
+                };
+                let project_type = builtin_match
+                    .as_ref()
+                    .map_or(project_types[0], |(project_type, _)| *project_type);
+                let rule = builtin_match.map(|(_, rule)| rule).or(gitignore_rule);
 
-                if builtin_rule.is_some() || gitignore_rule.is_some() {
+                if let Some(rule) = rule {
                     let info = if fast_mode {
                         self.build_project_info_fast(parent, project_type, dir)
                     } else {
@@ -598,15 +610,7 @@ impl Scanner {
                     };
 
                     if let Some(mut info) = info {
-                        if let Some(rule) = builtin_rule {
-                            apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
-                        } else if let Some(rule) = gitignore_rule {
-                            apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
-                        } else {
-                            // Shouldn't happen, but keep the default fields intact if we can't pinpoint a rule.
-                            info.category = classify_category(dir_name.as_ref(), &relative_path);
-                            info.risk_level = default_risk_level(info.category);
-                        }
+                        apply_matched_rule(&mut info, rule, dir_name.as_ref(), &relative_path);
                         return Some(info);
                     }
                 }
@@ -659,17 +663,22 @@ impl Scanner {
         None
     }
 
-    fn project_type_for(&self, dir: &Path) -> Option<ProjectType> {
-        let key = dir.to_path_buf();
-
-        if let Some(cached) = self.project_type_cache.lock().unwrap().get(&key).copied() {
-            return cached;
+    fn project_types_for(&self, dir: &Path) -> Arc<[ProjectType]> {
+        if let Some(cached) = self.project_type_cache.lock().unwrap().get(dir) {
+            return Arc::clone(cached);
         }
 
-        let detected = ProjectDetector::detect(dir);
+        let detected: Arc<[ProjectType]> = ProjectDetector::detect_all(dir).into();
         let mut cache = self.project_type_cache.lock().unwrap();
-        cache.insert(key, detected);
-        detected
+        Arc::clone(cache.entry(dir.to_path_buf()).or_insert(detected))
+    }
+
+    /// In use if the lock files of any ecosystem at `project_root` were touched recently.
+    fn is_in_use(&self, project_root: &Path, project_type: ProjectType) -> bool {
+        ProjectDetector::is_in_use(project_root, project_type)
+            || self.project_types_for(project_root).iter().any(|&other| {
+                other != project_type && ProjectDetector::is_in_use(project_root, other)
+            })
     }
 
     fn custom_root_matches(
@@ -783,7 +792,7 @@ impl Scanner {
         let last_modified = system_time_to_datetime(modified);
 
         // Check if project is in use
-        let in_use = ProjectDetector::is_in_use(project_root, project_type);
+        let in_use = self.is_in_use(project_root, project_type);
 
         Some(ProjectInfo::new_pending(
             project_root.to_path_buf(),
@@ -810,7 +819,7 @@ impl Scanner {
         let last_modified = system_time_to_datetime(modified);
 
         // Check if project is in use
-        let in_use = ProjectDetector::is_in_use(project_root, project_type);
+        let in_use = self.is_in_use(project_root, project_type);
 
         Some(ProjectInfo {
             root: project_root.to_path_buf(),
@@ -916,7 +925,7 @@ fn build_candidate_matchers(custom_patterns: &[CustomPattern]) -> CandidateMatch
     };
 
     // Built-in cleanable patterns across all supported project types.
-    const ALL_PROJECT_TYPES: [ProjectType; 20] = [
+    const ALL_PROJECT_TYPES: [ProjectType; 23] = [
         ProjectType::NodeJs,
         ProjectType::Rust,
         ProjectType::Python,
@@ -936,6 +945,9 @@ fn build_candidate_matchers(custom_patterns: &[CustomPattern]) -> CandidateMatch
         ProjectType::DotNet,
         ProjectType::Maven,
         ProjectType::Gradle,
+        ProjectType::Terraform,
+        ProjectType::Elm,
+        ProjectType::Unity,
         ProjectType::Generic,
     ];
 
@@ -1049,6 +1061,7 @@ fn classify_category(basename: &str, relative_path: &str) -> Category {
         || basename == "vendor"
         || basename == "deps"
         || basename == ".bundle"
+        || basename == ".terraform"
         || relative_path == "vendor/bundle"
         || relative_path.starts_with("vendor/bundle/")
     {
@@ -1065,6 +1078,10 @@ fn classify_category(basename: &str, relative_path: &str) -> Category {
         || basename == ".dart_tool"
         || basename == ".turbo"
         || basename == ".parcel-cache"
+        || basename == ".vite"
+        || basename == ".nyc_output"
+        || basename == ".hypothesis"
+        || basename == "temp"
     {
         return Category::Cache;
     }
@@ -1085,6 +1102,9 @@ fn classify_category(basename: &str, relative_path: &str) -> Category {
         || basename == ".swiftpm"
         || basename == "bin"
         || basename == "obj"
+        || basename == "storybook-static"
+        || basename == "elm-stuff"
+        || basename == "library"
         || basename.starts_with("cmake-build")
         || basename.ends_with(".egg-info")
     {
@@ -1408,6 +1428,93 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_type, ProjectType::Ruby);
         assert!(results[0].cleanable_dir.ends_with("vendor/bundle"));
+    }
+
+    fn touch_dir(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("x"), "y").unwrap();
+    }
+
+    #[test]
+    fn test_scanner_mixed_root_uses_every_detected_type() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("fullstack");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("package.json"), "{}").unwrap();
+        fs::write(project.join("pyproject.toml"), "[project]").unwrap();
+        touch_dir(&project.join("node_modules"));
+        touch_dir(&project.join(".venv"));
+
+        let results = Scanner::new(temp.path()).scan().unwrap();
+        let found = |name: &str| {
+            results
+                .iter()
+                .find(|r| r.cleanable_dir.ends_with(name))
+                .map(|r| r.project_type)
+        };
+        assert_eq!(found("node_modules"), Some(ProjectType::NodeJs));
+        assert_eq!(found(".venv"), Some(ProjectType::Python));
+    }
+
+    #[test]
+    fn test_scanner_makefile_does_not_add_cpp_patterns_to_other_projects() {
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("go-tool");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("go.mod"), "module x").unwrap();
+        fs::write(project.join("Makefile"), "all:").unwrap();
+        touch_dir(&project.join("out"));
+
+        let results = Scanner::new(temp.path()).scan().unwrap();
+        assert!(results.is_empty(), "{results:?}");
+    }
+
+    #[test]
+    fn test_scanner_new_ecosystems() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let tf = root.join("infra");
+        fs::create_dir(&tf).unwrap();
+        fs::write(tf.join("main.tf"), "").unwrap();
+        touch_dir(&tf.join(".terraform"));
+
+        let elm = root.join("elm-app");
+        fs::create_dir(&elm).unwrap();
+        fs::write(elm.join("elm.json"), "{}").unwrap();
+        touch_dir(&elm.join("elm-stuff"));
+
+        let unity = root.join("game");
+        fs::create_dir_all(unity.join("ProjectSettings")).unwrap();
+        fs::write(
+            unity.join("ProjectSettings/ProjectVersion.txt"),
+            "m_EditorVersion: 6",
+        )
+        .unwrap();
+        touch_dir(&unity.join("Library"));
+
+        let web = root.join("web");
+        fs::create_dir(&web).unwrap();
+        fs::write(web.join("package.json"), "{}").unwrap();
+        touch_dir(&web.join("storybook-static"));
+
+        let results = Scanner::new(root).scan().unwrap();
+        let get = |name: &str| results.iter().find(|r| r.cleanable_dir.ends_with(name));
+
+        let terraform = get(".terraform").expect(".terraform");
+        assert_eq!(terraform.project_type, ProjectType::Terraform);
+        assert_eq!(terraform.category, Category::Deps);
+        assert_eq!(get("elm-stuff").unwrap().project_type, ProjectType::Elm);
+        let library = get("Library").expect("Library");
+        assert_eq!(library.project_type, ProjectType::Unity);
+        assert!(!library.in_use);
+        assert_eq!(get("storybook-static").unwrap().category, Category::Build);
+
+        // An open Unity editor holds Temp/UnityLockfile.
+        touch_dir(&unity.join("Temp"));
+        fs::write(unity.join("Temp/UnityLockfile"), "").unwrap();
+        let results = Scanner::new(root).scan().unwrap();
+        assert!(results.iter().filter(|r| r.root == unity).all(|r| r.in_use));
     }
 
     #[test]
@@ -1738,7 +1845,7 @@ mod tests {
 
     #[test]
     fn test_builtin_patterns_have_known_categories() {
-        const ALL_PROJECT_TYPES: [ProjectType; 20] = [
+        const ALL_PROJECT_TYPES: [ProjectType; 23] = [
             ProjectType::NodeJs,
             ProjectType::Rust,
             ProjectType::Python,
@@ -1758,6 +1865,9 @@ mod tests {
             ProjectType::DotNet,
             ProjectType::Maven,
             ProjectType::Gradle,
+            ProjectType::Terraform,
+            ProjectType::Elm,
+            ProjectType::Unity,
             ProjectType::Generic,
         ];
 
