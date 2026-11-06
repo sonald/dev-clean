@@ -301,6 +301,7 @@ Confidence：
 
 - 不进入隐藏目录（扫描根本身除外）和 `node_modules` 内部继续寻找项目，避免把依赖包或工具缓存里的 `dist/`、`build/` 当成目标；`custom_patterns` 中以 `.` 开头的路径组件（如 `.yarn/cache` 的 `.yarn`）仍会进入。
 - 目标目录内若有 git 跟踪的文件（`git ls-files` 非空），视为源码，不作为 cleanable target。
+- 目标目录是或包含 git checkout 时也不作为 target：任意深度内有登记在外层仓库的 linked worktree（`git worktree list`），或非 builtin 规则命中的目标在三层以内有 `.git`（独立 clone）。外层仓库的 `ls-files` 看不到这些文件，否则 `.gitignore` 里的 `.worktrees/` 连同未提交改动会被列为可清理项（`ProjectDetector::contains_git_checkout`）。
 - size 为实际占用的磁盘块（`st_blocks * 512`），稀疏文件不会被高估；硬链接只有在所有链接都位于目标内时才计入。
 
 ### 4.7 Dedup

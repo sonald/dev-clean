@@ -541,7 +541,16 @@ impl Scanner {
     fn check_directory_impl(&self, dir: &Path, fast_mode: bool) -> Option<ProjectInfo> {
         let info = self.match_directory(dir, fast_mode)?;
         // Committed `dist/`, `build/` or `vendor/` folders are source, not artifacts.
-        (!ProjectDetector::contains_tracked_files(dir)).then_some(info)
+        if ProjectDetector::contains_tracked_files(dir) {
+            return None;
+        }
+        // Worktrees and nested clones hold files the enclosing repo cannot see. Builtin targets
+        // (`node_modules`, `target`, ...) are tool-owned, so skip the nested `.git` probe there.
+        let probe_nested = info
+            .matched_rule
+            .as_ref()
+            .is_none_or(|rule| rule.source != RuleSource::Builtin);
+        (!ProjectDetector::contains_git_checkout(dir, probe_nested)).then_some(info)
     }
 
     fn match_directory(&self, dir: &Path, fast_mode: bool) -> Option<ProjectInfo> {
@@ -1310,6 +1319,58 @@ mod tests {
         let scanner = Scanner::new(&repo);
         assert!(scanner.revalidate_target(repo.join("dist")).is_none());
         assert!(scanner.revalidate_target(repo.join("build")).is_some());
+    }
+
+    #[test]
+    fn test_scanner_ignores_targets_holding_worktrees_or_clones() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("app");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("package.json"), "{}").unwrap();
+        fs::write(
+            repo.join(".gitignore"),
+            ".worktrees/\nexternal/\n.scratch/\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        // A linked worktree nested deeper than the shallow `.git` probe reaches.
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            ".worktrees/a/b/c/feat",
+            "-b",
+            "feat",
+        ]);
+        fs::write(repo.join(".worktrees/a/b/c/feat/notes.txt"), "uncommitted").unwrap();
+        // An independent clone inside a gitignored folder.
+        fs::create_dir_all(repo.join("external/lib/.git")).unwrap();
+        fs::write(repo.join("external/lib/wip.rs"), "uncommitted").unwrap();
+        // A plain gitignored folder is still discovered.
+        touch_dir(&repo.join(".scratch"));
+
+        let scanner = Scanner::new(temp.path()).max_risk(RiskLevel::High);
+        let results = scanner.scan().unwrap();
+        assert_eq!(found_relative(&results, temp.path()), vec!["app/.scratch"]);
+        assert!(scanner.revalidate_target(repo.join(".worktrees")).is_none());
+        assert!(scanner.revalidate_target(repo.join("external")).is_none());
     }
 
     #[test]

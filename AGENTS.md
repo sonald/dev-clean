@@ -101,6 +101,7 @@ Both pipelines share these rules:
 - Scan roots are made absolute first (`ScanService::resolve_inputs`), so every path in output, plans, the trash log and the audit log is cwd-independent.
 - Traversal does not descend into hidden directories (except the scan root itself and hidden components named by `custom_patterns`, e.g. `.yarn`) or into `node_modules`.
 - A target that contains git-tracked files is treated as source and dropped (`ProjectDetector::contains_tracked_files`).
+- So is a target that is or holds a git checkout: a linked worktree registered with the enclosing repo (any depth), or, for non-builtin rules, a `.git` within three levels (`ProjectDetector::contains_git_checkout`).
 - Sizes are allocated blocks (`st_blocks * 512`); hard links count only when every link is inside the target.
 
 `Scanner::scan()` (used by commands that need full results like `stats`):

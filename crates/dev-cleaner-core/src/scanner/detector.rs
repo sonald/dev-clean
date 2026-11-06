@@ -262,6 +262,42 @@ impl ProjectDetector {
             .unwrap_or(false)
     }
 
+    /// True when `dir` is or holds a git checkout of its own: a linked worktree registered
+    /// with the enclosing repository (at any depth), or, with `probe_nested`, a `.git` entry
+    /// up to three levels down (an independent clone).
+    ///
+    /// The enclosing repo's `ls-files` cannot see files in those checkouts, so
+    /// `contains_tracked_files` would pass a gitignored `.worktrees/` holding uncommitted work.
+    pub fn contains_git_checkout(dir: &Path, probe_nested: bool) -> bool {
+        if probe_nested && has_git_entry(dir, 3) {
+            return true;
+        }
+        let Some(work_tree) = dir.ancestors().find(|p| p.join(".git").exists()) else {
+            return false;
+        };
+        // A main repository without linked worktrees has no `.git/worktrees`; skip the spawn.
+        let git = work_tree.join(".git");
+        if git.is_dir() && !git.join("worktrees").is_dir() {
+            return false;
+        }
+        let Ok(out) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(work_tree)
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let dir = canonical(dir);
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter_map(|field| field.strip_prefix("worktree "))
+            .any(|path| canonical(Path::new(path)).starts_with(&dir))
+    }
+
     /// Check if a directory is currently in use based on lock files
     pub fn is_in_use(project_dir: &Path, project_type: ProjectType) -> bool {
         match project_type {
@@ -535,6 +571,22 @@ fn custom_root_matches(project_root: &Path, custom: &CustomPattern) -> bool {
             .iter()
             .all(|marker| project_root.join(marker).exists()),
     }
+}
+
+fn has_git_entry(dir: &Path, depth: usize) -> bool {
+    if dir.join(".git").exists() {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_dir()))
+        .any(|entry| has_git_entry(&entry.path(), depth - 1))
 }
 
 fn dir_extensions(dir: &Path) -> Vec<String> {
