@@ -86,5 +86,5 @@
 - [x] 8.1 多类型检测：`detect_all` 返回所有命中类型，混合根目录（如 Node+Python）每个生态的规则都生效；in-use 检查所有类型；裸 `Makefile` 只在无其他类型时归为 C++。实测 `~/work` 多发现 1 项（Node+Python 项目的 `.venv`）。
 - [x] 8.2 补 Mole 也没有的规则：Node `.vite`/`.nyc_output`/`storybook-static`，Python `.hypothesis`，Terraform `.terraform`，Elm `elm-stuff`，Unity `Library`/`Temp`/`obj`。不做：`bazel-*`、Nix `result`（符号链接）、`.vercel`/`.netlify`（含项目链接配置）、`.ipynb_checkpoints`（笔记本备份）。
 - [x] 8.3a 修复：`.gitignore` 里的 `.worktrees/` 等目录连同其中 worktree 的未提交改动会被列为可清理项（外层仓库 `ls-files` 看不到 worktree 文件）。现在任意深度内有登记的 worktree、或非 builtin 目标三层内有 `.git`（独立 clone）都不作为候选；扫描与 apply 复核共用。`~/work` 实测结果与耗时不变。
-- [ ] 8.3b 进入 `<repo>/.claude/worktrees`、`~/.codex/worktrees` 扫描其中产物（当前不进入隐藏目录，meloface worktree 内约 4.3 GB `node_modules` 扫不到）。
-- [ ] 8.3c 废弃 git worktree 清理（Mole 明确不删 worktree），需先定"废弃"标准。
+- [-] 8.3b 进入 `<repo>/.claude/worktrees`、`~/.codex/worktrees` 扫描其中产物。取消（2026-11-09）：`mo purge` 已覆盖（实测 `scan_purge_targets`，`fd --hidden` 会进入隐藏目录）。Mole 的缺口只是搜索根以下 6 层的深度限制，与 worktree 无关，可用 `~/.config/mole/purge_paths` 把深层项目加为搜索根。
+- [ ] 8.3c（搁置，2026-11-09）废弃 git worktree 清理（Mole 明确不删 worktree）。本机实测可安全删除的只有约 35 MB，等废弃 worktree 占用明显空间时再做；届时需先定"废弃"标准。
