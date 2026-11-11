@@ -18,6 +18,9 @@ for arg in "$@"; do
   esac
 done
 
+# The root package's version, so the bundle never drifts from Cargo.toml.
+VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT/Cargo.toml" | head -1)"
+
 echo "Building Rust helper..."
 cargo build --manifest-path "$ROOT/Cargo.toml"
 
@@ -66,7 +69,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.3.0</string>
+  <string>$VERSION</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>

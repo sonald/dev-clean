@@ -31,6 +31,7 @@ final class AppModel: ObservableObject {
     @Published var trashBatches: [TrashBatch] = []
     @Published var trashEntries: [TrashEntry] = []
     @Published var selectedTrashBatchID: String?
+    private var auditRecordsRunID: String?
     @Published var auditRuns: [AuditRun] = []
     @Published var auditItems: [AuditItemRecord] = []
     @Published var isRecommending = false
@@ -137,11 +138,6 @@ final class AppModel: ObservableObject {
         trashBatches.reduce(0) { $0 + $1.totalSize }
     }
 
-    var selectedTrashBatch: TrashBatch? {
-        guard let selectedTrashBatchID else { return trashBatches.first }
-        return trashBatches.first { $0.batchId == selectedTrashBatchID }
-    }
-
     var filteredAuditRuns: [AuditRun] {
         switch auditFilter {
         case .all:
@@ -206,6 +202,8 @@ final class AppModel: ObservableObject {
     }
 
     func startSmartScan() {
+        // A new scan clears the results a running cleanup is reporting into.
+        guard !isCleaning else { return }
         guard !isScanning else {
             stopScan()
             return
@@ -401,6 +399,7 @@ final class AppModel: ObservableObject {
     }
 
     func showTrashEntries(batch: TrashBatch) async {
+        if selectedTrashBatchID != batch.batchId { trashEntries = [] }
         selectedTrashBatchID = batch.batchId
         do {
             try await bridge.run(arguments: ["trash", "show", "--batch", batch.batchId]) { [weak self] event in
@@ -452,10 +451,13 @@ final class AppModel: ObservableObject {
 
     func loadAuditRecords(runID: String?) async {
         auditItems = []
+        auditRecordsRunID = runID
         guard let runID else { return }
         do {
             try await bridge.run(arguments: ["audit", "show", "--run", runID]) { [weak self] event in
-                self?.handle(event)
+                // Rows clicked in quick succession overlap; only the latest selection may fill the panel.
+                guard let self, self.auditRecordsRunID == runID else { return }
+                self.handle(event)
             }
         } catch {
             alert = AppAlert(title: "Audit Details Failed", message: error.localizedDescription)
@@ -491,6 +493,11 @@ final class AppModel: ObservableObject {
             }
         } catch {
             preferences = GuiPreferences()
+            // Without a snapshot every settings change below is dropped, so say why.
+            alert = AppAlert(
+                title: "Settings Could Not Be Loaded",
+                message: "Changes will not be saved until the config file is fixed.\n\n\(error.localizedDescription)"
+            )
         }
     }
 
@@ -582,6 +589,8 @@ final class AppModel: ObservableObject {
         case .scanStarted(_, let total):
             scanProgress = total == 0 ? 0 : scanProgress
         case .scanItem(let project):
+            // Overlapping scan roots (e.g. /a and /a/b) report the same target twice.
+            guard !projects.contains(where: { $0.id == project.id }) else { break }
             projects.append(project)
             if focusedProjectID == nil { focusedProjectID = project.id }
         case .scanProgress(let completed, let total):
@@ -638,6 +647,7 @@ final class AppModel: ObservableObject {
             trashBatches = payload.decodePayloadArray(path: ["batches"], as: TrashBatch.self)
             if let selectedTrashBatchID, !trashBatches.contains(where: { $0.batchId == selectedTrashBatchID }) {
                 self.selectedTrashBatchID = trashBatches.first?.batchId
+                trashEntries = []  // they belonged to the batch that is gone
             }
         case .trashEntries(let payload):
             trashEntries = payload.decodePayloadArray(path: ["entries"], as: TrashEntry.self)
@@ -754,17 +764,13 @@ enum AuditFilter: String, CaseIterable, Identifiable {
 }
 
 struct RecommendationPreview {
-    var targetBytes: UInt64 = 0
     var selectedBytes: UInt64 = 0
     var selectedCount: Int = 0
-    var strategy: String = "balanced"
     var projects: [BridgeProject] = []
 
     init(payload: JSONValue) {
-        targetBytes = payload.uint64(path: ["target_bytes"]) ?? 0
         selectedBytes = payload.uint64(path: ["selected_bytes"]) ?? 0
         selectedCount = payload.int(path: ["selected_count"]) ?? 0
-        strategy = payload.string(path: ["strategy"]) ?? "balanced"
         projects = payload.decodePayloadArray(path: ["projects"], as: BridgeProject.self)
     }
 }

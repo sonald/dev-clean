@@ -28,6 +28,7 @@ struct DevCleanerMacApp: App {
                     }
                 }
                 .keyboardShortcut("r", modifiers: [.command])
+                .disabled(model.isCleaning)
 
                 Button("Move Selected to Trash") {
                     model.presentCleanup(mode: .trash, items: model.selectedProjects)
