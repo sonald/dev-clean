@@ -134,15 +134,11 @@ pub struct CustomPattern {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MarkerMode {
+    #[default]
     AnyOf,
     AllOf,
-}
-
-impl Default for MarkerMode {
-    fn default() -> Self {
-        Self::AnyOf
-    }
 }
 
 impl Config {
@@ -164,12 +160,31 @@ impl Config {
 
         let config: Config =
             toml::from_str(&content).with_context(|| "Failed to parse config file")?;
+        config.validate()?;
 
         Ok(config)
     }
 
+    /// Reject keep patterns that don't compile: skipping one would silently unprotect
+    /// what it was meant to keep.
+    pub fn validate(&self) -> Result<()> {
+        for (key, patterns) in [
+            ("keep_globs", &self.keep_globs),
+            ("keep_project_roots", &self.keep_project_roots),
+        ] {
+            for pattern in patterns {
+                globset::GlobBuilder::new(pattern)
+                    .literal_separator(true)
+                    .build()
+                    .with_context(|| format!("Invalid {key} pattern {pattern:?}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Save config to file
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.validate()?;
         let content = toml::to_string_pretty(self).with_context(|| "Failed to serialize config")?;
 
         fs::write(path.as_ref(), content)

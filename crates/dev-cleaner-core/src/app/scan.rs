@@ -31,7 +31,7 @@ impl Default for VisibilityOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ScanRequest {
     pub path: Option<PathBuf>,
     pub profile: Option<String>,
@@ -42,22 +42,6 @@ pub struct ScanRequest {
     pub category: Option<Category>,
     pub max_risk: Option<RiskLevel>,
     pub visibility: VisibilityOptions,
-}
-
-impl Default for ScanRequest {
-    fn default() -> Self {
-        Self {
-            path: None,
-            profile: None,
-            depth: None,
-            min_size_mb: None,
-            older_than_days: None,
-            gitignore: None,
-            category: None,
-            max_risk: None,
-            visibility: VisibilityOptions::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,13 +179,14 @@ impl ScanService {
         self.evaluate_projects(projects, &keep_policy, recent_days)
     }
 
-    pub fn evaluate_project_with_config(
+    /// Evaluate one streamed project. Build `keep_policy` once per scan, not per item.
+    pub fn evaluate_project(
         &self,
-        config: &Config,
         project: ProjectInfo,
+        keep_policy: &KeepPolicy,
         recent_days: i64,
     ) -> EvaluatedProject {
-        self.evaluate_projects_with_config(config, vec![project], recent_days)
+        self.evaluate_projects(vec![project], keep_policy, recent_days)
             .into_iter()
             .next()
             .expect("single project evaluation should return one project")
@@ -236,7 +221,7 @@ impl ScanService {
         let mut evaluated =
             self.evaluate_projects(discovered, &keep_policy, resolved.visibility.recent_days);
         evaluated = self.deduplicate_projects(evaluated);
-        evaluated.sort_by(|a, b| b.info.size.cmp(&a.info.size));
+        evaluated.sort_by_key(|p| std::cmp::Reverse(p.info.size));
 
         Ok(DiscoveredProjects {
             resolved,
@@ -424,10 +409,12 @@ mod tests {
 
     #[test]
     fn resolve_inputs_prefers_profile_and_defaults() {
-        let mut config = Config::default();
-        config.default_depth = Some(3);
-        config.min_size_mb = Some(10);
-        config.max_age_days = Some(9);
+        let mut config = Config {
+            default_depth: Some(3),
+            min_size_mb: Some(10),
+            max_age_days: Some(9),
+            ..Default::default()
+        };
         config.scan_profiles.insert(
             "demo".to_string(),
             ScanProfile {
@@ -539,7 +526,10 @@ mod tests {
         fs::create_dir_all(&b).unwrap();
 
         assert_eq!(derive_scan_root(&[]), PathBuf::from("."));
-        assert_eq!(derive_scan_root(&[a.clone()]), canonicalize_lossy(&a));
+        assert_eq!(
+            derive_scan_root(std::slice::from_ref(&a)),
+            canonicalize_lossy(&a)
+        );
         assert_eq!(
             derive_scan_root(&[a.clone(), PathBuf::from("relative-root")]),
             canonicalize_lossy(&a)

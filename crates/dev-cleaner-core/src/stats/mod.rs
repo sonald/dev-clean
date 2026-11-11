@@ -93,7 +93,7 @@ impl Statistics {
 
         // Create top largest list
         let mut sorted_projects = projects.clone();
-        sorted_projects.sort_by(|a, b| b.size.cmp(&a.size));
+        sorted_projects.sort_by_key(|p| std::cmp::Reverse(p.size));
         let top_largest: Vec<ProjectStats> = sorted_projects
             .iter()
             .map(|p| ProjectStats {

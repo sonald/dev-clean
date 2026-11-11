@@ -22,6 +22,13 @@ enum PatternTarget {
     RelativePath,
 }
 
+/// Builtin names common enough to appear as ordinary source folders (`src/util/bin`,
+/// `tools/build`). They only count as targets directly under a detected project root; tool
+/// caches such as `__pycache__` or `node_modules` still match at any depth.
+const AMBIGUOUS_BUILTIN_NAMES: &[&str] = &[
+    "bin", "build", "deps", "dist", "obj", "out", "vendor", "Library", "Temp",
+];
+
 struct CompiledPattern {
     pattern: String,
     target: PatternTarget,
@@ -30,7 +37,11 @@ struct CompiledPattern {
 
 impl CompiledPattern {
     fn new(pattern: &str) -> Option<Self> {
-        let pattern = pattern.replace('\\', "/");
+        // Same normalization as `build_candidate_matchers`: `build/` and `/build` mean `build`.
+        let pattern = pattern.replace('\\', "/").trim_matches('/').to_string();
+        if pattern.is_empty() {
+            return None;
+        }
         let target = if pattern.contains('/') {
             PatternTarget::RelativePath
         } else {
@@ -152,7 +163,7 @@ pub struct Scanner {
     max_age_days: Option<i64>,
 
     /// Cache of compiled cleanable directory matchers per project root/type
-    matcher_cache: Mutex<HashMap<(PathBuf, ProjectType), Arc<CleanableMatchers>>>,
+    matcher_cache: Mutex<HashMap<ProjectType, Arc<CleanableMatchers>>>,
 
     /// Cache of compiled `.gitignore` matchers per project root
     gitignore_cache: Mutex<HashMap<PathBuf, Arc<Gitignore>>>,
@@ -278,7 +289,7 @@ impl Scanner {
             final_results.retain(|project| project.size >= min_size);
         }
 
-        final_results.sort_by(|a, b| b.size.cmp(&a.size));
+        final_results.sort_by_key(|p| std::cmp::Reverse(p.size));
 
         self.emit_scan_trace(ScanPerfTrace {
             mode: "scan",
@@ -373,7 +384,7 @@ impl Scanner {
                     Err(_) => return WalkState::Continue,
                 };
 
-                if !entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
                     return WalkState::Continue;
                 }
 
@@ -396,14 +407,18 @@ impl Scanner {
                     }
                 }
 
-                if let Some(project_info) = scanner.check_directory_fast(dir) {
-                    // Apply non-size filters early (size filtering will be applied after size calculation).
-                    if scanner.passes_filters(&project_info) {
-                        results.lock().unwrap().push(project_info);
+                if let Some(project_info) = scanner.match_directory(dir, true) {
+                    // Cheap non-size filters first: the git guards below spawn `git`, and at the
+                    // default `--max-risk medium` every `node_modules` would pay for that only to
+                    // be dropped. (Size filtering happens after size calculation.)
+                    if !scanner.passes_filters(&project_info) {
+                        return WalkState::Skip;
                     }
-
-                    // Avoid walking into cleanable directories.
-                    return WalkState::Skip;
+                    if scanner.passes_git_guards(dir, &project_info) {
+                        results.lock().unwrap().push(project_info);
+                        // Avoid walking into cleanable directories.
+                        return WalkState::Skip;
+                    }
                 }
 
                 scanner.descend_state(&entry)
@@ -530,19 +545,17 @@ impl Scanner {
         self.check_directory_impl(dir, false)
     }
 
-    /// Check if a directory is a cleanable project directory (fast mode - no size calc)
-    fn check_directory_fast(&self, dir: &Path) -> Option<ProjectInfo> {
-        self.check_directory_impl(dir, true)
-    }
-
     /// Implementation of directory checking with configurable fast mode.
-    ///
-    /// Shared by discovery and `revalidate_target`, so plan application gets the same guard.
     fn check_directory_impl(&self, dir: &Path, fast_mode: bool) -> Option<ProjectInfo> {
         let info = self.match_directory(dir, fast_mode)?;
+        self.passes_git_guards(dir, &info).then_some(info)
+    }
+
+    /// Shared by discovery and `revalidate_target`, so plan application gets the same guard.
+    fn passes_git_guards(&self, dir: &Path, info: &ProjectInfo) -> bool {
         // Committed `dist/`, `build/` or `vendor/` folders are source, not artifacts.
         if ProjectDetector::contains_tracked_files(dir) {
-            return None;
+            return false;
         }
         // Worktrees and nested clones hold files the enclosing repo cannot see. Builtin targets
         // (`node_modules`, `target`, ...) are tool-owned, so skip the nested `.git` probe there.
@@ -550,7 +563,7 @@ impl Scanner {
             .matched_rule
             .as_ref()
             .is_none_or(|rule| rule.source != RuleSource::Builtin);
-        (!ProjectDetector::contains_git_checkout(dir, probe_nested)).then_some(info)
+        !ProjectDetector::contains_git_checkout(dir, probe_nested)
     }
 
     fn match_directory(&self, dir: &Path, fast_mode: bool) -> Option<ProjectInfo> {
@@ -597,8 +610,12 @@ impl Scanner {
                 // Check if current directory is a cleanable dir for any detected project type.
                 // This includes both default patterns AND patterns from `.gitignore` discovery.
                 let builtin_match = project_types.iter().find_map(|&project_type| {
-                    self.matchers_for(project_type, parent)
+                    self.matchers_for(project_type)
                         .matched_rule(dir_name.as_ref(), &relative_path)
+                        .filter(|rule| {
+                            !(AMBIGUOUS_BUILTIN_NAMES.contains(&rule.pattern.as_str())
+                                && relative_path.contains('/'))
+                        })
                         .map(|rule| (project_type, rule))
                 });
                 let gitignore_rule = if builtin_match.is_none() {
@@ -722,12 +739,9 @@ impl Scanner {
         matched
     }
 
-    fn matchers_for(
-        &self,
-        project_type: ProjectType,
-        project_root: &Path,
-    ) -> Arc<CleanableMatchers> {
-        let key = (project_root.to_path_buf(), project_type);
+    /// Builtin matchers depend only on the project type, so they are compiled once per type.
+    fn matchers_for(&self, project_type: ProjectType) -> Arc<CleanableMatchers> {
+        let key = project_type;
 
         // Fast path: cache hit
         if let Some(cached) = self.matcher_cache.lock().unwrap().get(&key) {
@@ -735,7 +749,7 @@ impl Scanner {
         }
 
         // Build outside lock to avoid blocking other threads while compiling patterns.
-        let built = Arc::new(build_matchers(project_type, project_root));
+        let built = Arc::new(build_matchers(project_type));
 
         let mut cache = self.matcher_cache.lock().unwrap();
         Arc::clone(cache.entry(key).or_insert_with(|| Arc::clone(&built)))
@@ -777,9 +791,7 @@ impl Scanner {
             return None;
         };
 
-        let Some(pattern) = ProjectDetector::gitignore_discovery_pattern(glob.original()) else {
-            return None;
-        };
+        let pattern = ProjectDetector::gitignore_discovery_pattern(glob.original())?;
 
         Some(RuleRef {
             source: RuleSource::Gitignore,
@@ -854,12 +866,6 @@ impl Scanner {
     /// Check if project info passes all filters
     fn passes_filters(&self, info: &ProjectInfo) -> bool {
         // Size filter
-        if let Some(min_size) = self.min_size {
-            if info.size_calculated && info.size < min_size {
-                return false;
-            }
-        }
-
         // Category filter
         if let Some(category) = self.category_filter {
             if info.category != category {
@@ -934,33 +940,8 @@ fn build_candidate_matchers(custom_patterns: &[CustomPattern]) -> CandidateMatch
     };
 
     // Built-in cleanable patterns across all supported project types.
-    const ALL_PROJECT_TYPES: [ProjectType; 23] = [
-        ProjectType::NodeJs,
-        ProjectType::Rust,
-        ProjectType::Python,
-        ProjectType::Java,
-        ProjectType::Kotlin,
-        ProjectType::Scala,
-        ProjectType::Clojure,
-        ProjectType::Dart,
-        ProjectType::Haskell,
-        ProjectType::Go,
-        ProjectType::C,
-        ProjectType::Cpp,
-        ProjectType::Ruby,
-        ProjectType::Swift,
-        ProjectType::Php,
-        ProjectType::Elixir,
-        ProjectType::DotNet,
-        ProjectType::Maven,
-        ProjectType::Gradle,
-        ProjectType::Terraform,
-        ProjectType::Elm,
-        ProjectType::Unity,
-        ProjectType::Generic,
-    ];
 
-    for project_type in ALL_PROJECT_TYPES {
+    for project_type in ProjectType::ALL {
         for pattern in ProjectDetector::cleanable_dirs(project_type) {
             add_pattern(pattern);
         }
@@ -1004,7 +985,7 @@ fn compile_custom_patterns(patterns: &[CustomPattern]) -> Vec<CompiledCustomPatt
     compiled
 }
 
-fn build_matchers(project_type: ProjectType, _project_root: &Path) -> CleanableMatchers {
+fn build_matchers(project_type: ProjectType) -> CleanableMatchers {
     let builtin_patterns = ProjectDetector::cleanable_dirs(project_type)
         .iter()
         .filter_map(|pattern| CompiledPattern::new(pattern))
@@ -1183,7 +1164,7 @@ fn system_time_to_datetime(time: SystemTime) -> DateTime<Utc> {
     let duration = time
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    DateTime::from_timestamp(duration.as_secs() as i64, 0).unwrap_or_else(|| Utc::now())
+    DateTime::from_timestamp(duration.as_secs() as i64, 0).unwrap_or_else(Utc::now)
 }
 
 #[cfg(test)]
@@ -1727,6 +1708,89 @@ mod tests {
     }
 
     #[test]
+    fn test_ambiguous_builtin_names_match_only_under_the_root() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("goproj");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("src/util/bin")).unwrap();
+        fs::create_dir_all(root.join("src/util/__pycache__")).unwrap();
+        fs::write(root.join("go.mod"), "module x\n").unwrap();
+        fs::write(root.join("pyproject.toml"), "").unwrap();
+        for dir in ["bin", "src/util/bin", "src/util/__pycache__"] {
+            fs::write(root.join(dir).join("x"), "y").unwrap();
+        }
+
+        let found = Scanner::new(&root)
+            .max_risk(RiskLevel::High)
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.cleanable_dir.strip_prefix(&root).unwrap().to_path_buf())
+            .collect::<Vec<_>>();
+        assert!(found.contains(&PathBuf::from("bin")));
+        assert!(found.contains(&PathBuf::from("src/util/__pycache__")));
+        assert!(!found.contains(&PathBuf::from("src/util/bin")), "{found:?}");
+    }
+
+    #[test]
+    fn test_explain_reports_the_rule_that_matched() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        fs::write(root.join("marker"), "").unwrap();
+        for dir in ["dist", "out-custom"] {
+            fs::create_dir(root.join(dir)).unwrap();
+            fs::write(root.join(dir).join("x"), "y").unwrap();
+        }
+        let patterns = vec![CustomPattern {
+            name: "Mine".to_string(),
+            directory: "out-custom".to_string(),
+            marker_files: vec!["marker".to_string()],
+            marker_mode: MarkerMode::AnyOf,
+        }];
+
+        let results = Scanner::new(root)
+            .custom_patterns(&patterns)
+            .scan()
+            .unwrap();
+        let explain = |name: &str| {
+            results
+                .iter()
+                .find(|p| p.cleanable_dir.ends_with(name))
+                .map(|p| p.explain())
+                .unwrap()
+        };
+        assert_eq!(explain("dist"), "matched builtin pattern `dist`");
+        assert_eq!(
+            explain("out-custom"),
+            "matched config custom pattern `Mine` directory `out-custom`"
+        );
+    }
+
+    #[test]
+    fn test_custom_pattern_with_slashes_matches() {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("proj");
+        fs::create_dir_all(project_dir.join("out")).unwrap();
+        fs::write(project_dir.join("marker"), "").unwrap();
+        fs::write(project_dir.join("out").join("x"), "y").unwrap();
+
+        for directory in ["out/", "/out"] {
+            let patterns = vec![CustomPattern {
+                name: "Custom".to_string(),
+                directory: directory.to_string(),
+                marker_files: vec!["marker".to_string()],
+                marker_mode: MarkerMode::AnyOf,
+            }];
+            let results = Scanner::new(temp.path())
+                .custom_patterns(&patterns)
+                .scan()
+                .unwrap();
+            assert_eq!(results.len(), 1, "pattern {directory:?}");
+        }
+    }
+
+    #[test]
     fn test_scan_and_streaming_return_same_results() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -1760,7 +1824,7 @@ mod tests {
         let scanner = Scanner::new(root).max_risk(RiskLevel::Medium);
         let (expected, rx) = scanner.scan_with_streaming().unwrap();
         let mut streaming_results = rx.iter().collect::<Vec<_>>();
-        streaming_results.sort_by(|a, b| b.size.cmp(&a.size));
+        streaming_results.sort_by_key(|p| std::cmp::Reverse(p.size));
 
         assert_eq!(expected, streaming_results.len());
         assert_eq!(snapshot(&scan_results), snapshot(&streaming_results));
@@ -1906,33 +1970,7 @@ mod tests {
 
     #[test]
     fn test_builtin_patterns_have_known_categories() {
-        const ALL_PROJECT_TYPES: [ProjectType; 23] = [
-            ProjectType::NodeJs,
-            ProjectType::Rust,
-            ProjectType::Python,
-            ProjectType::Java,
-            ProjectType::Kotlin,
-            ProjectType::Scala,
-            ProjectType::Clojure,
-            ProjectType::Dart,
-            ProjectType::Haskell,
-            ProjectType::Go,
-            ProjectType::C,
-            ProjectType::Cpp,
-            ProjectType::Ruby,
-            ProjectType::Swift,
-            ProjectType::Php,
-            ProjectType::Elixir,
-            ProjectType::DotNet,
-            ProjectType::Maven,
-            ProjectType::Gradle,
-            ProjectType::Terraform,
-            ProjectType::Elm,
-            ProjectType::Unity,
-            ProjectType::Generic,
-        ];
-
-        for project_type in ALL_PROJECT_TYPES {
+        for project_type in ProjectType::ALL {
             for pattern in ProjectDetector::cleanable_dirs(project_type) {
                 let normalized = pattern.replace('\\', "/");
                 let sample_relative = if normalized.contains('*') {

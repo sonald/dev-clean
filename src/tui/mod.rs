@@ -5,12 +5,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use dev_cleaner_core::app::{ScanRequest, ScanService};
 use dev_cleaner_core::audit::AuditLogger;
 use dev_cleaner_core::evaluation::EvaluatedProject;
-use dev_cleaner_core::scanner::RiskLevel;
 use dev_cleaner_core::utils::format_size;
-use dev_cleaner_core::{Cleaner, Config, ProjectInfo};
+use dev_cleaner_core::{CleanResult, Cleaner, Config, ProjectInfo};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -20,7 +18,6 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
 enum SortKey {
@@ -182,17 +179,21 @@ impl AppState {
         }
     }
 
+    /// Selected rows that are currently visible. Enter acts on these only: rows hidden by a
+    /// search or filter stay selected for later but are never cleaned unseen.
+    fn effective_selection(&self) -> impl Iterator<Item = &EvaluatedProject> {
+        self.visible_indices
+            .iter()
+            .filter(|idx| self.selected[**idx])
+            .map(|idx| &self.projects[*idx])
+    }
+
     fn selected_count(&self) -> usize {
-        self.selected.iter().filter(|&&v| v).count()
+        self.effective_selection().count()
     }
 
     fn selected_size(&self) -> u64 {
-        self.projects
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| self.selected[*idx])
-            .map(|(_, p)| p.info.size)
-            .sum()
+        self.effective_selection().map(|p| p.info.size).sum()
     }
 
     fn visible_total_size(&self) -> u64 {
@@ -203,11 +204,8 @@ impl AppState {
     }
 
     fn get_selected_projects(&self) -> Vec<ProjectInfo> {
-        self.projects
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| self.selected[*idx])
-            .map(|(_, p)| p.to_project_info())
+        self.effective_selection()
+            .map(|p| p.to_project_info())
             .collect()
     }
 
@@ -254,6 +252,11 @@ impl AppState {
     fn toggle_current_selection(&mut self) {
         if let Some(cursor) = self.list_state.selected() {
             if let Some(&idx) = self.visible_indices.get(cursor) {
+                // Protected and in-use rows can be shown but never cleaned from the TUI.
+                let project = &self.projects[idx];
+                if project.safety.protected || project.info.in_use {
+                    return;
+                }
                 self.selected[idx] = !self.selected[idx];
             }
         }
@@ -519,32 +522,6 @@ fn block_reason(project: &EvaluatedProject, recent_days: i64) -> String {
     "No blocker. Safe to include in cleanup selection.".to_string()
 }
 
-pub fn run_tui(path: PathBuf) -> Result<()> {
-    let config = Config::load_or_default(Config::default_path())?;
-    run_tui_with_config(path, &config)
-}
-
-pub fn run_tui_with_config(path: PathBuf, config: &Config) -> Result<()> {
-    let (projects, recent_days) = load_tui_projects(path, config)?;
-    run_tui_projects(projects, false, false, recent_days, config)
-}
-
-fn load_tui_projects(path: PathBuf, config: &Config) -> Result<(Vec<ProjectInfo>, i64)> {
-    let request = ScanRequest {
-        path: Some(path),
-        max_risk: Some(RiskLevel::High),
-        ..Default::default()
-    };
-    let discovered = ScanService::new().discover(config, &request)?;
-    let recent_days = discovered.resolved.visibility.recent_days;
-    let projects = discovered
-        .projects
-        .into_iter()
-        .map(ProjectInfo::from)
-        .collect();
-    Ok((projects, recent_days))
-}
-
 pub fn run_tui_projects(
     projects: Vec<ProjectInfo>,
     include_recent: bool,
@@ -574,8 +551,21 @@ pub fn run_tui_projects(
     )?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        eprintln!("Error: {}", err);
+    // Print after leaving the alternate screen, or the summary (and undo batch id) is erased.
+    if let Some(result) = res? {
+        println!("\nCleaning completed!");
+        println!("  Cleaned: {}", result.cleaned_count);
+        println!(
+            "  Skipped: {} ({})",
+            result.skipped_count,
+            format_size(result.bytes_skipped)
+        );
+        println!("  Failed: {}", result.failed_count);
+        println!("  Moved to trash: {}", result.size_freed_human());
+        if let Some(batch_id) = &result.trash_batch_id {
+            println!("  Undo: dev-cleaner undo --batch {batch_id}");
+            println!("  Release space: dev-cleaner trash purge --batch {batch_id}");
+        }
     }
     Ok(())
 }
@@ -584,20 +574,21 @@ fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut app: AppState,
     audit: &AuditLogger,
-) -> Result<()> {
+) -> Result<Option<CleanResult>> {
     loop {
         terminal.draw(|f| render_ui(f, &mut app))?;
 
         if let Event::Key(key) = event::read()? {
             match handle_key(&mut app, key.code) {
                 AppOutcome::Continue => {}
-                AppOutcome::Quit => return Ok(()),
+                AppOutcome::Quit => return Ok(None),
                 AppOutcome::CleanSelected => {
                     disable_raw_mode()?;
                     // Enter cleans without a separate prompt, so it must stay undoable.
                     let selected = app.get_selected_projects();
                     let run_id = audit.start_run_with_mode("clean", Some("trash")).ok();
-                    let cleaner = Cleaner::new().verbose(true).trash(true);
+                    // Ticking a recent row (shown via R / --include-recent) is the consent to clean it.
+                    let cleaner = Cleaner::new().trash(true).include_recent(true);
                     let mut observer = AuditedCleanObserver {
                         terminal: TerminalCleanObserver::new(true),
                         audit,
@@ -616,20 +607,7 @@ fn run_app(
                             result.bytes_freed,
                         );
                     }
-                    println!("\nCleaning completed!");
-                    println!("  Cleaned: {}", result.cleaned_count);
-                    println!(
-                        "  Skipped: {} ({})",
-                        result.skipped_count,
-                        format_size(result.bytes_skipped)
-                    );
-                    println!("  Failed: {}", result.failed_count);
-                    println!("  Moved to trash: {}", result.size_freed_human());
-                    if let Some(batch_id) = &result.trash_batch_id {
-                        println!("  Undo: dev-cleaner undo --batch {batch_id}");
-                        println!("  Release space: dev-cleaner trash purge --batch {batch_id}");
-                    }
-                    return Ok(());
+                    return Ok(Some(result));
                 }
             }
         }
@@ -812,7 +790,7 @@ fn draw_filter_panel(f: &mut Frame, app: &AppState) {
     let area = centered_rect(62, 13, f.size());
     f.render_widget(Clear, area);
 
-    let fields = vec![
+    let fields = [
         format!("Sort: {}", app.sort_key.as_str()),
         format!("Include recent: {}", app.include_recent),
         format!("Include protected: {}", app.include_protected),
@@ -893,9 +871,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use dev_cleaner_core::scanner::{Category, RiskLevel};
-    use std::fs;
     use std::path::PathBuf;
-    use tempfile::TempDir;
 
     fn project(
         name: &str,
@@ -928,26 +904,58 @@ mod tests {
     }
 
     #[test]
-    fn load_tui_projects_applies_keep_policy() {
-        let temp = TempDir::new().unwrap();
-        let project_root = temp.path().join("app");
-        let target = project_root.join("target");
-        fs::create_dir_all(&target).unwrap();
-        fs::write(
-            project_root.join("Cargo.toml"),
-            "[package]\nname = \"app\"\n",
-        )
-        .unwrap();
-        fs::write(project_root.join(".dev-cleaner-keep"), "").unwrap();
-        fs::write(target.join("artifact.bin"), b"x").unwrap();
+    fn enter_cleans_only_visible_selection_and_never_protected_rows() {
+        let mut app = AppState::new(
+            vec![
+                project(
+                    "alpha",
+                    10,
+                    30,
+                    Category::Cache,
+                    RiskLevel::Low,
+                    false,
+                    false,
+                ),
+                project(
+                    "beta",
+                    20,
+                    30,
+                    Category::Cache,
+                    RiskLevel::Low,
+                    false,
+                    false,
+                ),
+                project("kept", 30, 30, Category::Cache, RiskLevel::Low, false, true),
+            ],
+            false,
+            true,
+            7,
+        );
+        assert_eq!(app.selected_count(), 2);
 
-        let (projects, recent_days) =
-            load_tui_projects(project_root.clone(), &Config::default()).unwrap();
+        // A search hides "beta": it stays selected but Enter must not clean it.
+        app.query = "alpha".to_string();
+        app.recompute_visible();
+        let names = |app: &AppState| {
+            app.get_selected_projects()
+                .into_iter()
+                .filter_map(|p| p.project_name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), vec!["alpha"]);
+        assert_eq!(app.selected_count(), 1);
 
-        assert_eq!(recent_days, 7);
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].cleanable_dir, target);
-        assert!(projects[0].protected);
+        // The protected row is visible (include_protected) but cannot be ticked.
+        app.query.clear();
+        app.recompute_visible();
+        let kept_row = app
+            .visible_indices
+            .iter()
+            .position(|&idx| app.projects[idx].info.project_name.as_deref() == Some("kept"))
+            .unwrap();
+        app.list_state.select(Some(kept_row));
+        app.toggle_current_selection();
+        assert!(!names(&app).contains(&"kept".to_string()));
     }
 
     #[test]

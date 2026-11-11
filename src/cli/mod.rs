@@ -16,8 +16,9 @@ use dev_cleaner_core::app::{
 };
 use dev_cleaner_core::audit::AuditLogger;
 use dev_cleaner_core::cleaner::CleanOptions;
+use dev_cleaner_core::policy::KeepPolicy;
 use dev_cleaner_core::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
-use dev_cleaner_core::scanner::{Category, ProjectDetector, RiskLevel, RuleSource};
+use dev_cleaner_core::scanner::{Category, RiskLevel, RuleSource};
 use dev_cleaner_core::trash::{
     default_trash_root, gc_trash, latest_batch_id, list_trash_batches, purge_trash_batch,
     restore_batch_with_observer, trash_entries_for_batch,
@@ -26,7 +27,6 @@ use dev_cleaner_core::utils::{format_size, parse_size};
 use dev_cleaner_core::{
     Cleaner, CleanupPlan, Config, EvaluatedProject as AppEvaluatedProject, ProjectInfo,
 };
-use serde_json::json;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -142,9 +142,10 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "all")]
         category: CategoryFilterArg,
 
-        /// Filter by max risk level (low/medium/high/all)
-        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
-        max_risk: RiskArg,
+        /// Filter by max risk level (low/medium/high/all) [default: medium, or the profile's]
+        // No clap default: an explicit `--max-risk medium` must be able to override a profile.
+        #[arg(long, value_enum, alias = "risk")]
+        max_risk: Option<RiskArg>,
 
         /// Include protected targets in results
         #[arg(long)]
@@ -216,9 +217,10 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "all")]
         category: CategoryFilterArg,
 
-        /// Filter by max risk level (low/medium/high/all)
-        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
-        max_risk: RiskArg,
+        /// Filter by max risk level (low/medium/high/all) [default: medium, or the profile's]
+        // No clap default: an explicit `--max-risk medium` must be able to override a profile.
+        #[arg(long, value_enum, alias = "risk")]
+        max_risk: Option<RiskArg>,
 
         /// Include recently modified targets
         #[arg(long)]
@@ -280,9 +282,10 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "all")]
         category: CategoryFilterArg,
 
-        /// Filter by max risk level (low/medium/high/all)
-        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
-        max_risk: RiskArg,
+        /// Filter by max risk level (low/medium/high/all) [default: medium, or the profile's]
+        // No clap default: an explicit `--max-risk medium` must be able to override a profile.
+        #[arg(long, value_enum, alias = "risk")]
+        max_risk: Option<RiskArg>,
 
         /// Include recently modified targets
         #[arg(long)]
@@ -332,9 +335,10 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "all")]
         category: CategoryFilterArg,
 
-        /// Filter by max risk level (low/medium/high/all)
-        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
-        max_risk: RiskArg,
+        /// Filter by max risk level (low/medium/high/all) [default: medium, or the profile's]
+        // No clap default: an explicit `--max-risk medium` must be able to override a profile.
+        #[arg(long, value_enum, alias = "risk")]
+        max_risk: Option<RiskArg>,
 
         /// Include recently modified targets
         #[arg(long)]
@@ -414,9 +418,10 @@ pub enum Commands {
         #[arg(long, value_enum, default_value = "all")]
         category: CategoryFilterArg,
 
-        /// Filter by max risk level (low/medium/high/all)
-        #[arg(long, value_enum, default_value = "medium", alias = "risk")]
-        max_risk: RiskArg,
+        /// Filter by max risk level (low/medium/high/all) [default: medium, or the profile's]
+        // No clap default: an explicit `--max-risk medium` must be able to override a profile.
+        #[arg(long, value_enum, alias = "risk")]
+        max_risk: Option<RiskArg>,
     },
 
     /// Apply a cleanup plan JSON file
@@ -443,6 +448,10 @@ pub enum Commands {
         /// Skip the confirmation prompt only (in-use targets stay skipped)
         #[arg(short = 'y', long)]
         yes: bool,
+
+        /// Allow in-use targets (still asks for confirmation; --force also skips it)
+        #[arg(long)]
+        include_in_use: bool,
 
         /// Disable plan target re-validation before applying
         #[arg(long)]
@@ -844,6 +853,7 @@ impl Cli {
                 permanent,
                 force,
                 yes,
+                include_in_use,
                 no_verify,
                 include_recent,
                 force_protected,
@@ -855,6 +865,7 @@ impl Cli {
                     dry_run,
                     trash || !permanent,
                     force,
+                    include_in_use,
                     yes,
                     no_verify,
                     include_recent,
@@ -909,7 +920,7 @@ fn build_scan_request(
     older_than: Option<i64>,
     gitignore: bool,
     category: CategoryFilterArg,
-    max_risk: RiskArg,
+    max_risk: Option<RiskArg>,
     include_protected: bool,
     include_recent: bool,
     recent_days: i64,
@@ -922,7 +933,7 @@ fn build_scan_request(
         older_than_days: older_than,
         gitignore: gitignore.then_some(true),
         category: category.to_filter(),
-        max_risk: (!matches!(max_risk, RiskArg::Medium)).then_some(max_risk.to_max_risk()),
+        max_risk: max_risk.map(RiskArg::to_max_risk),
         visibility: VisibilityOptions {
             include_protected,
             include_recent,
@@ -936,7 +947,7 @@ fn project_infos_from_evaluated(projects: Vec<AppEvaluatedProject>) -> Vec<Proje
         .into_iter()
         .map(ProjectInfo::from)
         .collect::<Vec<_>>();
-    projects.sort_by(|a, b| b.size.cmp(&a.size));
+    projects.sort_by_key(|p| std::cmp::Reverse(p.size));
     projects
 }
 
@@ -950,7 +961,7 @@ fn run_scan(
     json_output: bool,
     explain: bool,
     category: CategoryFilterArg,
-    max_risk: RiskArg,
+    max_risk: Option<RiskArg>,
     include_protected: bool,
     include_recent: bool,
     recent_days: i64,
@@ -986,6 +997,7 @@ fn run_scan(
     let mut seen = std::collections::HashSet::new();
     let mut total_size = 0u64;
     let mut candidates = 0usize;
+    let keep_policy = KeepPolicy::from_config(config);
     for root in &resolved.roots {
         let scanner = scan_service.build_scanner(root, config, &resolved);
         let (total_count, rx) = scanner.scan_with_streaming()?;
@@ -1014,16 +1026,19 @@ fn run_scan(
 
         for project in rx.iter() {
             pb.inc(1);
-            if !resolved
-                .min_size_bytes
-                .map_or(true, |min_size_bytes| project.size >= min_size_bytes)
+            // Unmeasured (timed out / unreadable) items are dropped, as `Scanner::scan` does,
+            // so `scan` never lists something `clean` would not offer.
+            if !project.size_calculated
+                || !resolved
+                    .min_size_bytes
+                    .is_none_or(|min_size_bytes| project.size >= min_size_bytes)
             {
                 continue;
             }
 
-            let evaluated = scan_service.evaluate_project_with_config(
-                config,
+            let evaluated = scan_service.evaluate_project(
                 project,
+                &keep_policy,
                 resolved.visibility.recent_days,
             );
             if !resolved.visibility.is_visible(&evaluated) {
@@ -1037,11 +1052,7 @@ fn run_scan(
 
             total_size += project.size;
             let dir_display = project.cleanable_dir.display().to_string();
-            let short_path = if dir_display.len() > 50 {
-                format!("...{}", &dir_display[dir_display.len() - 47..])
-            } else {
-                dir_display.clone()
-            };
+            let short_path = crate::stats::truncate_left(&dir_display, 50);
             pb.set_message(format!("{}: {}", short_path, project.size_human()));
             let rule_meta = detection_meta(&project);
             print_line(format!(
@@ -1064,12 +1075,7 @@ fn run_scan(
             ));
 
             if explain {
-                let reason = ProjectDetector::explain_cleanable_dir(
-                    project.project_type,
-                    &project.root,
-                    &project.cleanable_dir,
-                    &config.custom_patterns,
-                );
+                let reason = project.explain();
                 print_line(format!(
                     "    {} {}",
                     "↳".bright_black(),
@@ -1203,6 +1209,25 @@ fn audit_mode(dry_run: bool, trash: bool) -> &'static str {
 
 /// Trash moves and dry runs do not free disk space; say what actually happened.
 /// Moving to trash frees nothing until the batch is purged, so the label says so.
+/// `ProjectInfo.skip_reason` holds the plan/JSON label; the audit log uses `audit_label`.
+fn audit_skip_reason(project: &ProjectInfo) -> Option<String> {
+    let label = project.skip_reason.as_deref()?;
+    Some(
+        dev_cleaner_core::evaluation::SkipReason::from_legacy_label(label)
+            .map_or(label, |reason| reason.audit_label())
+            .to_string(),
+    )
+}
+
+/// Exit non-zero after a run where something failed, so scripts can tell. Called after the
+/// summary is printed and the audit run is finished.
+fn exit_status(failed: usize, what: &str) -> Result<()> {
+    if failed > 0 {
+        anyhow::bail!("{failed} {what} failed");
+    }
+    Ok(())
+}
+
 fn freed_label(dry_run: bool, trash: bool) -> &'static str {
     match (dry_run, trash) {
         (true, true) => "Would move to trash",
@@ -1308,7 +1333,7 @@ fn run_clean(
     verbose: bool,
     gitignore: bool,
     category: CategoryFilterArg,
-    max_risk: RiskArg,
+    max_risk: Option<RiskArg>,
     include_recent: bool,
     include_protected: bool,
     force_protected: bool,
@@ -1419,7 +1444,7 @@ fn run_clean(
                 item_action(trash),
                 "skipped",
                 project.size,
-                project.skip_reason.clone(),
+                audit_skip_reason(project),
             );
         }
     }
@@ -1471,7 +1496,7 @@ fn run_clean(
     );
 
     if share {
-        print_share_block_if_applicable(&result, dry_run, trash, auto, force, verbose);
+        print_share_block_if_applicable(&result, dry_run, trash);
     }
 
     if let Some(batch_id) = &result.trash_batch_id {
@@ -1504,7 +1529,7 @@ fn run_clean(
         );
     }
 
-    Ok(())
+    exit_status(result.failed_count, "item(s)")
 }
 
 fn build_share_snippet(
@@ -1516,29 +1541,25 @@ fn build_share_snippet(
         return None;
     }
 
-    let action = if dry_run { "could free" } else { "just freed" };
-    let undoable = if trash && !dry_run {
-        " (undoable via trash)"
-    } else {
-        ""
+    let size = format_size(result.bytes_freed);
+    let count = result.cleaned_count;
+    // A trash move frees nothing until the batch is purged (see `freed_label`).
+    let claim = match (dry_run, trash) {
+        (true, _) => format!("I could free {size} by cleaning {count} directories with dev-cleaner."),
+        (false, true) => format!(
+            "I just moved {size} ({count} directories) to the trash with dev-cleaner (undoable; purge to free the space)."
+        ),
+        (false, false) => {
+            format!("I just freed {size} by cleaning {count} directories with dev-cleaner.")
+        }
     };
-
-    Some(format!(
-        "I {} {} by cleaning {} directories with dev-cleaner{}.\nTry: dev-cleaner scan",
-        action,
-        format_size(result.bytes_freed),
-        result.cleaned_count,
-        undoable
-    ))
+    Some(format!("{claim}\nTry: dev-cleaner scan"))
 }
 
 fn print_share_block_if_applicable(
     result: &dev_cleaner_core::cleaner::CleanResult,
     dry_run: bool,
     trash: bool,
-    auto: bool,
-    force: bool,
-    verbose: bool,
 ) {
     let Some(snippet) = build_share_snippet(result, dry_run, trash) else {
         return;
@@ -1548,26 +1569,6 @@ fn print_share_block_if_applicable(
     println!("------------------------------");
     println!("{}", snippet);
     println!("------------------------------");
-
-    let props = json!({
-        "cleaned_count": result.cleaned_count,
-        "bytes_freed": result.bytes_freed,
-        "dry_run": dry_run,
-        "trash": trash,
-        "auto": auto,
-        "force": force,
-        "tool_version": env!("CARGO_PKG_VERSION"),
-    });
-
-    if let Err(err) = crate::metrics::log_event("share_generated", props) {
-        if verbose {
-            eprintln!(
-                "{} {}",
-                "Warning:".yellow().bold(),
-                format!("failed to write metrics event: {}", err).yellow()
-            );
-        }
-    }
 }
 
 fn display_projects(projects: &[ProjectInfo]) {
@@ -1675,7 +1676,7 @@ fn run_stats(
     json_output: bool,
     gitignore: bool,
     category: CategoryFilterArg,
-    max_risk: RiskArg,
+    max_risk: Option<RiskArg>,
     include_recent: bool,
     include_protected: bool,
     recent_days: i64,
@@ -1683,7 +1684,9 @@ fn run_stats(
 ) -> Result<()> {
     use crate::Statistics;
 
-    println!("{}", "Scanning for cleanable directories...".cyan().bold());
+    if !json_output {
+        println!("{}", "Scanning for cleanable directories...".cyan().bold());
+    }
     let scan_service = ScanService::new();
     let request = build_scan_request(
         path,
@@ -1701,7 +1704,7 @@ fn run_stats(
     let projects =
         project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
 
-    if projects.is_empty() {
+    if projects.is_empty() && !json_output {
         println!("{}", "No cleanable directories found.".yellow());
         return Ok(());
     }
@@ -1749,7 +1752,7 @@ fn run_plan(
     gitignore: bool,
     output: Option<PathBuf>,
     category: CategoryFilterArg,
-    max_risk: RiskArg,
+    max_risk: Option<RiskArg>,
     include_recent: bool,
     include_protected: bool,
     recent_days: i64,
@@ -1775,11 +1778,13 @@ fn run_plan(
     let max_risk_level = discovered.resolved.max_risk;
     let projects = project_infos_from_evaluated(discovered.projects);
 
-    let mut params = dev_cleaner_core::plan::PlanParams::default();
-    params.max_risk = Some(max_risk_level);
-    params.category = category_filter;
-    params.recent_days = Some(recent_days);
-    params.verify_mode = Some("strict".to_string());
+    let params = dev_cleaner_core::plan::PlanParams {
+        max_risk: Some(max_risk_level),
+        category: category_filter,
+        recent_days: Some(recent_days),
+        verify_mode: Some("strict".to_string()),
+        ..Default::default()
+    };
     let plan = CleanupPlan::new_with_params(scan_root, projects, params);
 
     if let Some(output_path) = output {
@@ -1814,7 +1819,7 @@ fn run_recommend(
     json_output: bool,
     explain: bool,
     category: CategoryFilterArg,
-    max_risk: RiskArg,
+    max_risk: Option<RiskArg>,
     config: &Config,
 ) -> Result<()> {
     use serde::Serialize;
@@ -1900,13 +1905,15 @@ fn run_recommend(
     };
 
     if let Some(plan_path) = &output_plan {
-        let mut params = dev_cleaner_core::plan::PlanParams::default();
-        params.cleanup_bytes = cleanup_bytes;
-        params.free_at_least_bytes = free_at_least_bytes;
-        params.max_risk = Some(max_risk);
-        params.category = category;
-        params.strategy = Some(opts.strategy.as_str().to_string());
-        params.recent_days = Some(recent_days);
+        let params = dev_cleaner_core::plan::PlanParams {
+            cleanup_bytes,
+            free_at_least_bytes,
+            max_risk: Some(max_risk),
+            category,
+            strategy: Some(opts.strategy.as_str().to_string()),
+            recent_days: Some(recent_days),
+            ..Default::default()
+        };
 
         let plan =
             CleanupPlan::new_with_params(scan_root.clone(), selected_projects.clone(), params);
@@ -1922,10 +1929,10 @@ fn run_recommend(
     println!("  Scan root: {}", scan_root.display());
     println!(
         "  Target: {}",
-        if free_at_least_bytes.is_some() {
+        if let Some(free_at_least_bytes) = free_at_least_bytes {
             format!(
                 "free at least {} (need {})",
-                format_size(free_at_least_bytes.unwrap()),
+                format_size(free_at_least_bytes),
                 format_size(target_bytes)
             )
         } else {
@@ -1961,12 +1968,7 @@ fn run_recommend(
     if explain {
         println!();
         for project in &out.projects {
-            let reason = ProjectDetector::explain_cleanable_dir(
-                project.project_type,
-                &project.root,
-                &project.cleanable_dir,
-                &config.custom_patterns,
-            );
+            let reason = project.explain();
             println!("  {} {}", "↳".bright_black(), reason.bright_black());
         }
     }
@@ -1988,6 +1990,7 @@ fn run_apply(
     dry_run: bool,
     trash: bool,
     force: bool,
+    include_in_use: bool,
     yes: bool,
     no_verify: bool,
     include_recent: bool,
@@ -1997,21 +2000,23 @@ fn run_apply(
     config: &Config,
 ) -> Result<()> {
     let plan = CleanupPlan::load_json(&plan_path)?;
-    let audit = AuditLogger::from_config(config);
-    let run_id = audit
-        .start_run_with_mode("apply", Some(audit_mode(dry_run, trash)))
-        .ok();
+    let allow_in_use = force || include_in_use;
     let apply_result = ApplyPlanService::new().verify(
         config,
         ApplyPlanRequest {
             plan,
             no_verify,
             include_recent,
-            force,
+            force: allow_in_use,
             force_protected,
             recent_days,
         },
     )?;
+    // Started after verify, so a plan that fails to verify leaves no unfinished run.
+    let audit = AuditLogger::from_config(config);
+    let run_id = audit
+        .start_run_with_mode("apply", Some(audit_mode(dry_run, trash)))
+        .ok();
     let verified_projects = project_infos_from_evaluated(apply_result.verified_projects.clone());
     let skipped_pre = apply_result.skipped_pre_count;
     let skipped_pre_bytes = apply_result.skipped_pre_bytes;
@@ -2027,7 +2032,7 @@ fn run_apply(
                 "verify",
                 "skipped",
                 skipped.size,
-                skipped.skip_reason.clone(),
+                audit_skip_reason(&skipped),
             );
         }
     }
@@ -2079,7 +2084,7 @@ fn run_apply(
     let cleaner = Cleaner::with_options(CleanOptions {
         dry_run,
         verbose,
-        force,
+        force: allow_in_use,
         include_recent,
         force_protected,
         trash,
@@ -2147,7 +2152,7 @@ fn run_apply(
         );
     }
 
-    Ok(())
+    exit_status(result.failed_count, "item(s)")
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
@@ -2170,7 +2175,6 @@ fn run_undo(
 ) -> Result<()> {
     let trash_root = default_trash_root();
     let audit = AuditLogger::from_config(config);
-    let run_id = audit.start_run("undo").ok();
     let batch_id = match batch {
         Some(b) => Some(b),
         None => latest_batch_id(&trash_root)?,
@@ -2201,31 +2205,23 @@ fn run_undo(
         }
     }
 
-    if let Some(run_id) = &run_id {
-        let _ = audit.log_item(
-            run_id,
-            "undo",
-            &trash_root.join(&batch_id),
-            if dry_run {
-                "dry_run_restore"
-            } else {
-                "restore"
+    // Same record as the bridge: only real restores, with the real outcome.
+    if !dry_run {
+        log_trash_run(
+            &audit,
+            TrashRunLog {
+                command: "undo",
+                mode: "restore",
+                path: trash_root.join(&batch_id),
+                done: result.restored_count,
+                skipped: result.skipped_count,
+                failed: result.failed_count,
+                bytes: 0,
             },
-            "completed",
-            0,
-            None,
-        );
-        let _ = audit.finish_run(
-            run_id,
-            "undo",
-            result.restored_count,
-            result.skipped_count,
-            result.failed_count,
-            0,
         );
     }
 
-    Ok(())
+    exit_status(result.failed_count, "restore(s)")
 }
 
 fn run_trash(command: TrashCommands, config: &Config) -> Result<()> {
@@ -2354,6 +2350,7 @@ fn run_trash_with_root(command: TrashCommands, config: &Config, trash_root: Path
                     bytes: result.removed_bytes,
                 },
             );
+            exit_status(result.failed_batches, "batch purge(s)")?;
         }
         TrashCommands::Gc {
             keep_days,
@@ -2439,6 +2436,7 @@ fn run_trash_with_root(command: TrashCommands, config: &Config, trash_root: Path
                     bytes: applied.removed_bytes,
                 },
             );
+            exit_status(applied.failed_batches, "batch purge(s)")?;
         }
     }
 
@@ -2615,13 +2613,13 @@ fn run_tui(
         None,
         false,
         CategoryFilterArg::All,
-        RiskArg::Medium,
+        None,
         include_protected,
         include_recent,
         recent_days,
     );
-    let projects =
-        project_infos_from_evaluated(scan_service.discover_visible(config, &request)?.projects);
+    // Unfiltered: the TUI hides recent/protected rows itself, so R/P can reveal them.
+    let projects = project_infos_from_evaluated(scan_service.discover(config, &request)?.projects);
     crate::tui::run_tui_projects(
         projects,
         include_recent,
@@ -2700,8 +2698,9 @@ mod tests {
     #[test]
     fn share_snippet_marks_undoable_trash() {
         let snippet = build_share_snippet(&result(2, 1024), false, true).unwrap();
-        assert!(snippet.contains("just freed"));
-        assert!(snippet.contains("undoable via trash"));
+        assert!(snippet.contains("just moved"));
+        assert!(!snippet.contains("freed"));
+        assert!(snippet.contains("undoable"));
     }
 
     #[test]
@@ -2774,7 +2773,7 @@ mod tests {
             Some(9),
             true,
             CategoryFilterArg::Deps,
-            RiskArg::All,
+            Some(RiskArg::All),
             true,
             false,
             11,
@@ -2803,14 +2802,31 @@ mod tests {
             None,
             false,
             CategoryFilterArg::All,
-            RiskArg::Medium,
+            None,
             false,
             true,
             7,
         );
 
+        // Unset: core falls back to the profile's max_risk, then to medium.
         assert_eq!(request.max_risk, None);
-        assert_eq!(request.visibility.include_recent, true);
+        assert!(request.visibility.include_recent);
+
+        let explicit = build_scan_request(
+            None,
+            Some("wide"),
+            None,
+            None,
+            None,
+            false,
+            CategoryFilterArg::All,
+            Some(RiskArg::Medium),
+            false,
+            false,
+            7,
+        );
+        // Explicit medium must reach core so it can override a `max_risk = high` profile.
+        assert_eq!(explicit.max_risk, Some(RiskLevel::Medium));
     }
 
     #[test]
@@ -2855,7 +2871,7 @@ mod tests {
         fs::create_dir_all(&root_a).unwrap();
         fs::create_dir_all(&root_b).unwrap();
 
-        let derived = derive_scan_root(&vec![root_a, root_b]);
+        let derived = derive_scan_root(&[root_a, root_b]);
         let expected = canonicalize_lossy(&temp.path().join("workspace"));
         assert_eq!(derived, expected);
     }
@@ -2905,7 +2921,7 @@ mod tests {
         config.audit.path = Some(audit_path);
 
         run_apply(
-            plan_path, true, false, true, false, true, true, true, 7, false, &config,
+            plan_path, true, false, true, false, false, true, true, true, 7, false, &config,
         )
         .unwrap();
 
@@ -2977,7 +2993,7 @@ mod tests {
         config.audit.path = Some(audit_path);
 
         run_apply(
-            plan_path, false, true, false, false, true, false, false, 7, false, &config,
+            plan_path, false, true, false, false, false, true, false, false, 7, false, &config,
         )
         .unwrap();
 

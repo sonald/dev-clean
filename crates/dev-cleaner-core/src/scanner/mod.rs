@@ -14,17 +14,13 @@ use std::{fmt, fmt::Display};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Category {
     Cache,
     Build,
     Deps,
+    #[default]
     Unknown,
-}
-
-impl Default for Category {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl Category {
@@ -46,16 +42,12 @@ impl Display for Category {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RiskLevel {
     Low,
+    #[default]
     Medium,
     High,
-}
-
-impl Default for RiskLevel {
-    fn default() -> Self {
-        Self::Medium
-    }
 }
 
 impl RiskLevel {
@@ -76,17 +68,13 @@ impl Display for RiskLevel {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum Confidence {
     High,
     Medium,
     Low,
+    #[default]
     Unknown,
-}
-
-impl Default for Confidence {
-    fn default() -> Self {
-        Self::Unknown
-    }
 }
 
 impl Confidence {
@@ -194,6 +182,24 @@ fn default_true() -> bool {
 }
 
 impl ProjectInfo {
+    /// `--explain` text: which rule matched, read from `matched_rule` (what the scanner
+    /// actually used) rather than re-derived.
+    pub fn explain(&self) -> String {
+        let Some(rule) = &self.matched_rule else {
+            return "matched cleanable rules".to_string();
+        };
+        match rule.source {
+            RuleSource::Custom => format!(
+                "matched config custom pattern `{}` directory `{}`",
+                rule.name.as_deref().unwrap_or("custom"),
+                rule.pattern
+            ),
+            RuleSource::Builtin => format!("matched builtin pattern `{}`", rule.pattern),
+            RuleSource::Gitignore => format!("matched .gitignore pattern `{}`", rule.pattern),
+            RuleSource::Heuristic => "matched CMake out-of-source build heuristic (CMakeCache.txt present, no CMakeLists.txt)".to_string(),
+        }
+    }
+
     /// Create a new ProjectInfo with pending size calculation
     pub fn new_pending(
         root: PathBuf,

@@ -158,7 +158,9 @@ impl ApplyPlanService {
         let cleanable_dir = canonicalize_lossy(&project.cleanable_dir);
         let project_root = canonicalize_lossy(&project.root);
 
-        if !cleanable_dir.starts_with(&project_root) {
+        // A target must sit strictly inside its project: a plan naming the root itself
+        // (only possible when hand-edited) would delete the whole project.
+        if cleanable_dir == project_root || !cleanable_dir.starts_with(&project_root) {
             return Ok(EvaluatedProject::new(project.clone())
                 .with_skip_reason(SkipReason::OutsideProjectRoot));
         }
@@ -337,6 +339,30 @@ mod tests {
         assert!(err
             .to_string()
             .contains("Unsupported plan schema_version: 9"));
+    }
+
+    #[test]
+    fn verify_rejects_the_project_root_itself_even_without_verify() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+
+        let request = ApplyPlanRequest {
+            plan: sample_plan(root.clone(), root),
+            no_verify: true,
+            include_recent: false,
+            force: false,
+            force_protected: false,
+            recent_days: 7,
+        };
+        let result = ApplyPlanService::new()
+            .verify(&Config::default(), request)
+            .unwrap();
+        assert_eq!(result.verified_projects.len(), 0);
+        assert_eq!(
+            result.skipped_projects[0].skip_reason,
+            Some(SkipReason::OutsideProjectRoot)
+        );
     }
 
     #[test]

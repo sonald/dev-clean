@@ -39,6 +39,21 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Reason recorded in the audit log. One vocabulary for CLI, TUI and the macOS app, and
+    /// the same words the cleaner's observers use (`in_use`, `protected`, `recent`).
+    pub fn audit_label(self) -> &'static str {
+        match self {
+            Self::InUse => "in_use",
+            Self::Protected => "protected",
+            Self::Recent => "recent",
+            Self::Risk => "risk",
+            Self::OutsideProjectRoot => "outside_project_root",
+            Self::OutsideScanRoot => "outside_scan_root",
+            Self::RuleMismatchOrMissing => "missing_or_changed",
+        }
+    }
+
+    /// Label stored in `ProjectInfo.skip_reason` (plans and JSON output).
     pub fn legacy_label(self) -> &'static str {
         match self {
             Self::InUse => "blocked_in_use",

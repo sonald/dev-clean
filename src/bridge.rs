@@ -6,6 +6,7 @@ use dev_cleaner_core::app::{
 };
 use dev_cleaner_core::audit::AuditLogger;
 use dev_cleaner_core::cleaner::{CleanAction, CleanObserver, CleanOptions};
+use dev_cleaner_core::policy::KeepPolicy;
 use dev_cleaner_core::recommend::{recommend_projects, RecommendOptions, RecommendStrategy};
 use dev_cleaner_core::scanner::{Category, ProjectInfo, RiskLevel};
 use dev_cleaner_core::trash::{
@@ -28,7 +29,6 @@ pub enum BridgeCommands {
     /// Generate a recommendation preview and optional plan.
     Recommend(BridgeRecommendArgs),
     /// Scan and clean all matching items.
-    Clean(BridgeCleanArgs),
     /// Apply a cleanup plan.
     Apply(BridgeApplyArgs),
     /// Manage internal trash.
@@ -453,7 +453,6 @@ pub fn run_bridge(command: BridgeCommands, config: &Config, config_path: PathBuf
     match command {
         BridgeCommands::Scan(args) => bridge_scan(args, config),
         BridgeCommands::Recommend(args) => bridge_recommend(args, config),
-        BridgeCommands::Clean(args) => bridge_clean(args, config),
         BridgeCommands::Apply(args) => bridge_apply(args, config),
         BridgeCommands::Trash { command } => bridge_trash(command, config),
         BridgeCommands::Audit { command } => bridge_audit(command, config),
@@ -499,6 +498,7 @@ fn bridge_scan(args: BridgeScanArgs, config: &Config) -> Result<()> {
     let mut total_seen = 0usize;
     let mut completed = 0usize;
 
+    let keep_policy = KeepPolicy::from_config(config);
     for root in &resolved.roots {
         let scanner = service.build_scanner(root, config, &resolved);
         let (total, rx) = scanner.scan_with_streaming()?;
@@ -514,9 +514,11 @@ fn bridge_scan(args: BridgeScanArgs, config: &Config) -> Result<()> {
 
         for project in rx.iter() {
             completed += 1;
-            if !resolved
-                .min_size_bytes
-                .map_or(true, |min_size_bytes| project.size >= min_size_bytes)
+            // Same as the CLI: unmeasured items are not offered (see `Scanner::scan`).
+            if !project.size_calculated
+                || !resolved
+                    .min_size_bytes
+                    .is_none_or(|min_size_bytes| project.size >= min_size_bytes)
             {
                 emit(&BridgeEvent::ScanProgress {
                     completed,
@@ -525,11 +527,8 @@ fn bridge_scan(args: BridgeScanArgs, config: &Config) -> Result<()> {
                 continue;
             }
 
-            let evaluated = service.evaluate_project_with_config(
-                config,
-                project,
-                resolved.visibility.recent_days,
-            );
+            let evaluated =
+                service.evaluate_project(project, &keep_policy, resolved.visibility.recent_days);
             if resolved.visibility.is_visible(&evaluated) {
                 let project = evaluated.into_project_info();
                 emit(&BridgeEvent::ScanItem {
@@ -544,7 +543,6 @@ fn bridge_scan(args: BridgeScanArgs, config: &Config) -> Result<()> {
         }
     }
 
-    projects.sort_by(|a, b| b.size.cmp(&a.size));
     emit(&BridgeEvent::ScanFinished {
         total_count: projects.len(),
         total_bytes: projects.iter().map(|p| p.size).sum(),
@@ -659,44 +657,6 @@ fn bridge_recommend(args: BridgeRecommendArgs, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn bridge_clean(args: BridgeCleanArgs, config: &Config) -> Result<()> {
-    let scan_args = BridgeScanArgs {
-        path: args.path,
-        depth: args.depth,
-        min_size: args.min_size,
-        older_than: args.older_than,
-        gitignore: args.gitignore,
-        category: args.category,
-        max_risk: args.max_risk,
-        include_protected: args.include_protected,
-        include_recent: args.include_recent,
-        recent_days: args.recent_days,
-    };
-    let service = ScanService::new();
-    let request = build_scan_request(&scan_args);
-    let projects = service
-        .discover_visible(config, &request)?
-        .projects
-        .into_iter()
-        .map(ProjectInfo::from)
-        .collect::<Vec<_>>();
-    run_cleaner(
-        CleanerRun {
-            projects,
-            pre_skipped: Vec::new(),
-            dry_run: args.dry_run,
-            trash: args.trash,
-            permanent_delete: args.permanent_delete,
-            force: args.force,
-            include_recent: args.include_recent,
-            force_protected: args.force_protected,
-            cancel_file: args.cancel_file,
-            audit_command: "clean",
-        },
-        config,
-    )
-}
-
 fn bridge_apply(args: BridgeApplyArgs, config: &Config) -> Result<()> {
     let plan = CleanupPlan::load_json(&args.plan)?;
     let result = ApplyPlanService::new().verify(
@@ -720,7 +680,9 @@ fn bridge_apply(args: BridgeApplyArgs, config: &Config) -> Result<()> {
         .skipped_projects
         .into_iter()
         .map(|candidate| {
-            let reason = candidate.skip_reason.map_or("skipped", skip_label);
+            let reason = candidate
+                .skip_reason
+                .map_or("skipped", SkipReason::audit_label);
             (ProjectInfo::from(candidate), reason)
         })
         .collect::<Vec<_>>();
@@ -739,18 +701,6 @@ fn bridge_apply(args: BridgeApplyArgs, config: &Config) -> Result<()> {
         },
         config,
     )
-}
-
-fn skip_label(reason: SkipReason) -> &'static str {
-    match reason {
-        SkipReason::InUse => "in_use",
-        SkipReason::Protected => "protected",
-        SkipReason::Recent => "recent",
-        SkipReason::Risk => "risk",
-        SkipReason::OutsideProjectRoot => "outside_project_root",
-        SkipReason::OutsideScanRoot => "outside_scan_root",
-        SkipReason::RuleMismatchOrMissing => "missing_or_changed",
-    }
 }
 
 struct CleanerRun {
@@ -813,13 +763,18 @@ fn run_cleaner(run: CleanerRun, config: &Config) -> Result<()> {
     });
     let audit = AuditLogger::from_config(config);
     let run_id = audit.start_run_with_mode(audit_command, Some(mode)).ok();
-    let mut observer = BridgeCleanObserver::new(if dry_run {
-        "dry_run"
-    } else if trash {
-        "trash"
-    } else {
-        "remove"
-    });
+    let mut observer = BridgeCleanObserver::new(
+        if dry_run {
+            "dry_run"
+        } else if trash {
+            "trash"
+        } else {
+            "remove"
+        },
+        &audit,
+        run_id.clone(),
+        audit_command,
+    );
     for (project, reason) in &pre_skipped {
         observer.skipped(project, reason);
     }
@@ -827,17 +782,6 @@ fn run_cleaner(run: CleanerRun, config: &Config) -> Result<()> {
     result.skipped_count += pre_skipped.len();
     result.bytes_skipped = result.bytes_skipped.saturating_add(pre_skipped_bytes);
     if let Some(run_id) = &run_id {
-        for item in &observer.audit_items {
-            let _ = audit.log_item(
-                run_id,
-                audit_command,
-                &item.path,
-                item.action,
-                item.result,
-                item.bytes,
-                item.reason.clone(),
-            );
-        }
         let _ = audit.finish_run(
             run_id,
             audit_command,
@@ -865,23 +809,18 @@ fn run_cleaner(run: CleanerRun, config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[derive(Default)]
-struct BridgeCleanObserver {
+/// Audit items are written as they happen (like `AuditedCleanObserver`), so a helper the app
+/// kills mid-run still leaves an accurate log.
+struct BridgeCleanObserver<'a> {
     cancelled: bool,
     audit_action: &'static str,
-    audit_items: Vec<BridgeAuditItem>,
+    audit: &'a AuditLogger,
+    run_id: Option<String>,
+    audit_command: &'static str,
     bytes_by_category: BTreeMap<&'static str, u64>,
 }
 
-struct BridgeAuditItem {
-    path: PathBuf,
-    action: &'static str,
-    result: &'static str,
-    bytes: u64,
-    reason: Option<String>,
-}
-
-impl CleanObserver for BridgeCleanObserver {
+impl CleanObserver for BridgeCleanObserver<'_> {
     fn on_project(&mut self, project: &ProjectInfo) {
         emit(&BridgeEvent::CleanupProject {
             path: project.cleanable_dir.display().to_string(),
@@ -912,19 +851,17 @@ impl CleanObserver for BridgeCleanObserver {
             size: project.size,
         });
         self.count_category(project, project.size);
-        self.audit_items.push(BridgeAuditItem {
-            path: project.cleanable_dir.clone(),
-            action: "dry_run",
-            result: "dry_run",
-            bytes: project.size,
-            reason: Some(
-                match action {
-                    CleanAction::Delete => "delete",
-                    CleanAction::Trash => "trash",
-                }
-                .to_string(),
-            ),
-        });
+        let planned = match action {
+            CleanAction::Delete => "delete",
+            CleanAction::Trash => "trash",
+        };
+        self.record(
+            project,
+            "dry_run",
+            "dry_run",
+            project.size,
+            Some(planned.to_string()),
+        );
     }
 
     fn on_cleaned(&mut self, project: &ProjectInfo, size: u64) {
@@ -933,13 +870,7 @@ impl CleanObserver for BridgeCleanObserver {
             size,
         });
         self.count_category(project, size);
-        self.audit_items.push(BridgeAuditItem {
-            path: project.cleanable_dir.clone(),
-            action: self.audit_action,
-            result: "completed",
-            bytes: size,
-            reason: None,
-        });
+        self.record(project, self.audit_action, "completed", size, None);
     }
 
     fn on_failed(&mut self, project: &ProjectInfo, error: &anyhow::Error) {
@@ -947,13 +878,13 @@ impl CleanObserver for BridgeCleanObserver {
             path: project.cleanable_dir.display().to_string(),
             error: error.to_string(),
         });
-        self.audit_items.push(BridgeAuditItem {
-            path: project.cleanable_dir.clone(),
-            action: self.audit_action,
-            result: "failed",
-            bytes: project.size,
-            reason: Some(error.to_string()),
-        });
+        self.record(
+            project,
+            self.audit_action,
+            "failed",
+            project.size,
+            Some(error.to_string()),
+        );
     }
 
     fn on_cancelled(&mut self, remaining_projects: usize) {
@@ -964,13 +895,41 @@ impl CleanObserver for BridgeCleanObserver {
     }
 }
 
-impl BridgeCleanObserver {
-    fn new(audit_action: &'static str) -> Self {
+impl<'a> BridgeCleanObserver<'a> {
+    fn new(
+        audit_action: &'static str,
+        audit: &'a AuditLogger,
+        run_id: Option<String>,
+        audit_command: &'static str,
+    ) -> Self {
         Self {
             cancelled: false,
             audit_action,
-            audit_items: Vec::new(),
+            audit,
+            run_id,
+            audit_command,
             bytes_by_category: BTreeMap::new(),
+        }
+    }
+
+    fn record(
+        &self,
+        project: &ProjectInfo,
+        action: &str,
+        result: &str,
+        bytes: u64,
+        reason: Option<String>,
+    ) {
+        if let Some(run_id) = &self.run_id {
+            let _ = self.audit.log_item(
+                run_id,
+                self.audit_command,
+                &project.cleanable_dir,
+                action,
+                result,
+                bytes,
+                reason,
+            );
         }
     }
 
@@ -988,13 +947,13 @@ impl BridgeCleanObserver {
             reason: reason.to_string(),
             size: project.size,
         });
-        self.audit_items.push(BridgeAuditItem {
-            path: project.cleanable_dir.clone(),
-            action: self.audit_action,
-            result: "skipped",
-            bytes: project.size,
-            reason: Some(reason.to_string()),
-        });
+        self.record(
+            project,
+            self.audit_action,
+            "skipped",
+            project.size,
+            Some(reason.to_string()),
+        );
     }
 }
 

@@ -17,7 +17,7 @@ pub enum AuditRecord {
         run_id: String,
         command: String,
         ts: String,
-        /// Execution mode (`dry_run`, `trash`, `delete`); absent in older logs.
+        /// Execution mode (`dry_run`, `trash`, `permanent_delete`); absent in older logs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mode: Option<String>,
     },
@@ -269,7 +269,7 @@ impl AuditLogger {
                     ..
                 } => {
                     out.push_str(&format!(
-                        "run_started,{},{},{},,,,,,,,\n",
+                        "run_started,{},{},{},,,,,,,,,\n",
                         csv_escape(run_id),
                         csv_escape(command),
                         csv_escape(ts)
@@ -307,7 +307,7 @@ impl AuditLogger {
                     freed_bytes,
                 } => {
                     out.push_str(&format!(
-                        "run_finished,{},{},{},,,,,,,{},{},{},{}\n",
+                        "run_finished,{},{},{},,,,,,{},{},{},{}\n",
                         csv_escape(run_id),
                         csv_escape(command),
                         csv_escape(ts),
@@ -500,6 +500,23 @@ mod tests {
         assert!(csv.contains("\"cle\"\"an\""));
         assert!(csv.contains("\"/tmp/path,with,comma\""));
         assert!(csv.contains("\"needs,\"\"quote\"\"\""));
+        assert!(
+            csv.lines().all(|line| {
+                // Count separators outside quoted fields.
+                let mut quoted = false;
+                line.chars()
+                    .filter(|c| {
+                        if *c == '"' {
+                            quoted = !quoted;
+                        }
+                        *c == ',' && !quoted
+                    })
+                    .count()
+                    == 12
+            }),
+            "every row must have the header's 13 columns"
+        );
+        assert!(csv.ends_with(",,,,,,1,0,0,7\n"));
     }
 
     #[test]

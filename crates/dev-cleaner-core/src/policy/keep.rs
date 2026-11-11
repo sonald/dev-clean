@@ -18,10 +18,12 @@ pub struct KeepPolicy {
 
 impl KeepPolicy {
     pub fn from_config(config: &Config) -> Self {
+        // Scan sees paths as typed, apply sees them canonicalized: keep both spellings of each
+        // rule so a symlinked path (macOS `/tmp` -> `/private/tmp`) is protected either way.
         let keep_paths = config
             .keep_paths
             .iter()
-            .map(|p| expand_tilde(p))
+            .flat_map(|p| path_forms(&expand_tilde(p)))
             .collect::<Vec<_>>();
         let keep_glob_set = build_glob_set(&config.keep_globs);
         let keep_project_root_set = build_glob_set(&config.keep_project_roots);
@@ -59,21 +61,32 @@ impl KeepPolicy {
             }
         }
 
-        if self.matches_project_roots(&info.root) {
+        let roots = path_forms(&info.root);
+        let targets = path_forms(&info.cleanable_dir);
+
+        if roots.iter().any(|root| self.matches_project_roots(root)) {
             return ProtectionDecision {
                 protected: true,
                 reason: Some("config_keep_project_roots".to_string()),
             };
         }
 
-        if self.matches_keep_paths(&info.cleanable_dir) || self.matches_keep_paths(&info.root) {
+        if targets
+            .iter()
+            .chain(&roots)
+            .any(|p| self.matches_keep_paths(p))
+        {
             return ProtectionDecision {
                 protected: true,
                 reason: Some("config_keep_paths".to_string()),
             };
         }
 
-        if self.matches_keep_globs(&info.cleanable_dir) || self.matches_keep_globs(&info.root) {
+        if targets
+            .iter()
+            .chain(&roots)
+            .any(|p| self.matches_keep_globs(p))
+        {
             return ProtectionDecision {
                 protected: true,
                 reason: Some("config_keep_globs".to_string()),
@@ -132,10 +145,7 @@ fn match_project_pattern(root: &Path, target: &Path, pattern: &str) -> anyhow::R
     let pattern = expand_tilde(pattern);
 
     if pattern.is_absolute() {
-        return Ok(matches_pattern_path(
-            pattern.to_string_lossy().as_ref(),
-            target,
-        )?);
+        return matches_pattern_path(pattern.to_string_lossy().as_ref(), target);
     }
 
     let rel_target = target
@@ -171,14 +181,39 @@ fn compile_glob_matcher(pattern: &str) -> anyhow::Result<GlobMatcher> {
     Ok(glob.compile_matcher())
 }
 
+/// `path`, plus its canonical form when that differs.
+fn path_forms(path: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![path.to_path_buf()];
+    if let Ok(canonical) = path.canonicalize() {
+        if canonical != path {
+            forms.push(canonical);
+        }
+    }
+    forms
+}
+
+/// The glob with its literal leading directory canonicalized, when that changes it.
+fn canonical_glob(pattern: &str) -> Option<String> {
+    if !Path::new(pattern).is_absolute() {
+        return None;
+    }
+    let glob_start = pattern.find(['*', '?', '['])?;
+    let dir_end = pattern[..glob_start].rfind('/')?;
+    let dir = Path::new(&pattern[..dir_end.max(1)]);
+    let canonical = dir.canonicalize().ok()?;
+    (canonical != dir).then(|| format!("{}{}", canonical.display(), &pattern[dir_end..]))
+}
+
 fn build_glob_set(patterns: &[String]) -> GlobSet {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
         let pattern = expand_tilde(pattern).to_string_lossy().to_string();
-        let Ok(glob) = GlobBuilder::new(&pattern).literal_separator(true).build() else {
-            continue;
-        };
-        builder.add(glob);
+        // Invalid patterns are rejected by `Config::validate` when the config is loaded.
+        for pattern in std::iter::once(pattern.clone()).chain(canonical_glob(&pattern)) {
+            if let Ok(glob) = GlobBuilder::new(&pattern).literal_separator(true).build() {
+                builder.add(glob);
+            }
+        }
     }
     builder
         .build()
@@ -241,6 +276,43 @@ mod tests {
         fs::write(root.join(".dev-cleaner-keep-patterns"), content).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn keep_rules_match_through_symlinks_in_both_directions() {
+        let temp = TempDir::new().unwrap();
+        let real = temp.path().join("real");
+        let root = real.join("app");
+        fs::create_dir_all(root.join("target")).unwrap();
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let info_at = |base: &Path| project_info(&base.join("app"), &base.join("app/target"));
+
+        for (rule_base, seen_base) in [(&link, &real), (&real, &link)] {
+            for config in [
+                Config {
+                    keep_paths: vec![rule_base.join("app").display().to_string()],
+                    ..Default::default()
+                },
+                Config {
+                    keep_globs: vec![format!("{}/*/target", rule_base.display())],
+                    ..Default::default()
+                },
+            ] {
+                let policy = KeepPolicy::from_config(&config);
+                assert!(policy.evaluate(&info_at(seen_base)).protected, "{config:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_keep_glob_is_a_config_error() {
+        let config = Config {
+            keep_globs: vec!["/a/[unclosed".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn project_keep_marker_protects_target() {
         let temp = TempDir::new().unwrap();
@@ -261,8 +333,10 @@ mod tests {
         let target = root.join("app").join("target");
         fs::create_dir_all(&target).unwrap();
 
-        let mut config = Config::default();
-        config.keep_paths = vec![target.display().to_string()];
+        let mut config = Config {
+            keep_paths: vec![target.display().to_string()],
+            ..Default::default()
+        };
         let policy = policy_from_config(config.clone());
         assert!(
             policy
@@ -295,8 +369,10 @@ mod tests {
         let target = project.join("target");
         fs::create_dir_all(&target).unwrap();
 
-        let mut config = Config::default();
-        config.keep_globs = vec![format!("{}/*/target", root.display())];
+        let mut config = Config {
+            keep_globs: vec![format!("{}/*/target", root.display())],
+            ..Default::default()
+        };
         let policy = policy_from_config(config.clone());
         assert!(policy.evaluate(&project_info(&root, &target)).protected);
 
@@ -312,8 +388,10 @@ mod tests {
         let target = root.join("app").join("target");
         fs::create_dir_all(&target).unwrap();
 
-        let mut config = Config::default();
-        config.keep_project_roots = vec![root.join("app").display().to_string()];
+        let config = Config {
+            keep_project_roots: vec![root.join("app").display().to_string()],
+            ..Default::default()
+        };
         let policy = policy_from_config(config);
 
         let decision = policy.evaluate(&project_info(&root.join("app"), &target));

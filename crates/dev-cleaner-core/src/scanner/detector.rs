@@ -1,7 +1,3 @@
-use crate::config::{CustomPattern, MarkerMode};
-use globset::GlobBuilder;
-use ignore::gitignore::GitignoreBuilder;
-use ignore::Match;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -35,6 +31,63 @@ pub enum ProjectType {
 }
 
 impl ProjectType {
+    /// Every variant. `all_is_complete` below fails to compile when a variant is added
+    /// without updating it, so keep this list in step.
+    pub const ALL: [ProjectType; 23] = [
+        Self::NodeJs,
+        Self::Rust,
+        Self::Python,
+        Self::Java,
+        Self::Kotlin,
+        Self::Scala,
+        Self::Clojure,
+        Self::Dart,
+        Self::Haskell,
+        Self::Go,
+        Self::C,
+        Self::Cpp,
+        Self::Ruby,
+        Self::Swift,
+        Self::Php,
+        Self::Elixir,
+        Self::DotNet,
+        Self::Maven,
+        Self::Gradle,
+        Self::Terraform,
+        Self::Elm,
+        Self::Unity,
+        Self::Generic,
+    ];
+
+    #[cfg(test)]
+    fn all_is_complete(self) -> bool {
+        match self {
+            Self::NodeJs
+            | Self::Rust
+            | Self::Python
+            | Self::Java
+            | Self::Kotlin
+            | Self::Scala
+            | Self::Clojure
+            | Self::Dart
+            | Self::Haskell
+            | Self::Go
+            | Self::C
+            | Self::Cpp
+            | Self::Ruby
+            | Self::Swift
+            | Self::Php
+            | Self::Elixir
+            | Self::DotNet
+            | Self::Maven
+            | Self::Gradle
+            | Self::Terraform
+            | Self::Elm
+            | Self::Unity
+            | Self::Generic => Self::ALL.contains(&self),
+        }
+    }
+
     /// Returns the color code for CLI display
     pub fn color(&self) -> &'static str {
         match self {
@@ -471,106 +524,6 @@ impl ProjectDetector {
 
         cleanable
     }
-
-    /// Explain why a directory is considered cleanable.
-    ///
-    /// This is primarily intended for CLI output (`scan --explain`).
-    pub fn explain_cleanable_dir(
-        project_type: ProjectType,
-        project_root: &Path,
-        cleanable_dir: &Path,
-        custom_patterns: &[CustomPattern],
-    ) -> String {
-        let basename = cleanable_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
-
-        let relative_path = cleanable_dir
-            .strip_prefix(project_root)
-            .ok()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|| cleanable_dir.display().to_string());
-
-        // Prefer user config custom patterns.
-        for pattern in custom_patterns {
-            if !custom_root_matches(project_root, pattern) {
-                continue;
-            }
-            if pattern_matches(&pattern.directory, basename, &relative_path) {
-                return format!(
-                    "matched config custom pattern `{}` directory `{}`",
-                    pattern.name, pattern.directory
-                );
-            }
-        }
-
-        // Then built-in patterns.
-        for pattern in Self::cleanable_dirs(project_type) {
-            if pattern_matches(pattern, basename, &relative_path) {
-                return format!("matched builtin pattern `{}`", pattern);
-            }
-        }
-
-        // Then `.gitignore`-derived patterns (conservative discovery).
-        if let Some(pattern) = explain_gitignore_discovery_pattern(project_root, cleanable_dir) {
-            return format!("matched .gitignore pattern `{}`", pattern);
-        }
-
-        // Finally, heuristics.
-        if Self::is_cmake_build_dir(cleanable_dir) {
-            return "matched CMake out-of-source build heuristic (CMakeCache.txt present, no CMakeLists.txt)".to_string();
-        }
-
-        "matched cleanable rules".to_string()
-    }
-}
-
-fn explain_gitignore_discovery_pattern(project_root: &Path, dir: &Path) -> Option<String> {
-    let mut builder = GitignoreBuilder::new(project_root);
-    let path = project_root.join(".gitignore");
-    if !path.is_file() {
-        return None;
-    }
-    let _ = builder.add(path);
-    let gi = builder.build().ok()?;
-    match gi.matched(dir, /* is_dir */ true) {
-        Match::Ignore(glob) => ProjectDetector::gitignore_discovery_pattern(glob.original()),
-        Match::None | Match::Whitelist(_) => None,
-    }
-}
-
-fn pattern_matches(pattern: &str, basename: &str, relative_path: &str) -> bool {
-    let pattern = pattern.replace('\\', "/");
-    let text = if pattern.contains('/') {
-        relative_path
-    } else {
-        basename
-    };
-
-    let glob = match GlobBuilder::new(&pattern).literal_separator(true).build() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-
-    glob.compile_matcher().is_match(text)
-}
-
-fn custom_root_matches(project_root: &Path, custom: &CustomPattern) -> bool {
-    if custom.marker_files.is_empty() {
-        return false;
-    }
-
-    match custom.marker_mode {
-        MarkerMode::AnyOf => custom
-            .marker_files
-            .iter()
-            .any(|marker| project_root.join(marker).exists()),
-        MarkerMode::AllOf => custom
-            .marker_files
-            .iter()
-            .all(|marker| project_root.join(marker).exists()),
-    }
 }
 
 fn has_git_entry(dir: &Path, depth: usize) -> bool {
@@ -612,6 +565,13 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn project_type_all_lists_every_variant() {
+        assert!(ProjectType::ALL.iter().all(|t| t.all_is_complete()));
+        let unique: std::collections::HashSet<_> = ProjectType::ALL.iter().collect();
+        assert_eq!(unique.len(), ProjectType::ALL.len());
+    }
 
     #[test]
     fn test_in_use_detects_modern_lock_files() {
@@ -799,58 +759,6 @@ lib/
         touch_days_ago(&node_dir.join("package-lock.json"), 7);
 
         assert!(!ProjectDetector::is_in_use(&node_dir, ProjectType::NodeJs));
-    }
-
-    #[test]
-    fn test_explain_cleanable_dir_priority() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path();
-
-        fs::write(root.join("package.json"), "{}").unwrap();
-        fs::write(root.join("Assets"), "").unwrap();
-        fs::write(root.join("ProjectSettings"), "").unwrap();
-        fs::write(root.join(".gitignore"), "mybuild/\n").unwrap();
-
-        let custom_patterns = vec![CustomPattern {
-            name: "Unity".to_string(),
-            directory: "build".to_string(),
-            marker_files: vec!["Assets".to_string(), "ProjectSettings".to_string()],
-            marker_mode: MarkerMode::AllOf,
-        }];
-
-        let custom_dir = root.join("build");
-        fs::create_dir(&custom_dir).unwrap();
-        let builtin_dir = root.join("dist");
-        fs::create_dir(&builtin_dir).unwrap();
-        let gitignore_dir = root.join("mybuild");
-        fs::create_dir(&gitignore_dir).unwrap();
-        fs::write(gitignore_dir.join("CMakeCache.txt"), "# cache").unwrap();
-        let heuristic_dir = root.join("heuristicbuild");
-        fs::create_dir(&heuristic_dir).unwrap();
-        fs::write(heuristic_dir.join("CMakeCache.txt"), "# cache").unwrap();
-
-        let custom = ProjectDetector::explain_cleanable_dir(
-            ProjectType::Python,
-            root,
-            &custom_dir,
-            &custom_patterns,
-        );
-        assert!(custom.contains("matched config custom pattern `Unity`"));
-
-        let builtin =
-            ProjectDetector::explain_cleanable_dir(ProjectType::NodeJs, root, &builtin_dir, &[]);
-        assert_eq!(builtin, "matched builtin pattern `dist`");
-
-        let gitignore =
-            ProjectDetector::explain_cleanable_dir(ProjectType::Generic, root, &gitignore_dir, &[]);
-        assert_eq!(gitignore, "matched .gitignore pattern `mybuild`");
-
-        let heuristic =
-            ProjectDetector::explain_cleanable_dir(ProjectType::Generic, root, &heuristic_dir, &[]);
-        assert_eq!(
-            heuristic,
-            "matched CMake out-of-source build heuristic (CMakeCache.txt present, no CMakeLists.txt)"
-        );
     }
 
     #[test]

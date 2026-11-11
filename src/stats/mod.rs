@@ -43,7 +43,7 @@ fn display_by_type(stats: &Statistics) {
     ]));
 
     let mut types: Vec<_> = stats.by_type.iter().collect();
-    types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
+    types.sort_by_key(|p| std::cmp::Reverse(p.1.total_size));
 
     for (type_name, type_stats) in types {
         table.add_row(Row::new(vec![
@@ -72,7 +72,7 @@ fn display_chart_by_type(stats: &Statistics, top_n: usize) {
         return;
     }
 
-    types.sort_by(|a, b| b.1.total_size.cmp(&a.1.total_size));
+    types.sort_by_key(|p| std::cmp::Reverse(p.1.total_size));
     let max_size = types
         .first()
         .map(|(_, type_stats)| type_stats.total_size)
@@ -121,11 +121,7 @@ fn display_top_largest(stats: &Statistics, top_n: usize) {
     ]));
 
     for (i, project) in stats.top_largest.iter().take(top_n).enumerate() {
-        let path = if project.path.len() > 60 {
-            format!("...{}", &project.path[project.path.len() - 57..])
-        } else {
-            project.path.clone()
-        };
+        let path = truncate_left(&project.path, 60);
 
         table.add_row(Row::new(vec![
             Cell::new(&(i + 1).to_string()),
@@ -201,19 +197,37 @@ fn render_bar(value: u64, max: u64, width: usize) -> String {
         return String::new();
     }
 
-    let filled = if max == 0 {
-        0
-    } else {
-        ((value.saturating_mul(width as u64)) / max) as usize
-    };
+    let filled = value
+        .saturating_mul(width as u64)
+        .checked_div(max)
+        .unwrap_or(0) as usize;
     let filled = filled.min(width);
 
     format!("{}{}", "#".repeat(filled), "-".repeat(width - filled))
 }
 
+/// Keep the end of `s`, at most `max` chars, prefixed with `...` when cut.
+/// Counts chars, not bytes: byte slicing panics inside a multi-byte (e.g. CJK) path.
+pub(crate) fn truncate_left(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(count - max.saturating_sub(3)).collect();
+    format!("...{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_left_is_char_safe() {
+        let path = "/项目/".repeat(30);
+        let short = truncate_left(&path, 60);
+        assert!(short.starts_with("...") && short.chars().count() == 60);
+        assert_eq!(truncate_left("short", 60), "short");
+    }
     use dev_cleaner_core::scanner::{Category, Confidence, ProjectType, RiskLevel};
     use dev_cleaner_core::ProjectInfo;
     use std::path::PathBuf;

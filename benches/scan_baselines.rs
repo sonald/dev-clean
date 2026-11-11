@@ -94,7 +94,7 @@ fn run_streaming_scan(fixture: &WorkloadFixture) -> Vec<ProjectInfo> {
         "streaming scan yielded unexpected number of results for {}",
         fixture.name
     );
-    projects.sort_by(|a, b| b.size.cmp(&a.size));
+    projects.sort_by_key(|p| std::cmp::Reverse(p.size));
     projects
 }
 

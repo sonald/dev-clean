@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 const TRASH_LOG_FILENAME: &str = "trash_log.jsonl";
+const TRASH_LOCK_FILENAME: &str = "trash_log.lock";
 /// Per-volume trash folder, created at the mount point of a volume other than the trash root's.
 const VOLUME_TRASH_DIRNAME: &str = ".dev-cleaner-trash";
 
@@ -94,7 +95,16 @@ impl TrashManager {
             size,
             tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         };
-        self.append_log(&entry)?;
+        if let Err(err) = self.append_log(&entry) {
+            // Without a log entry the item could never be restored: put it back.
+            return Err(match move_path(&trashed_path, original, false) {
+                Ok(()) => err,
+                Err(undo_err) => err.context(format!(
+                    "and moving it back failed ({undo_err}); it is at {}",
+                    trashed_path.display()
+                )),
+            });
+        }
 
         Ok(entry)
     }
@@ -117,14 +127,17 @@ impl TrashManager {
     }
 
     fn append_log(&self, entry: &TrashEntry) -> Result<()> {
+        let _lock = lock_trash_log(&self.log_path)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)
             .with_context(|| format!("Failed to open trash log: {}", self.log_path.display()))?;
 
-        serde_json::to_writer(&mut file, entry)?;
-        writeln!(&mut file)?;
+        // One write per entry, so a concurrent reader never sees half a line.
+        let mut line = serde_json::to_string(entry)?;
+        line.push('\n');
+        file.write_all(line.as_bytes())?;
         Ok(())
     }
 
@@ -178,31 +191,9 @@ pub struct TrashBatchSummary {
 }
 
 pub fn list_trash_batches(root: &Path) -> Result<Vec<TrashBatchSummary>> {
-    use std::collections::HashMap;
-
-    let entries = load_trash_log(&root.join(TRASH_LOG_FILENAME))?;
-    let mut batches: HashMap<String, TrashBatchSummary> = HashMap::new();
-
-    for entry in entries {
-        let summary = batches
-            .entry(entry.batch_id.clone())
-            .or_insert(TrashBatchSummary {
-                batch_id: entry.batch_id.clone(),
-                created_at: entry.created_at,
-                entries_count: 0,
-                total_size: 0,
-            });
-
-        summary.entries_count += 1;
-        summary.total_size += entry.size;
-        if entry.created_at < summary.created_at {
-            summary.created_at = entry.created_at;
-        }
-    }
-
-    let mut results = batches.into_values().collect::<Vec<_>>();
-    results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(results)
+    Ok(summarize_batches(load_trash_log(
+        &root.join(TRASH_LOG_FILENAME),
+    )?))
 }
 
 pub fn trash_entries_for_batch(root: &Path, batch_id: &str) -> Result<Vec<TrashEntry>> {
@@ -308,37 +299,61 @@ pub fn restore_batch_with_observer<O: RestoreObserver>(
             continue;
         }
 
-        if entry.original_path.exists() && force {
-            // If forced, remove the existing target first.
-            if entry.original_path.is_dir() {
-                fs::remove_dir_all(&entry.original_path).with_context(|| {
+        // Any error is this entry's failure: an early return would skip the log rewrite
+        // below and leave already-restored entries listed in the trash.
+        let restore_one = || -> Result<()> {
+            if let Some(parent) = entry.original_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
                     format!(
-                        "Failed to remove existing dir: {}",
-                        entry.original_path.display()
+                        "Failed to create restore parent directory: {}",
+                        parent.display()
                     )
                 })?;
-            } else {
-                fs::remove_file(&entry.original_path).with_context(|| {
+            }
+
+            // With --force, set the existing target aside instead of deleting it up front:
+            // if the move fails it is put back, so a failed restore loses nothing.
+            let aside = (entry.original_path.exists() && force).then(|| {
+                let mut name = entry.original_path.as_os_str().to_owned();
+                name.push(".dev-cleaner-replaced");
+                PathBuf::from(name)
+            });
+            if let Some(aside) = &aside {
+                if fs::symlink_metadata(aside).is_ok() {
+                    anyhow::bail!(
+                        "Cannot set existing target aside: {} exists",
+                        aside.display()
+                    );
+                }
+                fs::rename(&entry.original_path, aside).with_context(|| {
                     format!(
-                        "Failed to remove existing file: {}",
+                        "Failed to set existing target aside: {}",
                         entry.original_path.display()
                     )
                 })?;
             }
-        }
 
-        if let Some(parent) = entry.original_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "Failed to create restore parent directory: {}",
-                    parent.display()
-                )
-            })?;
-        }
+            // Entries trashed by older versions may sit on another volume; copying back is fine.
+            if let Err(err) = move_path(&entry.trashed_path, &entry.original_path, true) {
+                if let Some(aside) = &aside {
+                    let _ = fs::rename(aside, &entry.original_path);
+                }
+                return Err(err);
+            }
+            if let Some(aside) = &aside {
+                // ponytail: the restore already succeeded; a leftover `*.dev-cleaner-replaced`
+                // is visible next to the target, so it is not worth failing the entry over.
+                let _ = if aside.is_dir() {
+                    fs::remove_dir_all(aside)
+                } else {
+                    fs::remove_file(aside)
+                };
+            }
+            Ok(())
+        };
 
-        // Entries trashed by older versions may sit on another volume; copying back is fine.
-        match move_path(&entry.trashed_path, &entry.original_path, true) {
-            Ok(_) => {
+        match restore_one() {
+            Ok(()) => {
                 restored_count += 1;
                 restored.insert(entry.trashed_path.clone());
                 observer.on_restored(&entry);
@@ -357,11 +372,10 @@ pub fn restore_batch_with_observer<O: RestoreObserver>(
     // Restored items no longer occupy the Trash: drop them from the log so listings and
     // automatic purges stop counting them.
     if !restored.is_empty() {
-        let kept = all_entries
-            .into_iter()
-            .filter(|e| !(e.batch_id == batch_id && restored.contains(&e.trashed_path)))
-            .collect::<Vec<_>>();
-        save_trash_log(&log_path, &kept)?;
+        drop(all_entries);
+        let kept = rewrite_trash_log(&log_path, |e| {
+            !(e.batch_id == batch_id && restored.contains(&e.trashed_path))
+        })?;
         if !kept.iter().any(|e| e.batch_id == batch_id) {
             for dir in &batch_dirs {
                 remove_dir_without_files(dir);
@@ -387,6 +401,15 @@ pub struct PurgeResult {
 }
 
 pub fn purge_trash_batch(root: &Path, batch_id: &str, dry_run: bool) -> Result<PurgeResult> {
+    // `root.join(batch_id)` is deleted below: "", "..", or an absolute path would escape the batch.
+    let mut components = Path::new(batch_id).components();
+    if !matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        anyhow::bail!("Invalid trash batch id: {batch_id:?}");
+    }
+
     let log_path = root.join(TRASH_LOG_FILENAME);
     let entries = load_trash_log(&log_path)?;
 
@@ -397,7 +420,7 @@ pub fn purge_trash_batch(root: &Path, batch_id: &str, dry_run: bool) -> Result<P
 
     if dry_run {
         return Ok(PurgeResult {
-            removed_batches: 1,
+            removed_batches: usize::from(removed_entries > 0),
             removed_entries,
             removed_bytes,
             failed_batches: 0,
@@ -433,11 +456,12 @@ pub fn purge_trash_batch(root: &Path, batch_id: &str, dry_run: bool) -> Result<P
     }
 
     if failed_batches == 0 {
-        save_trash_log(&log_path, &kept)?;
+        drop(kept);
+        rewrite_trash_log(&log_path, |e| e.batch_id != batch_id)?;
     }
 
     Ok(PurgeResult {
-        removed_batches: if removed_entries > 0 { 1 } else { 0 },
+        removed_batches: usize::from(removed_entries > 0),
         removed_entries,
         removed_bytes,
         failed_batches,
@@ -467,7 +491,7 @@ pub fn gc_trash(
     let log_path = root.join(TRASH_LOG_FILENAME);
     let entries = load_trash_log(&log_path)?;
 
-    let summaries = summarize_batches(entries.iter().cloned().collect());
+    let summaries = summarize_batches(entries.to_vec());
     let total_bytes = summaries.iter().map(|s| s.total_size).sum::<u64>();
 
     let mut blocked_by_keep_days = false;
@@ -503,7 +527,7 @@ pub fn gc_trash(
                     .filter(|s| !selected_ids.contains(&s.batch_id))
                     .cloned()
                     .collect::<Vec<_>>();
-                candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at)); // oldest first
+                candidates.sort_by_key(|a| a.created_at); // oldest first
 
                 while bytes_after > limit {
                     let Some(next) = candidates.first().cloned() else {
@@ -575,13 +599,8 @@ pub fn gc_trash(
         removed_ok_ids.insert(summary.batch_id.clone());
     }
 
-    let kept_entries = entries
-        .into_iter()
-        .filter(|e| !removed_ok_ids.contains(&e.batch_id))
-        .collect::<Vec<_>>();
-
     if !removed_ok_ids.is_empty() {
-        save_trash_log(&log_path, &kept_entries)?;
+        rewrite_trash_log(&log_path, |e| !removed_ok_ids.contains(&e.batch_id))?;
     }
 
     let removed_batches = removed_ok_ids.len();
@@ -649,30 +668,64 @@ fn summarize_batches(entries: Vec<TrashEntry>) -> Vec<TrashBatchSummary> {
     }
 
     let mut results = batches.into_values().collect::<Vec<_>>();
-    results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    results.sort_by_key(|p| std::cmp::Reverse(p.created_at));
     results
 }
 
-fn save_trash_log(log_path: &Path, entries: &[TrashEntry]) -> Result<()> {
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Failed to create parent directory for trash log: {}",
-                parent.display()
-            )
-        })?;
+/// Every writer of the trash log holds this lock. It lives in a sidecar file because a
+/// rewrite renames a new file over the log, so a lock on the log itself would not hold.
+fn lock_trash_log(log_path: &Path) -> Result<fs::File> {
+    let dir = log_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create trash log directory: {}", dir.display()))?;
+    let lock_path = dir.join(TRASH_LOCK_FILENAME);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("Failed to lock {}", lock_path.display()))?;
+    Ok(lock)
+}
+
+/// Rewrite the log keeping the entries `keep` accepts, and returns them.
+///
+/// Re-reads the log under the lock, so entries appended since the caller loaded it survive,
+/// and copies lines it cannot parse (a torn write, a newer schema) through unchanged: dropping
+/// them would orphan those trashed items for good.
+fn rewrite_trash_log(
+    log_path: &Path,
+    keep: impl Fn(&TrashEntry) -> bool,
+) -> Result<Vec<TrashEntry>> {
+    let _lock = lock_trash_log(log_path)?;
+    let content = match fs::read_to_string(log_path) {
+        Ok(c) => c,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to read {}", log_path.display()))
+        }
+    };
+
+    let mut out = String::with_capacity(content.len());
+    let mut kept = Vec::new();
+    for line in content.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match serde_json::from_str::<TrashEntry>(line) {
+            Ok(entry) if !keep(&entry) => continue,
+            Ok(entry) => kept.push(entry),
+            Err(_) => {}
+        }
+        out.push_str(line);
+        out.push('\n');
     }
 
     let tmp_path = log_path.with_extension("jsonl.tmp");
     let mut file = fs::File::create(&tmp_path)
         .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
-    for entry in entries {
-        serde_json::to_writer(&mut file, entry)?;
-        writeln!(&mut file)?;
-    }
+    file.write_all(out.as_bytes())?;
     file.sync_all()
         .with_context(|| format!("Failed to fsync {}", tmp_path.display()))?;
-
     fs::rename(&tmp_path, log_path).with_context(|| {
         format!(
             "Failed to replace trash log: {} -> {}",
@@ -681,7 +734,7 @@ fn save_trash_log(log_path: &Path, entries: &[TrashEntry]) -> Result<()> {
         )
     })?;
 
-    Ok(())
+    Ok(kept)
 }
 
 fn is_symlink_path(path: &Path) -> Result<bool> {
@@ -1108,7 +1161,7 @@ mod tests {
         let purge = purge_trash_batch(&trash_root, &manager.batch_id, false).unwrap();
         assert_eq!(purge.removed_entries, 2);
         assert_eq!(purge.removed_bytes, 30);
-        assert!(trash_root.join(&manager.batch_id).exists() == false);
+        assert!(!trash_root.join(&manager.batch_id).exists());
 
         let batches_after = list_trash_batches(&trash_root).unwrap();
         assert!(batches_after.is_empty());
@@ -1228,6 +1281,70 @@ mod tests {
         assert_eq!(result.skipped_count, 1);
         assert_eq!(result.failed_count, 0);
         assert!(result.errors.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_forced_restore_that_fails_keeps_existing_target() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let original = temp.path().join("restore").join("target");
+        fs::create_dir_all(&original).unwrap();
+        fs::write(original.join("keep.txt"), "keep").unwrap();
+        // move_path refuses symlinks, so this restore fails after the target was set aside.
+        let trashed = trash_root.join("batch-1").join("target");
+        fs::create_dir_all(trashed.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(temp.path(), &trashed).unwrap();
+        write_entries(
+            &trash_root.join(TRASH_LOG_FILENAME),
+            &[make_entry(
+                "batch-1",
+                Utc::now(),
+                original.clone(),
+                trashed,
+                1,
+            )],
+        );
+
+        let result = restore_batch(&trash_root, "batch-1", false, true).unwrap();
+        assert_eq!(result.failed_count, 1);
+        assert!(original.join("keep.txt").exists());
+    }
+
+    #[test]
+    fn test_rewrite_keeps_unparsable_lines_and_entries_appended_meanwhile() {
+        let temp = TempDir::new().unwrap();
+        let trash_root = temp.path().join("trash");
+        let log_path = trash_root.join(TRASH_LOG_FILENAME);
+        fs::create_dir_all(trash_root.join("old")).unwrap();
+        let old = make_entry(
+            "old",
+            Utc::now(),
+            "/tmp/a".into(),
+            trash_root.join("old/a"),
+            1,
+        );
+        write_log_lines(
+            &log_path,
+            &[
+                serde_json::to_string(&old).unwrap(),
+                "{\"future\":1}".to_string(),
+            ],
+        );
+
+        // Appended by another run after this one loaded the log.
+        let manager = TrashManager::new_with_root(trash_root.clone()).unwrap();
+        let source = temp.path().join("src");
+        create_dir_with_file(&source);
+        manager.trash_dir(&source, 1).unwrap();
+
+        purge_trash_batch(&trash_root, "old", false).unwrap();
+
+        let content = fs::read_to_string(&log_path).unwrap();
+        assert!(content.contains("{\"future\":1}"));
+        let left = load_trash_log(&log_path).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].batch_id, manager.batch_id);
     }
 
     #[test]
@@ -1437,6 +1554,15 @@ mod tests {
         assert_eq!(result.failed_batches, 0);
         assert!(batch_dir.exists());
         assert_eq!(load_trash_log(&log_path).unwrap().len(), 1);
+
+        for bad in ["", "..", ".", "a/b"] {
+            assert!(
+                purge_trash_batch(&trash_root, bad, false).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(purge_trash_batch(&trash_root, batch_dir.to_str().unwrap(), false).is_err());
+        assert!(trash_root.exists() && batch_dir.exists());
     }
 
     #[test]

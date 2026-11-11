@@ -49,7 +49,7 @@ impl SizeCalculator {
     /// The number of projects successfully processed
     pub fn calculate_batch_streaming(
         &self,
-        mut projects: Vec<ProjectInfo>,
+        projects: Vec<ProjectInfo>,
         tx: Sender<ProjectInfo>,
     ) -> usize {
         let total_projects = projects.len();
@@ -57,14 +57,12 @@ impl SizeCalculator {
         let timeout = Duration::from_secs(self.timeout_secs);
         let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        projects.par_iter_mut().for_each(|project| {
-            let finished = calculate_project_size(project, timeout);
-            if finished {
+        // Stop sizing once the receiver is gone (e.g. the UI cancelled the scan).
+        let _ = projects.into_par_iter().try_for_each(|mut project| {
+            if calculate_project_size(&mut project, timeout) {
                 completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-
-            // Ignore errors if receiver is dropped.
-            let _ = tx.send(project.clone());
+            tx.send(project).map_err(drop)
         });
 
         let completed = completed.load(std::sync::atomic::Ordering::Relaxed);
@@ -178,7 +176,10 @@ pub(crate) fn reclaimable_size(dir: &Path, timeout: Option<Duration>) -> Result<
         if !entry.file_type().is_file() {
             continue;
         }
-        let metadata = entry.metadata()?;
+        // A file deleted mid-walk (a running build) must not void the whole size.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         let bytes = allocated_bytes(&metadata);
         match hard_link(&metadata) {
             Some((key, links)) => linked.entry(key).or_insert((bytes, links, 0)).2 += 1,
@@ -191,14 +192,8 @@ pub(crate) fn reclaimable_size(dir: &Path, timeout: Option<Duration>) -> Result<
         .filter(|(_, links, seen)| seen >= links)
         .map(|(bytes, _, _)| *bytes)
         .sum::<u64>();
-    let total = total.saturating_add(fully_contained);
-
-    match timeout {
-        Some(timeout) if start.elapsed() >= timeout => {
-            Err(anyhow::anyhow!("Timeout calculating size for {:?}", dir))
-        }
-        _ => Ok(total),
-    }
+    // A walk that finished is a valid size even if it ran past the timeout.
+    Ok(total.saturating_add(fully_contained))
 }
 
 #[cfg(unix)]

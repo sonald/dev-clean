@@ -2,6 +2,7 @@
 name = "dev-cleaner-core"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.85"
 authors = ["Sian Cao"]
 description = "Core library for scanning and cleaning developer build artifacts"
 license = "MIT OR Apache-2.0"

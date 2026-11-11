@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Options for cleaning operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CleanOptions {
     /// Dry run mode - don't actually delete
     pub dry_run: bool,
@@ -31,21 +31,6 @@ pub struct CleanOptions {
 
     /// Optional cancellation sentinel checked between projects.
     pub cancel_file: Option<PathBuf>,
-}
-
-impl Default for CleanOptions {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            verbose: false,
-            force: false,
-            include_recent: false,
-            force_protected: false,
-            trash: false,
-            trash_root: None,
-            cancel_file: None,
-        }
-    }
 }
 
 /// Result of a cleaning operation
@@ -120,6 +105,7 @@ pub struct NoopCleanObserver;
 impl CleanObserver for NoopCleanObserver {}
 
 /// Main cleaner for removing project directories
+#[derive(Default)]
 pub struct Cleaner {
     options: CleanOptions,
 }
@@ -226,15 +212,15 @@ impl Cleaner {
                 continue;
             }
 
-            if self.options.trash
-                && !self.options.dry_run
-                && project.cleanable_dir.exists()
-                && trash_manager.is_none()
-            {
+            let existed = project.cleanable_dir.exists();
+            if self.options.trash && !self.options.dry_run && existed && trash_manager.is_none() {
                 trash_manager = self.build_trash_manager()?;
             }
 
             match self.clean_single_impl(project, trash_manager.as_ref(), observer) {
+                // Gone since the scan: nothing was cleaned, so don't report it as cleaned
+                // (same as `clean_single_with_observer`).
+                Ok(_) if !existed => {}
                 Ok(size) => {
                     cleaned_count += 1;
                     bytes_freed += size;

@@ -244,7 +244,7 @@ mod tests {
 
         let result = recommend_projects(vec![project], &opts);
         assert!(result.selected.is_empty());
-        assert_eq!(original.recent, false);
+        assert!(!original.recent);
         assert_eq!(original.skip_reason, None);
         assert_eq!(original.selection_reason, None);
     }

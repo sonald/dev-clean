@@ -1,8 +1,11 @@
+// ponytail: command handlers take their flattened clap flags as arguments; bundling them
+// into structs only to satisfy this lint would add types nobody else uses.
+#![allow(clippy::too_many_arguments)]
+
 pub mod bridge;
 mod clean_progress;
 pub mod cli;
 pub mod interactive;
-mod metrics;
 pub mod stats;
 pub mod tui;
 

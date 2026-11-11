@@ -168,63 +168,20 @@ fn bridge_scan_streams_jsonl_events() {
 }
 
 #[test]
-fn bridge_clean_defaults_to_trash_without_trash_flag() {
-    let workspace = TempDir::new().unwrap();
-    let project_root = write_project(workspace.path(), "bridge-default-trash-app", 2048);
-    let target = project_root.join("target");
-
-    let output = run(
-        &workspace,
-        &[
-            "bridge",
-            "clean",
-            project_root.to_str().unwrap(),
-            "--include-recent",
-            "--force",
-            "--max-risk",
-            "all",
-        ],
-    );
-
-    assert!(!target.exists());
-    let events = parse_json_lines(&output.stdout);
-    let started = events
-        .iter()
-        .find(|event| event["type"] == "cleanup_started")
-        .unwrap();
-    assert_eq!(started["mode"], "trash");
-    let finished = events
-        .iter()
-        .find(|event| event["type"] == "cleanup_finished")
-        .unwrap();
-    assert_eq!(finished["payload"]["cleaned_count"], 1);
-    assert!(finished["payload"]["trash_batch_id"].as_str().is_some());
-    assert!(workspace
-        .path()
-        .join("trash")
-        .join("trash_log.jsonl")
-        .exists());
-    let audit_content = fs::read_to_string(audit_log_path(&workspace)).unwrap();
-    assert!(audit_content.contains("\"result\":\"completed\""));
-    assert!(!audit_content.contains("\"result\":\"attempted\""));
-}
-
-#[test]
-fn bridge_clean_permanent_delete_requires_explicit_flag_and_does_not_create_trash_batch() {
+fn bridge_apply_permanent_delete_requires_explicit_flag_and_does_not_create_trash_batch() {
     let workspace = TempDir::new().unwrap();
     let project_root = write_project(workspace.path(), "bridge-delete-app", 2048);
     let target = project_root.join("target");
+    let plan_path = write_apply_plan(&workspace, &project_root, "bridge-delete-plan.json");
 
     let output = run(
         &workspace,
         &[
             "bridge",
-            "clean",
-            project_root.to_str().unwrap(),
+            "apply",
+            plan_path.to_str().unwrap(),
             "--include-recent",
             "--force",
-            "--max-risk",
-            "all",
             "--permanent-delete",
         ],
     );
@@ -244,30 +201,9 @@ fn bridge_clean_permanent_delete_requires_explicit_flag_and_does_not_create_tras
         .join("trash_log.jsonl")
         .exists());
     let audit_content = fs::read_to_string(audit_log_path(&workspace)).unwrap();
-    assert!(audit_content.contains("\"command\":\"clean\""));
+    assert!(audit_content.contains("\"command\":\"apply\""));
     assert!(audit_content.contains("\"result\":\"completed\""));
     assert!(!audit_content.contains("\"result\":\"attempted\""));
-}
-
-#[test]
-fn bridge_clean_rejects_trash_and_permanent_delete_together() {
-    let workspace = TempDir::new().unwrap();
-    let project_root = write_project(workspace.path(), "bridge-conflict-app", 1024);
-
-    let output = run_failure(
-        &workspace,
-        &[
-            "bridge",
-            "clean",
-            project_root.to_str().unwrap(),
-            "--include-recent",
-            "--trash",
-            "--permanent-delete",
-        ],
-    );
-
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Use either --trash"));
-    assert!(project_root.join("target").exists());
 }
 
 #[test]
@@ -329,9 +265,10 @@ fn bridge_apply_rejects_trash_and_permanent_delete_together() {
 }
 
 #[test]
-fn bridge_clean_cancel_file_stops_before_next_item() {
+fn bridge_apply_cancel_file_stops_before_next_item() {
     let workspace = TempDir::new().unwrap();
     let project_root = write_project(workspace.path(), "bridge-cancel-app", 2048);
+    let plan_path = write_apply_plan(&workspace, &project_root, "bridge-cancel-plan.json");
     let cancel_file = workspace.path().join("cancel");
     fs::write(&cancel_file, "stop").unwrap();
 
@@ -339,12 +276,10 @@ fn bridge_clean_cancel_file_stops_before_next_item() {
         &workspace,
         &[
             "bridge",
-            "clean",
-            project_root.to_str().unwrap(),
+            "apply",
+            plan_path.to_str().unwrap(),
             "--include-recent",
             "--force",
-            "--max-risk",
-            "all",
             "--cancel-file",
             cancel_file.to_str().unwrap(),
         ],
@@ -429,8 +364,7 @@ fn stats_json_reports_aggregates() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let json_start = stdout.find('{').unwrap();
-    let stats: Value = serde_json::from_str(&stdout[json_start..]).unwrap();
+    let stats: Value = serde_json::from_str(&stdout).expect("stats --json stdout is pure JSON");
     assert_eq!(stats["total_projects"], 1);
     assert_eq!(stats["by_age_group"]["recent"][0], 1);
     assert_eq!(stats["top_largest"][0]["project_type"], "Rust");
@@ -654,12 +588,12 @@ fn clean_trash_undo_roundtrip_updates_files_and_audit_log() {
         .unwrap()
         .filter_map(|entry| {
             let entry = entry.unwrap();
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == "trash_log.jsonl" {
-                None
-            } else {
-                Some(name)
-            }
+            // Batches are directories; the log and its lock file are not.
+            entry
+                .file_type()
+                .unwrap()
+                .is_dir()
+                .then(|| entry.file_name().to_string_lossy().to_string())
         })
         .collect();
     assert_eq!(batches.len(), 1);
@@ -752,4 +686,31 @@ fn plan_apply_trash_moves_target_and_logs_apply() {
     let audit_content = fs::read_to_string(&audit_path).unwrap();
     assert!(audit_content.contains("\"command\":\"apply\""));
     assert!(audit_content.contains("\"type\":\"run_finished\""));
+}
+
+#[cfg(unix)]
+#[test]
+fn undo_exits_non_zero_when_a_restore_fails() {
+    let workspace = TempDir::new().unwrap();
+    let project_root = write_project(workspace.path(), "undo-fail-app", 64);
+    run(
+        &workspace,
+        &[
+            "clean",
+            project_root.to_str().unwrap(),
+            "--auto",
+            "--include-recent",
+        ],
+    );
+
+    // Swap the trashed directory for a symlink: restore refuses to move symlinks.
+    let log = fs::read_to_string(workspace.path().join("trash").join("trash_log.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+    let trashed = PathBuf::from(entry["trashed_path"].as_str().unwrap());
+    fs::remove_dir_all(&trashed).unwrap();
+    std::os::unix::fs::symlink(workspace.path(), &trashed).unwrap();
+
+    let output = run_failure(&workspace, &["undo"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Failed: 1"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("restore(s) failed"));
 }

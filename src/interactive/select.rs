@@ -197,6 +197,22 @@ impl ProjectSelector {
             return Ok(None);
         }
 
+        // In search mode typed chars go to the query (searching "sqlite" must not quit on `q`);
+        // Esc leaves search mode instead of cancelling.
+        if self.state.search_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.search_mode = false;
+                    return Ok(None);
+                }
+                KeyCode::Char(ch) if is_search_char(ch) => {
+                    self.state.push_query_char(ch);
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                 return Ok(Some(None));
@@ -217,11 +233,6 @@ impl ProjectSelector {
             KeyCode::Char('o') if !self.state.search_mode => self.state.toggle_sort_order(),
             KeyCode::Char('/') => self.state.search_mode = true,
             KeyCode::Backspace => self.state.pop_query_char(),
-            KeyCode::Char(ch) => {
-                if self.state.search_mode && is_search_char(ch) {
-                    self.state.push_query_char(ch);
-                }
-            }
             _ => {}
         }
 
@@ -238,12 +249,12 @@ fn footer_lines(width: usize, search_mode: bool) -> Vec<String> {
         if width >= 80 {
             vec![
                 "Search mode: type to filter | Backspace delete | Ctrl+U clear".to_string(),
-                "Enter confirm | q/Esc cancel".to_string(),
+                "Enter confirm | Esc exit search".to_string(),
             ]
         } else {
             vec![
                 "Search: type | Backspace | Ctrl+U".to_string(),
-                "Enter confirm | q/Esc cancel".to_string(),
+                "Enter confirm | Esc exit search".to_string(),
             ]
         }
     } else if width >= 130 {
@@ -341,7 +352,7 @@ impl SelectorState {
     }
 
     fn page_rows(&self, rows: usize) -> usize {
-        let footer_rows = if self.search_mode { 2 } else { 2 };
+        let footer_rows = 2;
         rows.saturating_sub(8 + footer_rows).max(1)
     }
 
@@ -367,7 +378,7 @@ impl SelectorState {
             .and_then(|idx| self.projects.get(idx))
     }
 
-    fn block_reason<'a>(&self, project: &'a ProjectInfo) -> Option<&'static str> {
+    fn block_reason(&self, project: &ProjectInfo) -> Option<&'static str> {
         if project.in_use && !self.options.force {
             Some("IN_USE")
         } else if project.protected && !self.options.force_protected {
@@ -669,6 +680,41 @@ mod tests {
             selection_reason: None,
             skip_reason: None,
         }
+    }
+
+    #[test]
+    fn search_mode_types_q_instead_of_cancelling() {
+        let mut selector = ProjectSelector::new(
+            vec![project(
+                "/a/sqlite",
+                100,
+                10,
+                RiskLevel::Low,
+                false,
+                false,
+                false,
+            )],
+            SelectorOptions::default(),
+        );
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        selector.handle_key(key(KeyCode::Char('/')), 10).unwrap();
+        assert!(selector
+            .handle_key(key(KeyCode::Char('q')), 10)
+            .unwrap()
+            .is_none());
+        assert_eq!(selector.state.query, "q");
+
+        // Esc leaves search mode; a second Esc cancels.
+        assert!(selector
+            .handle_key(key(KeyCode::Esc), 10)
+            .unwrap()
+            .is_none());
+        assert!(!selector.state.search_mode);
+        assert!(matches!(
+            selector.handle_key(key(KeyCode::Esc), 10).unwrap(),
+            Some(None)
+        ));
     }
 
     #[test]
