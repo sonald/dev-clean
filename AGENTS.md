@@ -33,7 +33,7 @@ cargo test --workspace
 
 # Optional hygiene
 cargo fmt
-cargo clippy --all-targets --all-features
+cargo clippy --workspace --all-targets --locked -- -D warnings   # same as CI
 ```
 
 ## Quick Manual Testing (Local)
@@ -99,17 +99,18 @@ cargo run -- undo
 
 Both pipelines share these rules:
 - Scan roots are made absolute first (`ScanService::resolve_inputs`), so every path in output, plans, the trash log and the audit log is cwd-independent.
+- Ambiguous builtin names (`bin`, `build`, `deps`, `dist`, `obj`, `out`, `vendor`, `Library`, `Temp`; see `AMBIGUOUS_BUILTIN_NAMES` in `walker.rs`) match only as direct children of a detected project root; cache names like `__pycache__` match at any depth.
+- Cheap filters (risk/category/age) run before the git guards during discovery, since the guards spawn `git`.
 - Traversal does not descend into hidden directories (except the scan root itself and hidden components named by `custom_patterns`, e.g. `.yarn`) or into `node_modules`.
 - A target that contains git-tracked files is treated as source and dropped (`ProjectDetector::contains_tracked_files`).
 - So is a target that is or holds a git checkout: a linked worktree registered with the enclosing repo (any depth), or, for non-builtin rules, a `.git` within three levels (`ProjectDetector::contains_git_checkout`).
 - Sizes are allocated blocks (`st_blocks * 512`); hard links count only when every link is inside the target.
 
 `Scanner::scan()` (used by commands that need full results like `stats`):
-1. Traverse candidates via `ignore::WalkBuilder` (Ripgrep-style)
-2. Detect project root/type, match cleanable targets, and compute directory sizes (blocking)
-3. Apply filters (size/age/category/risk)
-4. Deduplicate nested targets (`Scanner::deduplicate_nested_dirs`)
-5. Sort by size (largest first)
+1. Same fast discovery as streaming (`discover_pending_projects`: traverse, match, non-size filters, dedup)
+2. `SizeCalculator::calculate_batch` sizes all candidates (blocking)
+3. Drop candidates whose size could not be measured, apply `min_size`
+4. Sort by size (largest first)
 
 `Scanner::scan_with_streaming()` (used by `scan` for real-time UX):
 1. Fast discovery (`check_directory_fast`) to enumerate candidate cleanables without sizes
@@ -124,7 +125,7 @@ Both pipelines share these rules:
    - When enabled: walker skips gitignored directories.
 
 2. **Discovery of additional candidates** (always on for Git projects):
-   - `ProjectDetector::parse_gitignore` extracts *conservative* directory-like patterns from `.gitignore`.
+   - `Scanner::gitignore_rule_for` (an `ignore::Gitignore` matcher + `ProjectDetector::gitignore_discovery_pattern`) accepts only *conservative* directory-like patterns from `.gitignore`.
    - These patterns are treated as **high risk** and **low confidence** by default (see Risk/Confidence below).
 
 ### Matching, Rule Attribution, Category, Risk, Confidence
@@ -162,7 +163,7 @@ Unless `--permanent` (or `--dry-run`) is given, clean/apply/TUI move directories
 
 1. Add a variant to `ProjectType` in `crates/dev-cleaner-core/src/scanner/detector.rs`.
 2. Add a marker-file check to `ProjectDetector::detect_all()` (a root can match several types; order is priority).
-   Also add the variant to both `ALL_PROJECT_TYPES` arrays in `walker.rs`.
+   Also add the variant to `ProjectType::ALL` (the `all_is_complete` match won't compile until you do).
 3. Add built-in cleanable patterns in `ProjectDetector::cleanable_dirs()`.
 4. If new patterns don’t classify correctly, extend `classify_category()` in `crates/dev-cleaner-core/src/scanner/walker.rs`.
 5. If applicable, add lock-file checks in `ProjectDetector::is_in_use()`.
@@ -179,5 +180,6 @@ Custom patterns allow naming a rule and scoping it via marker files (see `Custom
 - `.gitignore`-discovered candidates are intentionally `high` risk + `low` confidence; they won’t show up with the default `--max-risk medium`.
 - Deduplication must run before reporting results; without it you’ll get noisy nested matches (e.g., `.venv/.../__pycache__`).
 - `apply` is plan-driven: updating the plan schema requires bumping `CleanupPlan.schema_version` (`crates/dev-cleaner-core/src/plan.rs`).
-- Audit records must describe what happened: log per-item results from a `CleanObserver` (see `AuditedCleanObserver`), not a blanket status after the run.
+- Audit records must describe what happened: log per-item results from a `CleanObserver` as they happen (see `AuditedCleanObserver`, `BridgeCleanObserver`), not a blanket status after the run. Skip reasons use `SkipReason::audit_label()`.
+- Every trash-log writer goes through `TrashManager::append_log` / `rewrite_trash_log`, which hold `trash_log.lock`; never write the log directly.
 - The macOS app passes the same `--recent-days`/`--include-recent` to `apply` as to `scan`; otherwise items the user saw are skipped as recent.

@@ -80,7 +80,7 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 - `--auto`/`--yes` 跳过选择与确认，但仍跳过 in-use；`--include-in-use` 只放行 in-use，仍需确认；`--force` 放行 in-use 并跳过确认；`--force-protected` 才允许 protected 目标进入删除。
 - TTY 且未 `--auto/--force` 时使用键盘选择器；非 TTY 时退化为传统 prompt。
 - 回收站是 Dev Cleaner 自有 trash root，而不是系统 Trash；dry-run 汇总区分 "Would move to trash" 与 "Would free"。
-- `--share` 输出可复制摘要，并写入本地 metrics event。
+- `--share` 输出可复制摘要（只打印，不写任何文件）。
 
 ### 3.3 `tui [PATH]`
 
@@ -89,7 +89,8 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 - 支持 `--include-recent`、`--include-protected`、`--recent-days`。
 - 展示目标列表、详情、risk/source/protection 信息，并使用相同 safety 语义。
 - Enter 没有二次确认，因此把选中项移入 Dev Cleaner 回收站（可 `undo`），并写入 audit；结束时打印 undo/purge 命令。
-- 相比 `scan`/`clean`，TUI 的命令行过滤面较窄；仍是后续体验增强点。
+- Enter 只处理“已选中且当前可见”的条目：被搜索/过滤隐藏的选中项不会被清理。
+- `R`/`P` 显示或隐藏 recent/protected 条目。勾选 recent 条目即视为同意清理；protected 与 in-use 条目只显示、不可勾选。
 
 ### 3.4 `stats [PATH]`
 
@@ -131,10 +132,11 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 执行 plan JSON：
 
 - 默认移入 Dev Cleaner 回收站；`--permanent` 直接删除（`--trash` 保留兼容）。
-- 支持 `--dry-run`、`--force`（跳过确认并放行 in-use）、`-y/--yes`（只跳过确认）、`--no-verify`、`--include-recent`、`--force-protected`、`--recent-days`、`--verbose`。
+- 支持 `--dry-run`、`--force`（跳过确认并放行 in-use）、`--include-in-use`（只放行 in-use，仍需确认）、`-y/--yes`（只跳过确认）、`--no-verify`、`--include-recent`、`--force-protected`、`--recent-days`、`--verbose`。
+- 有任何条目失败时（clean/apply/undo/trash purge/gc 同样）打印汇总后以非零退出码结束。
 - 接受 schema v1/v2/v3；当前生成 v3。
 - 默认会重新验证 plan 目标：
-  - cleanable_dir 必须位于 project root 下。
+  - cleanable_dir 必须严格位于 project root 之内（等于 project root 也会被拒绝，`--no-verify` 下同样）。
   - absolute scan_root 下的目标必须仍位于 scan_root 下。
   - 重新用 scanner 校验规则仍匹配。
   - 重新计算 keep/recent/in-use safety。
@@ -146,7 +148,8 @@ Dev Cleaner 是一个本地优先的开发者空间清理工具：
 
 - `undo --batch <ID>`；未指定 batch 时恢复最新 batch。
 - 支持 `--dry-run`、`--force`、`--verbose`。
-- restore 时更深路径优先，目标已存在时默认跳过，`--force` 会覆盖。
+- restore 时更深路径优先，目标已存在时默认跳过，`--force` 会覆盖：先把已有目标改名放到一旁，恢复成功后再删除，失败则放回原处。
+- `--dry-run` 不写审计记录。
 - 恢复成功的条目从 trash log 移除，不再计入 `trash list` 和回收站大小；批次全部恢复后删除空的批次目录。
 
 ### 3.9 `trash`
@@ -193,12 +196,12 @@ Audit 默认开启，日志会按大小轮转：
 
 ### 3.12 `bridge` 与 macOS App
 
-`dev-cleaner bridge <scan|recommend|clean|apply|trash|audit|config>` 输出 JSONL 事件，供 `macos/DevCleanerMac` 使用：
+`dev-cleaner bridge <scan|recommend|apply|trash|audit|config>` 输出 JSONL 事件，供 `macos/DevCleanerMac` 使用：
 
 - App 偏好（扫描根、深度、recent 天数、是否显示高风险、回收站保留天数/提醒阈值、自动清理过期批次）保存在 bridge 的 GUI preferences 文件中，修改即保存。
 - App 的所有清理都先展示确认表单，列出将处理的条目，并且只移入回收站（可先 Dry Run）。执行时传入与扫描一致的 `--recent-days`/`--include-recent`。
 - 多扫描根：plan 的 `scan_root` 取各根的公共父目录；`bridge recommend` 接受多个路径并去重。
-- 启动时按保留天数自动清理过期批次（只按天数，不按大小，避免刚移入的批次被清掉）。
+- 启动时及每次清理后按保留天数自动清理过期批次（只按天数，不按大小，避免刚移入的批次被清掉）。
 
 ---
 
@@ -349,7 +352,8 @@ Keep policy 已落地：
 - 项目根存在 `.dev-cleaner-keep`：保护整个项目。
 - 项目根存在 `.dev-cleaner-keep-patterns`：按相对 pattern/glob/绝对 path 保护匹配目标；解析失败时保守保护。
 - Config `keep_paths`：精确路径，父子路径均视为匹配。
-- Config `keep_globs`：glob path 保护。
+- Config `keep_globs`：glob path 保护。无效的 `keep_globs`/`keep_project_roots` 会让配置加载/保存直接报错（不会静默失去保护）。
+- 路径类规则同时按原样和 canonical 形式匹配，经过 symlink 的路径（如 macOS `/tmp`）在 scan 与 apply 中结果一致。
 - Config `keep_project_roots`：项目根 glob 保护。
 
 scan/stats/plan/recommend 默认不显示 protected；clean/apply 默认不删除 protected。需要：
@@ -417,7 +421,7 @@ Trash JSONL entry：
 - `size`
 - `tool_version`
 
-`trash list` 会按 batch 聚合 `entries_count` 和 `total_size`。`original_path` 总是绝对路径；`trashed_path` 可能位于其他卷的 `.dev-cleaner-trash/` 下。恢复成功的条目会从 log 中移除。
+`trash list` 会按 batch 聚合 `entries_count` 和 `total_size`。所有写入都持有同目录的 `trash_log.lock`；重写 log 时无法解析的行原样保留。`original_path` 总是绝对路径；`trashed_path` 可能位于其他卷的 `.dev-cleaner-trash/` 下。恢复成功的条目会从 log 中移除。
 
 ### 6.4 Audit Log
 
@@ -432,14 +436,6 @@ Audit record 是 tagged JSONL：
 - `enabled`
 - `path`
 - `max_size_mb`
-
-### 6.5 Metrics Event
-
-当前 metrics 仅用于本地事件日志，例如 `--share` 写入 `share_generated`：
-
-- 默认路径：config dir 下 `dev-cleaner/events.jsonl`
-- fallback：当前目录 `.dev-cleaner-events.jsonl`
-- 不联网，不上传。
 
 ---
 
@@ -502,7 +498,7 @@ Profile 字段：
 
 隐私：
 
-- 默认所有扫描、计划、trash、audit、metrics 均在本机完成。
+- 默认所有扫描、计划、trash、audit 均在本机完成。
 - 无联网行为。
 
 可维护性：
@@ -541,7 +537,6 @@ Profile 字段：
 - `tui/`：ratatui 全屏 UI。
 - `interactive/select.rs`：TTY keyboard selector。
 - `stats/mod.rs`：统计的终端展示。
-- `metrics.rs`：本地 metrics event log。
 
 macOS App `macos/DevCleanerMac/`：SwiftUI 界面、`AppModel` 状态与 `BridgeClient`。
 

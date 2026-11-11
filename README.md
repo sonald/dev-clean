@@ -7,7 +7,7 @@ Project homepage: <https://sonald.me/dev-clean/>
 ## Features
 
 - **Multi-Language Support**: Automatically detects and cleans 18+ project types
-- **Smart Scanning**: Uses Ripgrep-style traversal with `.gitignore` respect
+- **Smart Scanning**: Uses Ripgrep-style traversal, optionally respecting `.gitignore` (`--gitignore`)
 - **Streaming Progress**: Real-time progress bars with live size calculation streaming
 - **Statistics Dashboard**: Comprehensive stats with charts, breakdowns by type, age, and size
 - **.gitignore Discovery (Conservative)**: Reads project `.gitignore` to discover extra candidates, but treats them as high-risk by default unless explicitly included
@@ -37,7 +37,7 @@ Project homepage: <https://sonald.me/dev-clean/>
 | **Dart/Flutter** | `build`, `.dart_tool` |
 | **Haskell** | `.stack-work`, `dist`, `dist-newstyle` |
 | **Go** | `vendor`, `bin` |
-| **C/C++** | `build`, `cmake-build-*`, `out` |
+| **C/C++** | `build`, `cmake-build-debug`, `cmake-build-release`, `out` |
 | **Ruby** | `vendor/bundle`, `.bundle` |
 | **Swift** | `.build`, `DerivedData`, `.swiftpm` |
 | **PHP** | `vendor` |
@@ -170,7 +170,7 @@ Options:
   --dry-run                     Preview without changing anything
   --permanent                   Delete permanently instead of moving to Dev Cleaner's trash (the default)
   --trash                       Move to Dev Cleaner's trash (already the default; kept for compatibility)
-  --share                       Print a copy-friendly share summary and log local share_generated event
+  --share                       Print a copy-friendly share summary
   -y, --auto, --yes             Skip selection and confirmation (in-use targets stay skipped)
   --include-in-use              Also clean targets whose lock files changed recently (still asks)
   -f, --force                   Skip all confirmations and clean in-use targets
@@ -188,13 +188,13 @@ When running in an interactive terminal (`TTY`) without `--auto` and without `--
 Space       Toggle selection
 a           Select all selectable targets
 d           Deselect all visible targets
-/           Enter search mode
+/           Enter search mode (keys, incl. q/j/k/Space, then type into the query; Esc leaves it)
 Backspace   Delete one search character
 Ctrl+U      Clear search
 s           Cycle sort (size/age/risk)
 o           Toggle sort order
 Enter       Confirm (auto-select current target if nothing is selected)
-q or Esc    Cancel
+q or Esc    Cancel (outside search mode)
 ```
 
 Notes:
@@ -216,6 +216,9 @@ dev-cleaner apply plan.json
 # Delete permanently instead, without the prompt
 dev-cleaner apply plan.json --permanent --yes
 
+# Also apply in-use targets (still asks; --force also skips the prompt)
+dev-cleaner apply plan.json --include-in-use
+
 # Skip re-validation (not recommended)
 dev-cleaner apply plan.json --no-verify
 
@@ -224,6 +227,7 @@ dev-cleaner undo --batch <BATCH_ID>
 ```
 
 `apply` now shows the same execution summary card as `clean` (selected size, mode, and blocked counts).
+`clean`, `apply`, `undo` and `trash purge/gc` exit non-zero when any item fails, after printing the summary.
 In TTY mode, confirm with `Enter` or cancel with `Esc/q`. In non-TTY mode, it keeps the classic `y/N` prompt.
 
 #### Recommend
@@ -352,7 +356,12 @@ Keyboard Shortcuts:
   Space    - Toggle selection
   a        - Select all
   d        - Deselect all
-  Enter    - Clean selected
+  s        - Cycle sort order
+  /        - Search (Backspace edits the query)
+  f        - Filter panel
+  R        - Toggle recent targets
+  P        - Toggle protected targets
+  Enter    - Move selected to trash
   ?/h      - Toggle help
   q/Esc    - Quit
 ```
@@ -363,7 +372,8 @@ Generate default config file:
 
 ```bash
 dev-cleaner init-config
-# Creates config at: ~/.config/dev-cleaner/config.toml (Linux/macOS)
+# Creates config at: ~/.config/dev-cleaner/config.toml (Linux)
+#                    ~/Library/Application Support/dev-cleaner/config.toml (macOS)
 #                    %APPDATA%\dev-cleaner\config.toml (Windows)
 ```
 
@@ -450,7 +460,7 @@ Dev Cleaner is built for speed:
   - **40-60% faster** than traditional blocking approach
 - **Parallel Processing**: Utilizes all CPU cores via `rayon` for both scanning and size calculation
 - **Smart Traversal**: Uses `ignore` crate (same as Ripgrep) for efficient directory walking
-- **Optimized Detection**: Stops scanning when project type is detected
+- **Optimized Detection**: Does not descend into a directory once it matches as a target
 - **Timeout Protection**: 60-second timeout per directory prevents hangs on extremely large directories
 - **Minimal Overhead**: Rust's zero-cost abstractions ensure near-native performance
 

@@ -1,4 +1,4 @@
-# Dev Cleaner 0.2 开发 TODO
+# Dev Cleaner 开发 TODO
 
 基于 `spec.md`（路线图 0.2+），按优先级推进；每个勾选项完成后都需要跑测试并提交。
 
@@ -12,9 +12,10 @@
 
 ## 可选 / 后续
 
-- [ ] Keep/Protect：`.dev-cleaner-keep` / `.dev-cleaner-keep-patterns` + config keep_paths/keep_roots
+- [x] Keep/Protect：`.dev-cleaner-keep` / `.dev-cleaner-keep-patterns` + config `keep_paths`/`keep_globs`/`keep_project_roots`
 - [ ] History（JSONL）：`history list/show/top-growth`
-- [ ] TUI 升级：搜索/过滤/排序/详情面板/流式更新
+- [x] TUI 升级：搜索/过滤/排序/详情面板
+- [ ] TUI 流式更新（目前等待扫描全部完成才显示）
 
 ## Core 拆分审查修复清单（2026-04-28）
 

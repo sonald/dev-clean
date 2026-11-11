@@ -46,7 +46,9 @@ dev-cleaner tui ~/projects
 # Space        - Select/deselect
 # a            - Select all
 # d            - Deselect all
-# Enter        - Clean selected
+# s / / / f    - Sort / search / filter panel
+# R / P        - Show recent / protected targets
+# Enter        - Move selected to trash
 # q            - Quit
 ```
 
@@ -181,7 +183,7 @@ Generate a config file:
 dev-cleaner init-config
 ```
 
-Edit the config at `~/.config/dev-cleaner/config.toml`:
+Edit the config at `~/.config/dev-cleaner/config.toml` (Linux) or `~/Library/Application Support/dev-cleaner/config.toml` (macOS):
 
 ```toml
 # Set defaults for all commands
@@ -191,9 +193,9 @@ default_depth = 10
 
 # Add custom project types
 [[custom_patterns]]
-name = "Unity"
-directory = "Library"
-marker_files = ["Assets", "ProjectSettings"]
+name = "Godot"
+directory = ".godot"
+marker_files = ["project.godot"]
 ```
 
 ## Troubleshooting
